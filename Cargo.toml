@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rake-domain",
+    "crates/rake-core",
+    "crates/rake-cli",
+    "crates/rake-hash",
+    "crates/rake-shim-bin",
+]
+default-members = ["crates/rake-cli"]

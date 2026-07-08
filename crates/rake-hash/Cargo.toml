@@ -1,0 +1,8 @@
+[package]
+name = "rake-hash"
+version = "0.1.0"
+edition = "2024"
+description = "Hash verification for Rake — SHA256, MD5, SHA1"
+
+[lints.rust]
+unsafe_code = "forbid"

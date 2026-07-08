@@ -1,0 +1,8 @@
+[package]
+name = "rake-shim-bin"
+version = "0.1.0"
+edition = "2024"
+description = "Rake shim binary — reads .shim metadata and launches target"
+
+[lints.rust]
+unsafe_code = "forbid"

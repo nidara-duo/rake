@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - i686-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package archive
+        shell: pwsh
+        run: |
+          $name = "rake-${{ matrix.target }}"
+          $zip = "$name.zip"
+          $src = "target/${{ matrix.target }}/release/rake.exe"
+          $bs  = "scripts/bootstrap.ps1"
+          if (-not (Test-Path $src)) {
+            Write-Error "Build artifact not found: $src"
+            exit 1
+          }
+          Compress-Archive -Path $src, $bs -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "$zip.sha256" -Value "$hash  $zip"
+          Write-Output "Packaged: $zip"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rake-*.zip
+            rake-*.zip.sha256

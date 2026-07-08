@@ -26,7 +26,7 @@ param(
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
-$Repo = "anomalyco/rake"
+$Repo = "nidara-duo/rake"
 $ApiUrl = "https://api.github.com/repos/$Repo/releases"
 $InstallRoot = "$env:LOCALAPPDATA\rake"
 $BinDir = "$InstallRoot\bin"

@@ -9,7 +9,10 @@ env:
 
 jobs:
   build:
+    permissions:
+      contents: write
     strategy:
+      fail-fast: false
       matrix:
         target:
           - x86_64-pc-windows-msvc

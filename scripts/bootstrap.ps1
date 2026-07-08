@@ -257,8 +257,10 @@ function Action-Install {
     Install-Binary $zipPath
 
     # Copy bootstrap alongside the binary
-    Copy-Item -Path $PSCommandPath -Destination "$BinDir\bootstrap.ps1" -Force
-    Write-Ok "Copied bootstrap.ps1 alongside rake.exe"
+    if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
+        Copy-Item -Path $PSCommandPath -Destination "$BinDir\bootstrap.ps1" -Force
+        Write-Ok "Copied bootstrap.ps1 alongside rake.exe"
+    }
 
     # PATH
     Add-ToPath $BinDir
@@ -321,7 +323,9 @@ function Action-Update {
 
     try {
         Install-Binary $zipPath
-        Copy-Item -Path $PSCommandPath -Destination "$BinDir\bootstrap.ps1" -Force
+        if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
+            Copy-Item -Path $PSCommandPath -Destination "$BinDir\bootstrap.ps1" -Force
+        }
 
         # Remove backup on success
         if ($backup -and (Test-Path $backup)) {

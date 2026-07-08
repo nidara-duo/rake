@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+version = "0.1.0"
 members = [
     "crates/rake-domain",
     "crates/rake-core",

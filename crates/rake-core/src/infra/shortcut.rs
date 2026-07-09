@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::Result;
+use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
 pub struct ShortcutEntry {
@@ -12,12 +13,20 @@ pub struct ShortcutEntry {
 
 /// Create Start Menu shortcuts for a Scoop app.
 #[cfg(windows)]
-pub fn create_shortcuts(entries: &[ShortcutEntry], version_dir: &Path, global: bool) -> Result<()> {
+pub fn create_shortcuts(
+    entries: &[ShortcutEntry],
+    version_dir: &Path,
+    global: bool,
+) -> Result<Vec<String>> {
     let folder = shortcut_folder(global)?;
+    let mut warnings = Vec::new();
     for entry in entries {
-        create_single_shortcut(entry, version_dir, &folder)?;
+        match create_single_shortcut(entry, version_dir, &folder) {
+            Ok(()) => {}
+            Err(e) => warnings.push(e.to_string()),
+        }
     }
-    Ok(())
+    Ok(warnings)
 }
 
 #[cfg(not(windows))]
@@ -25,8 +34,8 @@ pub fn create_shortcuts(
     _entries: &[ShortcutEntry],
     _version_dir: &Path,
     _global: bool,
-) -> Result<()> {
-    Ok(())
+) -> Result<Vec<String>> {
+    Ok(Vec::new())
 }
 
 /// See the identical helper and rationale in infra/shim.rs — manifest
@@ -55,10 +64,31 @@ fn create_single_shortcut(
     validate_manifest_name(&entry.name)?;
     let target = version_dir.join(&entry.target);
     if !target.exists() {
-        return Err(crate::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Shortcut target not found: {}", target.display()),
-        )));
+        let mut diag = format!(
+            "Shortcut target not found: manifest declared '{}', resolved to {}",
+            entry.target,
+            target.display()
+        );
+        let entries: Vec<_> = WalkDir::new(version_dir)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file() || e.file_type().is_dir())
+            .take(20)
+            .map(|e| e.path().to_string_lossy().into_owned())
+            .collect();
+        if entries.is_empty() {
+            diag.push_str(&format!(
+                " — directory {} is empty or missing",
+                version_dir.display()
+            ));
+        } else {
+            diag.push_str(" — version_dir contains (depth ≤2):");
+            for e in entries {
+                diag.push_str(&format!("\n  {}", e));
+            }
+        }
+        return Err(crate::Error::Io(std::io::Error::other(diag)));
     }
 
     let target_abs = target.canonicalize()?;
@@ -198,4 +228,65 @@ fn shortcut_folder(global: bool) -> Result<PathBuf> {
     };
     std::fs::create_dir_all(&folder)?;
     Ok(folder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn missing_shortcut_target_returns_warning_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let version_dir = tmp.path();
+        let entries = vec![ShortcutEntry {
+            target: "nonexistent.exe".to_string(),
+            name: "Foo".to_string(),
+            arguments: None,
+            icon: None,
+        }];
+        let result = create_shortcuts(&entries, version_dir, false);
+        assert!(result.is_ok());
+        let warnings = result.unwrap();
+        assert_eq!(warnings.len(), 1);
+        let w = &warnings[0];
+        assert!(
+            w.contains("nonexistent.exe"),
+            "warning should mention the manifest-declared target, got: {w}"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn valid_shortcut_created_and_invalid_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let version_dir = tmp.path();
+        fs::write(version_dir.join("real.exe"), b"").unwrap();
+
+        let start_menu = shortcut_folder(false).unwrap();
+        let _ = std::fs::remove_file(start_menu.join("Valid.lnk"));
+
+        let entries = vec![
+            ShortcutEntry {
+                target: "real.exe".to_string(),
+                name: "Valid".to_string(),
+                arguments: None,
+                icon: None,
+            },
+            ShortcutEntry {
+                target: "missing.exe".to_string(),
+                name: "Missing".to_string(),
+                arguments: None,
+                icon: None,
+            },
+        ];
+        let result = create_shortcuts(&entries, version_dir, false);
+        assert!(result.is_ok());
+        let warnings = result.unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("missing.exe"));
+
+        let valid_link = start_menu.join("Valid.lnk");
+        assert!(valid_link.exists(), "valid shortcut should be created");
+    }
 }

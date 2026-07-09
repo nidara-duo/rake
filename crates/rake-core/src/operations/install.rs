@@ -132,7 +132,7 @@ pub async fn install_packages(
         }
 
         // 2. Apply extract_dir
-        apply_extract_dir(pkg, &version_dir, arch)?;
+        apply_extract_dir(pkg, &version_dir, arch, &tx)?;
 
         // 3. Run pre_install
         if let Some(script_lines) = pkg.manifest.resolve_pre_install(arch) {
@@ -175,7 +175,10 @@ pub async fn install_packages(
                 .filter(|e| !e.target.is_empty() && !e.name.is_empty())
                 .collect();
             if !entries.is_empty() {
-                shortcut::create_shortcuts(&entries, &version_dir, false)?;
+                let warnings = shortcut::create_shortcuts(&entries, &version_dir, false)?;
+                for w in warnings {
+                    let _ = tx.try_send(Event::CommitProgress(format!("⚠ {}", w)));
+                }
             }
         }
 
@@ -324,7 +327,12 @@ pub(crate) fn finalize_installation(
     Ok(())
 }
 
-fn apply_extract_dir(pkg: &Package, version_dir: &std::path::Path, arch: Arch) -> Result<()> {
+fn apply_extract_dir(
+    pkg: &Package,
+    version_dir: &std::path::Path,
+    arch: Arch,
+    tx: &flume::Sender<Event>,
+) -> Result<()> {
     let manifest = &pkg.manifest;
 
     let dirs: Vec<String> = match manifest.resolve_extract_dir(arch) {
@@ -335,6 +343,11 @@ fn apply_extract_dir(pkg: &Package, version_dir: &std::path::Path, arch: Arch) -
     for subdir in &dirs {
         let src = version_dir.join(subdir);
         if !src.exists() {
+            let _ = tx.try_send(Event::CommitProgress(format!(
+                "⚠ extract_dir '{}' not found under {} — archive layout may not match manifest expectations",
+                subdir,
+                version_dir.display()
+            )));
             continue;
         }
 

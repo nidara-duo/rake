@@ -4,6 +4,7 @@ use rake_domain::arch::Arch;
 use rake_domain::package::InstallRecord;
 
 use crate::Result;
+use crate::event::Event;
 use crate::infra::fs;
 use crate::infra::shortcut::ShortcutEntry;
 use crate::infra::{persist, shim, shortcut};
@@ -32,6 +33,7 @@ pub fn reset_packages(
     let mut reset = Vec::new();
     let shims_dir = root.join("shims");
     let persist_root = root.join("persist");
+    let tx = session.event_bus().core_sender();
 
     let entries: Vec<_> = std::fs::read_dir(&apps_root)
         .map_err(crate::Error::Io)?
@@ -98,7 +100,12 @@ pub fn reset_packages(
                     .collect();
                 if !entries.is_empty() {
                     let _ = shortcut::remove_shortcuts(&entries, false);
-                    let _ = shortcut::create_shortcuts(&entries, &version_dir, false);
+                    if let Ok(warnings) = shortcut::create_shortcuts(&entries, &version_dir, false)
+                    {
+                        for w in warnings {
+                            let _ = tx.try_send(Event::CommitProgress(format!("⚠ {}", w)));
+                        }
+                    }
                 }
             }
 

@@ -22,11 +22,12 @@ mod tests {
         let json = serde_json::to_string_pretty(&record).unwrap();
 
         // Must match Scoop's output exactly — no "url" key, no null values.
+        // Scoop uses "architecture" (not "arch") and "hold" (not "held").
         let expected = r#"{
   "version": "1.0.0",
   "bucket": "main",
-  "arch": "64bit",
-  "held": false
+  "architecture": "64bit",
+  "hold": false
 }"#;
         assert_eq!(
             json, expected,
@@ -58,6 +59,58 @@ mod tests {
 
         assert_eq!(value["url"], "https://example.com/manifest.json");
         assert!(value.get("bucket").is_none() || value["bucket"].is_null());
+    }
+
+    /// Scoop reads `$install.architecture` (not `arch`) in uninstall and
+    /// other libexec scripts.  rake must write the key that Scoop expects.
+    #[test]
+    fn serializes_architecture_not_arch() {
+        let record = InstallRecord {
+            version: "4.0.0".to_owned(),
+            bucket: Some("main".to_owned()),
+            arch: "32bit".to_owned(),
+            held: false,
+            url: None,
+        };
+
+        let json = serde_json::to_string_pretty(&record).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(
+            value.as_object().unwrap().contains_key("architecture"),
+            "install.json must use 'architecture' key (Scoop compat), got: {json}"
+        );
+        assert!(
+            !value.as_object().unwrap().contains_key("arch"),
+            "install.json must NOT use 'arch' key, got: {json}"
+        );
+        assert_eq!(value["architecture"], "32bit");
+    }
+
+    /// Scoop reads `$install.hold` (not `held`) in hold/unhold/list/status.
+    /// rake must write the key that Scoop expects.
+    #[test]
+    fn serializes_hold_not_held() {
+        let record = InstallRecord {
+            version: "5.0.0".to_owned(),
+            bucket: Some("main".to_owned()),
+            arch: "64bit".to_owned(),
+            held: true,
+            url: None,
+        };
+
+        let json = serde_json::to_string_pretty(&record).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(
+            value.as_object().unwrap().contains_key("hold"),
+            "install.json must use 'hold' key (Scoop compat), got: {json}"
+        );
+        assert!(
+            !value.as_object().unwrap().contains_key("held"),
+            "install.json must NOT use 'held' key, got: {json}"
+        );
+        assert_eq!(value["hold"], true);
     }
 
     /// serde must never emit `"url": null`.  Scoop distinguishes between

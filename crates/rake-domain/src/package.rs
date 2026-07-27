@@ -132,12 +132,11 @@ impl Package {
 /// * `bucket` — set for bucket-based installs, null/absent for URL-sourced
 ///   or local-manifest installs.
 ///
-/// * `arch` — serialised under the JSON key `"architecture"` in Scoop;
-///   the `alias` attribute handles reading that spelling.  Rake writes
-///   `"arch"` (the shorter key) — this is a recognised divergence.
+/// * `arch` — serialised as `"architecture"` (Scoop's key).  `alias`
+///   on the Rust field provides backward-compat reading of `"arch"`.
 ///
-/// * `held` — serialised under `"hold"` in Scoop; the `alias` handles
-///   reading.  Same key divergence as `arch`/`architecture`.
+/// * `held` — serialised as `"hold"` (Scoop's key).  `alias` provides
+///   backward-compat reading of `"held"`.
 ///
 /// **Serialisation contract** (serde attributes below enforce this):
 /// - Fields with `skip_serializing_if` MUST NOT appear in JSON when empty.
@@ -162,9 +161,9 @@ pub struct InstallRecord {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket: Option<String>,
-    #[serde(default, alias = "architecture")]
+    #[serde(default, alias = "arch", rename = "architecture")]
     pub arch: String,
-    #[serde(default, alias = "hold")]
+    #[serde(default, alias = "held", rename = "hold")]
     pub held: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,

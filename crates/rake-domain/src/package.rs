@@ -114,14 +114,48 @@ impl Package {
 
 /// The on-disk `install.json` record written into each version directory.
 ///
-/// This is the **single canonical** definition. Previously, four near-identical
-/// `InstallInfo` structs existed (in `install`, `query`, `hold`, `reset`,
-/// `uninstall`) with subtly diverging field names and sets — most critically,
-/// `install.rs` wrote the arch under key `arch` while `query.rs` read it as
-/// `architecture`, so the installed arch and (worse) the `held` flag were
-/// silently lost on every read. `hold.rs` additionally re-serialised from a
-/// struct lacking `url`, deleting that field on hold. Consolidating here makes
-/// that class of drift impossible.
+/// IMPORTANT — treat this as a **stable external ABI**, not an internal
+/// data structure.  The semantics of every field are defined by the
+/// official Scoop (PowerShell) implementation.  Rake must produce files
+/// that are indistinguishable from Scoop's output whenever possible.
+///
+/// Key Scoop compatibility rules:
+///
+/// * `url` — holds the **manifest location**, not the downloaded archive.
+///   Scoop's `manifest()` function (lib/manifest.ps1) gives `url`
+///   unconditional precedence over `bucket`: if `url` is non-null, Scoop
+///   fetches it and parses it as a manifest JSON.  Therefore:
+///   - For bucket-sourced packages: `url` MUST be null/absent.
+///   - For URL-sourced packages: `url` MUST be the manifest URL.
+///   - Binary/artifact download URLs MUST NEVER appear here.
+///
+/// * `bucket` — set for bucket-based installs, null/absent for URL-sourced
+///   or local-manifest installs.
+///
+/// * `arch` — serialised under the JSON key `"architecture"` in Scoop;
+///   the `alias` attribute handles reading that spelling.  Rake writes
+///   `"arch"` (the shorter key) — this is a recognised divergence.
+///
+/// * `held` — serialised under `"hold"` in Scoop; the `alias` handles
+///   reading.  Same key divergence as `arch`/`architecture`.
+///
+/// **Serialisation contract** (serde attributes below enforce this):
+/// - Fields with `skip_serializing_if` MUST NOT appear in JSON when empty.
+///   Scoop skips null fields entirely — `"url": null` is NOT valid Scoop.
+/// - `#[serde(default)]` ensures missing fields decode as the zero value.
+///
+/// This is the **single canonical** definition.  Previously, four
+/// near-identical `InstallInfo` structs existed (in `install`, `query`,
+/// `hold`, `reset`, `uninstall`) with subtly diverging field names and
+/// sets — most critically, `install.rs` wrote the arch under key `arch`
+/// while `query.rs` read it as `architecture`, so the installed arch and
+/// (worse) the `held` flag were silently lost on every read.  `hold.rs`
+/// additionally re-serialised from a struct lacking `url`, deleting that
+/// field on hold.  Consolidating here makes that class of drift impossible.
+///
+/// There must be exactly **one** canonical writer of `InstallRecord`.
+/// Every other operation should preserve the existing record by
+/// read-modify-write rather than rebuilding it from scratch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallRecord {
     #[serde(default)]

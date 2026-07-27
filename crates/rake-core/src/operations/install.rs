@@ -185,11 +185,23 @@ pub async fn install_packages(
         // 8. Apply env
         apply_env(pkg, session, arch)?;
 
+        // IMPORTANT — Scoop ABI contract on `url`:
+        //
+        // Scoop interprets install.json.url as the location of the
+        // package MANIFEST, not the downloaded archive.
+        //
+        // If this field is populated for bucket installs, Scoop's
+        // manifest() function (lib/manifest.ps1) ignores bucket and
+        // attempts to download the URL as JSON — producing the
+        // "Error parsing JSON at <binary-asset-url>" symptom.
+        //
+        // Rule: url is set ONLY for PackageSource::File (URL-sourced
+        // installs).  For bucket installs and for None, url is null.
         let install_url = match &pkg.source {
             Some(PackageSource::File(_manifest_url)) => {
-                // TODO: For URL-sourced packages, Scoop expects the manifest
-                // URL, not the download asset URL. Use _manifest_url once
-                // the File-sourced install path is fully implemented.
+                // TODO: Scoop expects the manifest URL itself here, not
+                // the download asset URL.  Use _manifest_url once the
+                // File-sourced install path is fully implemented.
                 pkg_files.first().map(|f| f.url.clone())
             }
             _ => None,

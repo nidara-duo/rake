@@ -9,6 +9,12 @@ use walkdir::WalkDir;
 use crate::Result;
 use crate::session::Session;
 
+/// Backward-compatibility shim: for install.json files written by old rake
+/// builds that lacked a `bucket` field, try to extract the bucket name from
+/// a URL that happened to contain a `buckets/<name>/...` path segment.
+///
+/// Newly-written install.json files always have an explicit `bucket` field,
+/// so this function is only reached for pre-existing installs.
 fn extract_bucket_from_url(url: &str) -> Option<String> {
     let path = std::path::Path::new(url);
     let components: Vec<&str> = path.iter().filter_map(|c| c.to_str()).collect();
@@ -74,6 +80,11 @@ pub(crate) fn query_installed_inner(session: &Session) -> Result<Vec<Package>> {
                 url,
             });
 
+            // source: None because install.json does not persist the
+            // PackageSource variant (Bucket vs File).  The bucket name is
+            // stored separately in the `bucket` field.  If URL-sourced
+            // installs are implemented in the future, a `source` field
+            // should be added to InstallRecord to recover this.
             Some(Package::new(ident, manifest, None, status))
         })
         .collect();

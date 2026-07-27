@@ -378,9 +378,16 @@ fn parse_extract_dir(line: &str) -> Option<&str> {
 
 /// Execute `installer.script` lines from a Scoop manifest.
 ///
-/// For each `Expand-InnoArchive` line, parses `-ExtractDir` and `-Removal`
-/// flags then calls `innounp` for that component.
-/// The source file is only removed if any line contains `-Removal`.
+/// For each `Expand-InnoArchive` line, parses `-ExtractDir` flag then calls
+/// `innounp` for that component.
+///
+/// IMPORTANT: The source file (a persistent cache entry) is NEVER deleted
+/// here, even if the manifest's `installer.script` contains `-Removal`.
+/// `-Removal` is a Scoop-side instruction that assumes Scoop's own
+/// copy-then-extract pipeline (lib/download.ps1 copies the cached file into
+/// the version directory first, then extracts from that copy — the cache
+/// entry survives).  Rake extracts directly from the cache file, so
+/// `-Removal` must not be honoured as "delete the cache file."
 #[cfg(windows)]
 pub fn extract_innosetup_with_script(
     lines: &[String],
@@ -396,8 +403,6 @@ pub fn extract_innosetup_with_script(
             ))
         })?;
 
-    let mut should_remove = false;
-
     for line in lines {
         let line = line.trim();
         if !line.starts_with("Expand-InnoArchive") {
@@ -405,10 +410,6 @@ pub fn extract_innosetup_with_script(
         }
 
         let extract_dir = parse_extract_dir(line);
-        let has_removal = line.contains("-Removal");
-        if has_removal {
-            should_remove = true;
-        }
 
         let extract_flag = match extract_dir {
             Some(dir) if !dir.is_empty() => {
@@ -449,10 +450,6 @@ pub fn extract_innosetup_with_script(
         }
     }
 
-    if should_remove {
-        let _ = std::fs::remove_file(src);
-    }
-
     Ok(())
 }
 
@@ -475,7 +472,13 @@ pub fn extract_innosetup_with_script(
 ///
 /// If `extract_dir` is set, passes `-c{app}\<extract_dir>` to innounp
 /// (matching Scoop's `-ExtractDir` semantic).
-/// The original `.exe` is removed after extraction (Scoop's `-Removal` behaviour).
+///
+/// IMPORTANT: The source file (a persistent cache entry) is NEVER deleted
+/// here.  Scoop copies the cached file into the version directory before
+/// extraction (lib/download.ps1), meaning its cache survives and its
+/// disposable copy can be deleted.  Rake extracts directly from the cache,
+/// so this function must NOT remove it — that would break rake's own
+/// cache-reuse guarantee and diverge from Scoop's behaviour.
 #[cfg(windows)]
 pub fn extract_innosetup(
     src: &Path,
@@ -527,9 +530,6 @@ pub fn extract_innosetup(
             status.code()
         ))));
     }
-
-    // Remove original .exe (Scoop's -Removal behaviour)
-    let _ = std::fs::remove_file(src);
 
     Ok(())
 }
@@ -652,5 +652,51 @@ mod format_detection_tests {
     fn returns_none_for_unrecognized_extension() {
         let url = "https://example.com/tool-1.0.0.exe";
         assert_eq!(detect_format_for_url(url), None);
+    }
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod innosetup_extraction_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// Regression: rake must never delete the cache file after InnoSetup
+    /// extraction.  Official Scoop copies from cache into the version
+    /// directory first, then extracts from the copy (the cache survives).
+    /// Rake extracts directly from the cache, so remove_file(src) would
+    /// break the cache-reuse guarantee.
+    #[test]
+    fn cache_file_survives_innosetup_extraction() {
+        let dir = tempdir().unwrap();
+
+        // Create a mock innounp.exe that find_helper can discover
+        let innounp_dir = dir.path().join("apps").join("innounp").join("current");
+        fs::create_dir_all(&innounp_dir).unwrap();
+        fs::write(innounp_dir.join("innounp.exe"), b"").unwrap();
+
+        // Create a fake cache file
+        let cache_file = dir.path().join("cache").join("test-installer.exe");
+        fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+        fs::write(&cache_file, b"fake installer content").unwrap();
+
+        let dest = dir.path().join("extracted");
+        fs::create_dir_all(&dest).unwrap();
+
+        // Empty lines means no Expand-InnoArchive lines — innounp is
+        // resolved but never invoked.  The function returns Ok after
+        // an empty loop.  Without the fix, the old code would still
+        // unconditionally remove src in extract_innosetup, or
+        // conditionally remove it in extract_innosetup_with_script
+        // if any line had -Removal.
+        let lines: Vec<String> = vec![];
+        let result = extract_innosetup_with_script(&lines, &cache_file, &dest, Some(dir.path()));
+
+        assert!(result.is_ok(), "empty script should succeed");
+        assert!(
+            cache_file.exists(),
+            "cache file must survive InnoSetup extraction"
+        );
     }
 }

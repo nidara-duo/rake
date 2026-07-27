@@ -2,52 +2,69 @@ name: Release
 
 on:
   push:
-    tags: ["v*.*.*"]
+    tags: ["v*"]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-pc-windows-msvc
-          - i686-pc-windows-msvc
-          - aarch64-pc-windows-msvc
-    runs-on: windows-latest
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: .exe
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: ""
+
+    runs-on: ${{ matrix.os }}
+
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build release binary
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package archive
-        shell: pwsh
+      - name: Package binary
+        shell: bash
         run: |
-          $name = "rake-${{ matrix.target }}"
-          $zip = "$name.zip"
-          $src = "target/${{ matrix.target }}/release/rake.exe"
-          $bs  = "scripts/bootstrap.ps1"
-          if (-not (Test-Path $src)) {
-            Write-Error "Build artifact not found: $src"
-            exit 1
-          }
-          Compress-Archive -Path $src, $bs -DestinationPath $zip
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          Set-Content -Path "$zip.sha256" -Value "$hash  $zip"
-          Write-Output "Packaged: $zip"
+          BIN="target/${{ matrix.target }}/release/rake${{ matrix.suffix }}"
+          ARCHIVE="rake-${{ matrix.target }}${{ matrix.suffix }}"
+          cp "$BIN" "$ARCHIVE"
+          echo "asset=$ARCHIVE" >> $GITHUB_ENV
 
-      - name: Upload release assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rake-${{ matrix.target }}
+          path: rake-${{ matrix.target }}${{ matrix.suffix }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rake-*
+          merge-multiple: true
+
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            rake-*.zip
-            rake-*.zip.sha256
+          files: rake-*
+          draft: true
+          generate_release_notes: true

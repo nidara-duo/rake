@@ -7,6 +7,8 @@ mod cleanup_tests;
 pub mod download;
 pub mod hold;
 pub mod install;
+#[cfg(test)]
+mod install_tests;
 pub mod query;
 pub mod reset;
 pub mod status;

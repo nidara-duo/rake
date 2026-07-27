@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use rake_domain::arch::Arch;
-use rake_domain::package::{InstallRecord, InstallState, Package, PackageStatus};
+use rake_domain::package::{InstallRecord, InstallState, Package, PackageSource, PackageStatus};
 
 use crate::Result;
 use crate::event::Event;
@@ -185,7 +185,15 @@ pub async fn install_packages(
         // 8. Apply env
         apply_env(pkg, session, arch)?;
 
-        let install_url = pkg_files.first().map(|f| f.url.clone());
+        let install_url = match &pkg.source {
+            Some(PackageSource::File(_manifest_url)) => {
+                // TODO: For URL-sourced packages, Scoop expects the manifest
+                // URL, not the download asset URL. Use _manifest_url once
+                // the File-sourced install path is fully implemented.
+                pkg_files.first().map(|f| f.url.clone())
+            }
+            _ => None,
+        };
 
         let _guard = session.write_lock()?;
         finalize_installation(

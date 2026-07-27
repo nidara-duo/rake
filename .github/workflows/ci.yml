@@ -10,24 +10,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-
-    runs-on: ${{ matrix.os }}
-
+  quality:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+          components: rustfmt, clippy
 
       - name: Format check
         run: cargo fmt --check
@@ -35,8 +25,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Build
-        run: cargo build --workspace
-
       - name: Test
         run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --workspace

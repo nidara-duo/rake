@@ -24,9 +24,9 @@ pub struct Args {
 }
 
 pub fn execute(args: Args, session: &Session) -> Result<()> {
-    let snap = query::collect_snapshot(session)?;
-    let synced = snap.synced;
-    let installed = snap.installed;
+    let installed = query::query_installed(session)?;
+    let synced =
+        query::query_synced_matching(session, &args.query, args.explicit, args.with_description)?;
 
     let installed_map: std::collections::HashMap<String, (String, bool)> = installed
         .into_iter()

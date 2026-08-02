@@ -72,3 +72,20 @@ impl Session {
             .map_err(|_| crate::Error::Custom("state lock poisoned".into()))
     }
 }
+
+#[cfg(test)]
+impl Session {
+    pub fn from_config(config: Config) -> Self {
+        Self {
+            inner: Arc::new(SessionInner {
+                config,
+                event_bus: EventBus::new(),
+                http_client: Box::new(
+                    ReqwestClient::new(None, Some("test")).expect("build reqwest client"),
+                ),
+                env_service: Box::new(WindowsEnvService::new()),
+                state_lock: RwLock::new(()),
+            }),
+        }
+    }
+}

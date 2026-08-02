@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::Result;
+use crate::bucket::Bucket;
 use crate::session::Session;
 
 /// Backward-compatibility shim: for install.json files written by old rake
@@ -168,6 +169,120 @@ pub fn query_synced(session: &Session) -> Result<Vec<Package>> {
     query_synced_inner(session)
 }
 
+pub fn query_synced_matching(
+    session: &Session,
+    queries: &[String],
+    explicit: bool,
+    with_description: bool,
+) -> Result<Vec<Package>> {
+    let _guard = session.read_lock()?;
+    query_synced_matching_inner(session, queries, explicit, with_description)
+}
+
+pub(crate) fn query_synced_matching_inner(
+    session: &Session,
+    queries: &[String],
+    explicit: bool,
+    with_description: bool,
+) -> Result<Vec<Package>> {
+    let buckets_dir = session
+        .config()
+        .root_path
+        .as_ref()
+        .map(|p| p.join("buckets"));
+
+    let buckets_dir = match buckets_dir {
+        Some(p) if p.exists() => p,
+        _ => return Ok(vec![]),
+    };
+
+    let buckets: Vec<_> = std::fs::read_dir(&buckets_dir)
+        .map_err(crate::Error::Io)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+
+    let queries_lower: Vec<_> = queries.iter().map(|q| q.to_ascii_lowercase()).collect();
+
+    let packages = buckets
+        .into_par_iter()
+        .flat_map(|entry| {
+            let bucket_name = entry.file_name().to_string_lossy().to_string();
+            let bucket = match Bucket::from(&entry.path()) {
+                Ok(b) => b,
+                Err(_) => return Vec::new(),
+            };
+
+            let mut manifest_paths = bucket.manifest_paths();
+            manifest_paths.sort();
+
+            if with_description {
+                manifest_paths
+                    .into_iter()
+                    .filter_map(|manifest_path| {
+                        if let Ok(content) = std::fs::read_to_string(&manifest_path)
+                            && let Ok(manifest) = serde_json::from_str::<Manifest>(&content)
+                        {
+                            let file_stem = manifest_path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let ident = PackageIdent::new(bucket_name.clone(), file_stem);
+                            Some(Package::new(
+                                ident,
+                                manifest,
+                                Some(PackageSource::Bucket(bucket_name.clone())),
+                                PackageStatus::NotInstalled,
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                manifest_paths
+                    .into_iter()
+                    .filter(|manifest_path| {
+                        let file_stem = manifest_path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let file_stem_lower = file_stem.to_ascii_lowercase();
+                        queries_lower.iter().any(|q| {
+                            if explicit {
+                                file_stem_lower == q.as_str()
+                            } else {
+                                file_stem_lower.contains(q.as_str())
+                            }
+                        })
+                    })
+                    .filter_map(|manifest_path| {
+                        if let Ok(content) = std::fs::read_to_string(&manifest_path)
+                            && let Ok(manifest) = serde_json::from_str::<Manifest>(&content)
+                        {
+                            let file_stem = manifest_path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let ident = PackageIdent::new(bucket_name.clone(), file_stem);
+                            Some(Package::new(
+                                ident,
+                                manifest,
+                                Some(PackageSource::Bucket(bucket_name.clone())),
+                                PackageStatus::NotInstalled,
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+        })
+        .collect();
+
+    Ok(packages)
+}
+
 pub struct Snapshot {
     pub installed: Vec<Package>,
     pub synced: Vec<Package>,
@@ -268,4 +383,133 @@ pub fn find_all_synced_by_name(session: &Session, name: &str) -> Result<Vec<Pack
     }
 
     Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rake_domain::config::Config;
+    use tempfile::tempdir;
+
+    fn make_session(root: std::path::PathBuf) -> Session {
+        let config = Config {
+            root_path: Some(root),
+            ..Default::default()
+        };
+        Session::from_config(config)
+    }
+
+    #[test]
+    fn test_query_synced_matching_substring() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let buckets_dir = root.join("buckets");
+        std::fs::create_dir_all(buckets_dir.join("main").join("bucket")).unwrap();
+
+        std::fs::write(
+            buckets_dir
+                .join("main")
+                .join("bucket")
+                .join("packagea.json"),
+            r#"{"version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            buckets_dir
+                .join("main")
+                .join("bucket")
+                .join("packageb.json"),
+            r#"{"version":"2.0.0"}"#,
+        )
+        .unwrap();
+
+        let session = make_session(root);
+        let results =
+            query_synced_matching(&session, &["ackagea".to_string()], false, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name(), "packagea");
+    }
+
+    #[test]
+    fn test_query_synced_matching_explicit() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let buckets_dir = root.join("buckets");
+        std::fs::create_dir_all(buckets_dir.join("main").join("bucket")).unwrap();
+
+        std::fs::write(
+            buckets_dir
+                .join("main")
+                .join("bucket")
+                .join("packagea.json"),
+            r#"{"version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let session = make_session(root);
+        let results =
+            query_synced_matching(&session, &["packagea".to_string()], true, false).unwrap();
+        assert_eq!(results.len(), 1);
+
+        let results2 =
+            query_synced_matching(&session, &["PackageA".to_string()], true, false).unwrap();
+        assert_eq!(results2.len(), 1);
+
+        let results3 =
+            query_synced_matching(&session, &["PackageB".to_string()], true, false).unwrap();
+        assert_eq!(results3.len(), 0);
+    }
+
+    #[test]
+    fn test_query_synced_matching_description() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let buckets_dir = root.join("buckets");
+        std::fs::create_dir_all(buckets_dir.join("main").join("bucket")).unwrap();
+
+        std::fs::write(
+            buckets_dir
+                .join("main")
+                .join("bucket")
+                .join("packagea.json"),
+            r#"{"version":"1.0.0","description":"A great package"}"#,
+        )
+        .unwrap();
+
+        let session = make_session(root);
+        let results = query_synced_matching(&session, &["great".to_string()], false, true).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name(), "packagea");
+    }
+
+    #[test]
+    fn test_query_synced_matching_skips_non_matching_without_description() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let buckets_dir = root.join("buckets");
+        std::fs::create_dir_all(buckets_dir.join("main").join("bucket")).unwrap();
+
+        std::fs::write(
+            buckets_dir
+                .join("main")
+                .join("bucket")
+                .join("packagea.json"),
+            r#"{"version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            buckets_dir
+                .join("main")
+                .join("bucket")
+                .join("packageb.json"),
+            r#"{"version":"2.0.0"}"#,
+        )
+        .unwrap();
+
+        let session = make_session(root);
+        let results =
+            query_synced_matching(&session, &["packageb".to_string()], false, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name(), "packageb");
+    }
 }

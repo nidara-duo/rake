@@ -7,7 +7,7 @@ use rake_domain::package::Package;
 
 use crate::Result;
 use crate::event::{BucketState, Event};
-use crate::infra::git::{ExternalGit, GitService};
+use crate::infra::git::GitService;
 use crate::infra::{fs, persist, script, shim, shortcut};
 use crate::operations::bucket;
 use crate::operations::download::DownloadedFile;
@@ -24,7 +24,7 @@ pub struct UpdateSpec {
 
 pub async fn bucket_update(session: &Session) -> Result<()> {
     let buckets = bucket::bucket_list(session)?;
-    let git = ExternalGit::new();
+    let git = crate::infra::git_libgit2::Git::new();
     let tx = session.event_bus().core_sender();
 
     for bucket in buckets {

@@ -2,6 +2,7 @@ pub mod archive;
 pub mod env;
 pub mod fs;
 pub mod git;
+pub mod git_libgit2;
 pub mod http;
 pub mod persist;
 pub mod script;

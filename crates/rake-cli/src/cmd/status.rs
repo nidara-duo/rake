@@ -32,6 +32,17 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
         );
     }
 
+    // With no buckets there is nothing Rake can install or check, so reporting "ok" here
+    // would be misleading on a freshly installed machine.
+    if !crate::util::has_buckets(session) {
+        println!(
+            "{} No buckets added yet — nothing can be installed until there is one.",
+            style("!").yellow()
+        );
+        println!("  Add the default set with: rake bucket add main");
+        return Ok(());
+    }
+
     if report.entries.is_empty() {
         println!("Everything is ok!");
         return Ok(());

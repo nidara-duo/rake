@@ -63,6 +63,15 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
     let packages = rake_core::operations::query::find_synced_by_names(session, &names)?;
 
     if packages.is_empty() {
+        // See the note in `install`: with no buckets the real blocker is the missing
+        // bucket, not a misspelled package name.
+        if !crate::util::has_buckets(session) {
+            writeln!(
+                stdout,
+                "✗ No buckets added yet, so there is nothing to download from.\n  Add the default set with: rake bucket add main"
+            )?;
+            return Ok(());
+        }
         writeln!(stdout, "✗ No matching packages found")?;
         return Ok(());
     }

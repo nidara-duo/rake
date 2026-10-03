@@ -53,6 +53,15 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
     let packages = rake_core::operations::query::find_synced_by_names(session, &names)?;
 
     if packages.is_empty() {
+        // With no buckets there is nothing to search, so "no matching packages" would
+        // point the user at a typo instead of at the actual blocker.
+        if !crate::util::has_buckets(session) {
+            writeln!(
+                stdout,
+                "✗ No buckets added yet, so there is nothing to install from.\n  Add the default set with: rake bucket add main"
+            )?;
+            return Ok(());
+        }
         writeln!(stdout, "✗ No matching packages found")?;
         return Ok(());
     }

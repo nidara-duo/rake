@@ -34,6 +34,18 @@ impl ExternalGit {
     }
 }
 
+/// Translate a failure to launch `git` into something the user can act on.
+///
+/// When git is not installed the OS reports a bare "program not found", which says
+/// nothing about what to do next. Buckets are git repositories, so git is a hard
+/// requirement for every bucket operation — name it and say how to obtain it.
+fn spawn_error(e: std::io::Error) -> crate::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return crate::Error::GitNotFound;
+    }
+    crate::Error::Git(e.to_string())
+}
+
 impl Default for ExternalGit {
     fn default() -> Self {
         Self::new()
@@ -53,7 +65,8 @@ impl GitService for ExternalGit {
             }
         })
         .await
-        .map_err(|e| crate::Error::Git(e.to_string()))??;
+        .map_err(|e| crate::Error::Git(e.to_string()))?
+        .map_err(spawn_error)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -78,7 +91,8 @@ impl GitService for ExternalGit {
             }
         })
         .await
-        .map_err(|e| crate::Error::Git(e.to_string()))??;
+        .map_err(|e| crate::Error::Git(e.to_string()))?
+        .map_err(spawn_error)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -102,7 +116,8 @@ impl GitService for ExternalGit {
             }
         })
         .await
-        .map_err(|e| crate::Error::Git(e.to_string()))??;
+        .map_err(|e| crate::Error::Git(e.to_string()))?
+        .map_err(spawn_error)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -124,7 +139,7 @@ impl GitService for ExternalGit {
                 cmd.current_dir(&path);
                 cmd.arg("fetch").arg("origin");
                 cmd.arg("refs/heads/*:refs/heads/*");
-                let out = cmd.output().map_err(|e| crate::Error::Git(e.to_string()))?;
+                let out = cmd.output().map_err(spawn_error)?;
                 if !out.status.success() {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     return Err(crate::Error::Git(format!(
@@ -137,7 +152,7 @@ impl GitService for ExternalGit {
                 let mut cmd = Self::git_cmd();
                 cmd.current_dir(&path);
                 cmd.arg("reset").arg("--hard").arg("HEAD");
-                let out = cmd.output().map_err(|e| crate::Error::Git(e.to_string()))?;
+                let out = cmd.output().map_err(spawn_error)?;
                 if !out.status.success() {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     return Err(crate::Error::Git(format!(
@@ -162,7 +177,7 @@ impl GitService for ExternalGit {
             .arg("origin")
             .current_dir(path)
             .output()
-            .map_err(|e| crate::Error::Git(e.to_string()))?;
+            .map_err(spawn_error)?;
 
         if output.status.success() {
             let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();

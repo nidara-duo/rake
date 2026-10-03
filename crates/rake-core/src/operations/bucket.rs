@@ -16,6 +16,18 @@ pub fn bucket_list_known() -> Vec<(&'static str, &'static str)> {
 
 pub fn bucket_add(session: &Session, name: &str, remote_url: &str) -> Result<()> {
     let _guard = session.write_lock()?;
+
+    // Buckets are git repositories, so git has to be present. Checked up front so the
+    // failure names the missing tool instead of surfacing as a bare "program not found"
+    // from the clone, and so no directories are created for a clone that cannot happen.
+    let git = crate::infra::git::ExternalGit::new();
+    let git_ready = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(git.is_installed())
+    });
+    if !git_ready {
+        return Err(crate::Error::GitNotFound);
+    }
+
     let root = session
         .config()
         .root_path

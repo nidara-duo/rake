@@ -20,7 +20,9 @@ pub enum Error {
     #[error("git error: {0}")]
     Git(String),
 
-    #[error("git not found: install Git from https://git-scm.com or run 'rake install git'")]
+    #[error(
+        "git not found: Rake needs Git to manage buckets. Install it from https://git-scm.com/download/win, then run 'rake bucket add main'."
+    )]
     GitNotFound,
 
     #[error("archive error: {0}")]

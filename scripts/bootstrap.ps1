@@ -192,49 +192,24 @@ function Verify-Checksum {
 # it requires administrator rights and writes HKLM\...\PendingFileRenameOperations —
 # unacceptable for a per-user tool, so it is not used.
 
-function Get-OwningProcessId {
-    # The immediate parent of this script is powershell.exe; its parent is the
-    # rake.exe that invoked us, and that is the process holding the exe lock.
-    try {
-        $ps = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID"
-        if (-not $ps) { return $null }
-        $parent = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($ps.ParentProcessId)"
-        if (-not $parent) { return $null }
-        if ($parent.Name -notlike "rake*") { return $null }
-        return [int]$parent.ProcessId
-    } catch {
-        return $null
-    }
-}
-
-function Start-DeferredDelete {
+function Report-DeferredCleanup {
+    # A running rake.exe holds a lock that survives until this command exits, so it
+    # cannot be removed from here. Report what is left and let `rake self` finish the
+    # job from a native helper — spawning a second PowerShell for one file deletion
+    # costs far more than the deletion itself.
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][int]$ProcessId,
-        # Directory to remove afterwards if this deletion empties it. The bin dir cannot
-        # be dropped while the exe is still locked, so the helper tidies it up later.
-        [string]$PruneEmptyDir = ""
+        [string]$PruneEmptyDir = "",
+        # An executable the helper may run from. Must not be $Path itself, since a
+        # process cannot delete the image it is executing from.
+        [string]$HelperExe = ""
     )
 
     if (-not (Test-Path $Path)) { return }
 
-    $script = "try { Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue } catch {}; " +
-              "Remove-Item -LiteralPath '$Path' -Force -ErrorAction SilentlyContinue"
-
-    if ($PruneEmptyDir) {
-        $script += "; if (Test-Path '$PruneEmptyDir') { " +
-                   "if (-not (Get-ChildItem '$PruneEmptyDir' -ErrorAction SilentlyContinue)) { " +
-                   "Remove-Item -LiteralPath '$PruneEmptyDir' -Force -ErrorAction SilentlyContinue } }"
-    }
-
-    try {
-        Start-Process -FilePath "powershell" `
-            -ArgumentList "-NoProfile", "-NonInteractive", "-Command", $script `
-            -WindowStyle Hidden -ErrorAction Stop | Out-Null
-        Write-Ok "Scheduled cleanup of $(Split-Path -Leaf $Path) after pid $ProcessId exits"
-    } catch {
-        Write-Host "  Note: could not schedule deferred cleanup; leftover file at $Path" -ForegroundColor Yellow
-    }
+    Write-Ok "$(Split-Path -Leaf $Path) is still locked and will be removed on exit"
+    # Machine-readable, on its own line, for the caller to pick up.
+    Write-Output "RAKE_DEFER_DELETE|$Path|$PruneEmptyDir|$HelperExe"
 }
 
 function Move-RunningExeAside {
@@ -345,15 +320,9 @@ function Install-Binary {
     Write-Ok "Installed $ExePath"
 
     if ($stale) {
-        $owner = Get-OwningProcessId
-        if ($owner) {
-            Start-DeferredDelete -Path $stale -ProcessId $owner
-        } else {
-            Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
-            if (Test-Path $stale) {
-                Write-Host "  Note: leftover file at $stale" -ForegroundColor Yellow
-            }
-        }
+        # The freshly written rake.exe is a different file from the one that was moved
+        # aside, so the helper can run from it.
+        Report-DeferredCleanup -Path $stale -HelperExe $ExePath
     }
 }
 
@@ -435,17 +404,10 @@ function Action-Uninstall {
         Move-Item -LiteralPath $ExePath -Destination $doomed -Force
         Write-Ok "Moved $ExePath aside for removal"
 
-        $owner = Get-OwningProcessId
-        if ($owner) {
-            Start-DeferredDelete -Path $doomed -ProcessId $owner -PruneEmptyDir $BinDir
-            $exeGone = $false
-        } else {
-            Remove-Item -LiteralPath $doomed -Force -ErrorAction SilentlyContinue
-            if (Test-Path $doomed) {
-                Write-Error "Could not remove $doomed — delete it manually."
-                $exeGone = $false
-            }
-        }
+        # No helper executable is named here: the only binary left is the locked one
+        # itself, so `rake self` copies it aside before running the cleanup from it.
+        Report-DeferredCleanup -Path $doomed -PruneEmptyDir $BinDir
+        $exeGone = $false
     } else {
         Write-Ok "Rake is not installed"
     }
@@ -488,8 +450,8 @@ function Action-Uninstall {
         Write-Step "Rake has been uninstalled."
     } else {
         Write-Step "Rake has been uninstalled."
-        Write-Host "  rake.exe is still running and will be deleted as soon as this command exits."
-        Write-Host "  The bin directory will remain until then."
+        Write-Host "  rake.exe is still running; it and the bin directory will be removed"
+        Write-Host "  as soon as this command exits."
     }
 }
 

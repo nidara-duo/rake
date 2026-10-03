@@ -5,6 +5,7 @@ pub mod git;
 pub mod http;
 pub mod persist;
 pub mod script;
+pub mod self_replace;
 pub mod shim;
 pub mod shortcut;
 pub mod system;

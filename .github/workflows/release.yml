@@ -35,12 +35,14 @@ jobs:
           $name = "rake-${{ matrix.target }}"
           $zip = "$name.zip"
           $src = "target/${{ matrix.target }}/release/rake.exe"
-          $bs  = "scripts/bootstrap.ps1"
           if (-not (Test-Path $src)) {
             Write-Error "Build artifact not found: $src"
             exit 1
           }
-          Compress-Archive -Path $src, $bs -DestinationPath $zip
+          # Only the executable: `rake self install/update/uninstall` are implemented in
+          # Rust, so releases no longer need to carry a bootstrap script. scripts/bootstrap.ps1
+          # exists solely to fetch the very first binary and is not published in the archive.
+          Compress-Archive -Path $src -DestinationPath $zip
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           Set-Content -Path "$zip.sha256" -Value "$hash  $zip"
           Write-Output "Packaged: $zip"

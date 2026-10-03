@@ -14,6 +14,9 @@ use crate::event::{DownloadProgress, Event};
 pub trait HttpClient: Send + Sync {
     async fn content_length(&self, url: &str) -> Result<Option<u64>>;
 
+    /// Fetch a small text resource, such as a release manifest or a checksum file.
+    async fn get_text(&self, url: &str) -> Result<String>;
+
     async fn download(
         &self,
         url: &str,
@@ -54,6 +57,21 @@ impl ReqwestClient {
 
 #[async_trait]
 impl HttpClient for ReqwestClient {
+    async fn get_text(&self, url: &str) -> Result<String> {
+        let resp = self.inner.get(url).send().await?;
+
+        if !resp.status().is_success() {
+            return Err(crate::Error::Download(format!(
+                "GET {url} returned {}",
+                resp.status()
+            )));
+        }
+
+        resp.text()
+            .await
+            .map_err(|e| crate::Error::Download(format!("read {url}: {e}")))
+    }
+
     async fn content_length(&self, url: &str) -> Result<Option<u64>> {
         // 1) Быстрый путь: HEAD. Работает для простых статических файловых
         //    серверов, но НЕ работает для многих реальных хостингов (см. ниже).

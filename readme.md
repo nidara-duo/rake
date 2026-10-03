@@ -39,7 +39,7 @@ Thanks to Rust's native compilation and highly optimized I/O operations, Rake ex
 - **Blazing Fast Performance** — No more waiting for cold PowerShell startup overhead.
 - **Pure Autonomy** — Ships as a single standalone `rake.exe` binary. No heavy PowerShell session is spawned for daily tasks.
 - **Flawless Scoop Compatibility** — Instantly inherits existing Scoop installation paths, configuration, local buckets, and downloaded cache.
-- **Elegant Decoupling** — Package management logic stays inside the core engine, while self-updates and complex installations leverage a lightweight, non-intrusive bootstrap mechanism.
+- **Elegant Decoupling** — Package management logic stays inside the core engine, and Rake manages its own binary through the same infrastructure. PowerShell is used only where manifests require it: `pre_install`, `install` and `post_install` scripts are authored in PowerShell and run through it.
 - **Secure by Default** — Strict SHA-256 validation for all remote assets and internal releases.
 
 ---
@@ -84,11 +84,21 @@ cargo build --release
 Your compiled binary will be available at `target/release/rake.exe`.
 
 🔄 Self-Updating
-Rake cleanly separates package management from binary orchestration. To safely update rake.exe to the latest stable release without locking files currently in use, simply run:
+`rake self` manages Rake's own binary — `install`, `update` and `uninstall` are implemented in Rust, so no external script is involved:
 
-PowerShell
-rake self update
-This triggers the background bootstrap wrapper to fetch, verify, and cleanly swap the executable in place.
+```PowerShell
+rake self update          # fetch the latest release, verify its SHA-256, swap the binary
+rake self uninstall       # remove the binary and its PATH entry
+```
+
+Windows locks a running executable, so the current one cannot be overwritten in place. Rake renames it aside, writes the replacement, and removes the leftover on its next start — the same approach Scoop takes with its old version directory.
+
+To exercise these commands against a local build instead of a published release:
+
+```PowerShell
+rake self install --local target\release\rake.exe
+rake self update  --local target\release\rake.exe
+```
 
 🛠️ Available Commands
 Rake ships with a comprehensive set of CLI commands, fully mirroring the Scoop workflow:

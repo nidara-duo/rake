@@ -1,6 +1,6 @@
 # <img src="../assets/rake_logo.ico" width="42" height="42" valign="middle" alt="Rake Logo"> Rake（Rust 重写的 Scoop）
 
-[![版本](https://img.shields.io/badge/version-0.1.0-blue?style=for-the-badge)](https://github.com/nidara-duo/rake/releases)
+[![版本](https://img.shields.io/badge/version-0.1.2-blue?style=for-the-badge)](https://github.com/nidara-duo/rake/releases)
 [![许可证](https://img.shields.io/badge/license-GPL--3.0-green?style=for-the-badge)](LICENSE)
 [![平台 Windows](https://img.shields.io/badge/platform-windows-0078d7?style=for-the-badge&logo=windows)](https://www.microsoft.com/windows)
 [![语言 Rust](https://img.shields.io/badge/language-Rust-ea4aaa?style=for-the-badge&logo=rust)](https://www.rust-lang.org)

@@ -12,16 +12,24 @@
     update    – Update Rake to the latest stable version (replaces binary).
     uninstall – Remove Rake and clean up.
 
+.PARAMETER Source
+    Path to a locally built rake.exe. When set, no release download happens —
+    the binary is packaged straight into the install payload. Useful for
+    exercising the self-management flow without spending bandwidth.
+
 .EXAMPLE
     .\bootstrap.ps1 install
     .\bootstrap.ps1 update
     .\bootstrap.ps1 uninstall
+    .\bootstrap.ps1 update -Source ..\target\release\rake.exe
 #>
 
 param(
     [Parameter(Position = 0)]
     [ValidateSet("install", "update", "uninstall")]
-    [string]$Action = "install"
+    [string]$Action = "install",
+
+    [string]$Source = ""
 )
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -56,18 +64,9 @@ function Clean-Temp {
     }
 }
 
-function Assert-Admin {
-    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object System.Security.Principal.WindowsPrincipal($id)
-    if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Error "This action requires administrator privileges."
-        exit 1
-    }
-}
-
 function Add-ToPath {
     param([string]$Dir)
-    $scope = if ($Action -eq "install" -or $Action -eq "update") { "User" } else { "User" }
+    $scope = "User"
     $current = [Environment]::GetEnvironmentVariable("PATH", $scope)
     if ($current -split ";" -notcontains $Dir) {
         $newPath = if ($current.EndsWith(";")) { "$current$Dir" } else { "$current;$Dir" }
@@ -80,7 +79,15 @@ function Remove-FromPath {
     param([string]$Dir)
     $scope = "User"
     $current = [Environment]::GetEnvironmentVariable("PATH", $scope)
-    $entries = $current -split ";" | Where-Object { $_ -ne "" -and $_ -ne $Dir }
+    if (-not $current) { return }
+
+    # Compare case-insensitively: PATH entries are Windows paths.
+    $entries = $current -split ";" | Where-Object { $_ -ne "" -and $_ -ine $Dir }
+    if ($entries.Count -eq ($current -split ";" | Where-Object { $_ -ne "" }).Count) {
+        Write-Ok "'$Dir' was not in PATH"
+        return
+    }
+
     $newPath = $entries -join ";"
     [Environment]::SetEnvironmentVariable("PATH", $newPath, $scope)
     Write-Ok "Removed '$Dir' from PATH"
@@ -100,19 +107,16 @@ function Get-ArchSuffix {
 }
 
 function Get-LatestRelease {
-    param([switch]$PreRelease)
     $url = "$ApiUrl/latest"
     try {
         $release = Invoke-RestMethod -Uri $url -UseBasicParsing -ErrorAction Stop
         return $release
     } catch {
-        if (-not $PreRelease) {
-            try {
-                $all = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing -ErrorAction Stop
-                $stable = $all | Where-Object { -not $_.prerelease -and $_.tag_name -match '^v\d+\.\d+\.\d+$' } | Select-Object -First 1
-                if ($stable) { return $stable }
-            } catch {}
-        }
+        try {
+            $all = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing -ErrorAction Stop
+            $stable = $all | Where-Object { -not $_.prerelease -and $_.tag_name -match '^v\d+\.\d+\.\d+$' } | Select-Object -First 1
+            if ($stable) { return $stable }
+        } catch {}
         return $null
     }
 }
@@ -176,38 +180,187 @@ function Verify-Checksum {
     return $true
 }
 
+# ─── Self-replacement ─────────────────────────────────────────────────────────
+#
+# Windows holds an exclusive lock on a running image: the running rake.exe can be
+# neither overwritten nor deleted, and `Expand-Archive -Force` over it fails with
+# "Access to the path ... is denied". Renaming it aside is permitted, which frees
+# the original name for writing. The renamed file is still locked, so it is removed
+# by a detached helper once the owning process exits.
+#
+# `MoveFileEx` with MOVEFILE_DELAY_UNTIL_REBOOT would defer the delete to the OS, but
+# it requires administrator rights and writes HKLM\...\PendingFileRenameOperations —
+# unacceptable for a per-user tool, so it is not used.
+
+function Get-OwningProcessId {
+    # The immediate parent of this script is powershell.exe; its parent is the
+    # rake.exe that invoked us, and that is the process holding the exe lock.
+    try {
+        $ps = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID"
+        if (-not $ps) { return $null }
+        $parent = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($ps.ParentProcessId)"
+        if (-not $parent) { return $null }
+        if ($parent.Name -notlike "rake*") { return $null }
+        return [int]$parent.ProcessId
+    } catch {
+        return $null
+    }
+}
+
+function Start-DeferredDelete {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        # Directory to remove afterwards if this deletion empties it. The bin dir cannot
+        # be dropped while the exe is still locked, so the helper tidies it up later.
+        [string]$PruneEmptyDir = ""
+    )
+
+    if (-not (Test-Path $Path)) { return }
+
+    $script = "try { Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue } catch {}; " +
+              "Remove-Item -LiteralPath '$Path' -Force -ErrorAction SilentlyContinue"
+
+    if ($PruneEmptyDir) {
+        $script += "; if (Test-Path '$PruneEmptyDir') { " +
+                   "if (-not (Get-ChildItem '$PruneEmptyDir' -ErrorAction SilentlyContinue)) { " +
+                   "Remove-Item -LiteralPath '$PruneEmptyDir' -Force -ErrorAction SilentlyContinue } }"
+    }
+
+    try {
+        Start-Process -FilePath "powershell" `
+            -ArgumentList "-NoProfile", "-NonInteractive", "-Command", $script `
+            -WindowStyle Hidden -ErrorAction Stop | Out-Null
+        Write-Ok "Scheduled cleanup of $(Split-Path -Leaf $Path) after pid $ProcessId exits"
+    } catch {
+        Write-Host "  Note: could not schedule deferred cleanup; leftover file at $Path" -ForegroundColor Yellow
+    }
+}
+
+function Move-RunningExeAside {
+    # Returns the path the old binary was moved to, or $null when there was nothing to move.
+    if (-not (Test-Path $ExePath)) { return $null }
+
+    $stale = "$BinDir\rake.exe.old"
+    if (Test-Path $stale) {
+        Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
+    }
+
+    Move-Item -LiteralPath $ExePath -Destination $stale -Force
+    Write-Ok "Moved existing rake.exe aside to $(Split-Path -Leaf $stale)"
+    return $stale
+}
+
+function Restore-MovedExe {
+    param([string]$StalePath)
+    if ($StalePath -and (Test-Path $StalePath)) {
+        Move-Item -LiteralPath $StalePath -Destination $ExePath -Force
+        Write-Ok "Restored previous rake.exe"
+    }
+}
+
+function New-LocalPayload {
+    # Packages a locally built binary into the same zip layout the CI release produces,
+    # so both payload sources feed an identical install path.
+    if (-not (Test-Path $Source)) {
+        throw "Local source not found: $Source"
+    }
+
+    $stage = "$TempDir\stage"
+    Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+    Ensure-Directory $stage
+
+    Copy-Item -LiteralPath $Source -Destination "$stage\rake.exe" -Force
+    if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
+        Copy-Item -LiteralPath $PSCommandPath -Destination "$stage\bootstrap.ps1" -Force
+    }
+
+    $payload = "$TempDir\rake-local.zip"
+    Compress-Archive -Path "$stage\rake.exe", "$stage\bootstrap.ps1" -DestinationPath $payload -Force
+    return $payload
+}
+
+function Resolve-Payload {
+    if ($Source) {
+        Write-Step "Using local payload from $Source"
+        Ensure-Directory $TempDir
+        return New-LocalPayload
+    }
+
+    # Resolve arch
+    $suffix = Get-ArchSuffix
+    Write-Step "Target architecture: $suffix"
+
+    # Fetch latest release
+    Write-Step "Querying latest release from $Repo"
+    $release = Get-LatestRelease
+    if (-not $release) {
+        Write-Error "Could not find any stable release for $Repo"
+        exit 1
+    }
+    Write-Ok "Latest: $($release.tag_name)"
+
+    # Locate asset
+    $asset = Get-Asset $release $suffix
+    if (-not $asset) {
+        Write-Error "No asset found for architecture '$suffix' in release $($release.tag_name)"
+        exit 1
+    }
+
+    $zipPath = "$TempDir\$($asset.Name)"
+
+    # Download archive
+    Download-File -Url $asset.Url -OutFile $zipPath
+
+    # Verify checksum
+    Write-Step "Verifying checksum"
+    $expectedHash = Get-Checksum $release $asset.Name
+    if (-not (Verify-Checksum -FilePath $zipPath -ExpectedHash $expectedHash)) {
+        Clean-Temp
+        exit 1
+    }
+
+    return $zipPath
+}
+
 function Install-Binary {
     param([string]$ZipPath)
+
     Ensure-Directory $BinDir
     Write-Step "Extracting $ZipPath → $BinDir"
-    Expand-Archive -Path $ZipPath -DestinationPath $BinDir -Force
+
+    $stale = Move-RunningExeAside
+    try {
+        Expand-Archive -Path $ZipPath -DestinationPath $BinDir -Force
+    } catch {
+        Restore-MovedExe $stale
+        throw
+    }
+
     if (-not (Test-Path $ExePath)) {
+        Restore-MovedExe $stale
         throw "rake.exe not found after extraction"
     }
+
     Write-Ok "Installed $ExePath"
+
+    if ($stale) {
+        $owner = Get-OwningProcessId
+        if ($owner) {
+            Start-DeferredDelete -Path $stale -ProcessId $owner
+        } else {
+            Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
+            if (Test-Path $stale) {
+                Write-Host "  Note: leftover file at $stale" -ForegroundColor Yellow
+            }
+        }
+    }
 }
 
 function Ensure-Directory {
     param([string]$Path)
     if (-not (Test-Path $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
-    }
-}
-
-function Backup-Exe {
-    $backup = "$BinDir\rake.exe.old"
-    if (Test-Path $ExePath) {
-        Copy-Item -Path $ExePath -Destination $backup -Force
-        return $backup
-    }
-    return $null
-}
-
-function Restore-Backup {
-    param([string]$BackupPath)
-    if ($BackupPath -and (Test-Path $BackupPath)) {
-        Move-Item -Path $BackupPath -Destination $ExePath -Force
-        Write-Ok "Restored previous version"
     }
 }
 
@@ -219,48 +372,10 @@ function Action-Install {
     Clean-Temp
     Ensure-Directory $TempDir
 
-    # Resolve arch
-    $suffix = Get-ArchSuffix
-    Write-Step "Target architecture: $suffix"
-
-    # Fetch latest release
-    Write-Step "Querying latest release from $Repo"
-    $release = Get-LatestRelease
-    if (-not $release) {
-        Write-Error "Could not find any stable release for $Repo"
-        exit 1
-    }
-    Write-Ok "Latest: $($release.tag_name)"
-
-    # Locate asset
-    $asset = Get-Asset $release $suffix
-    if (-not $asset) {
-        Write-Error "No asset found for architecture '$suffix' in release $($release.tag_name)"
-        exit 1
-    }
-
-    $zipPath = "$TempDir\$($asset.Name)"
-
-    # Download archive
-    Download-File -Url $asset.Url -OutFile $zipPath
-
-    # Verify checksum
-    Write-Step "Verifying checksum"
-    $expectedHash = Get-Checksum $release $asset.Name
-    if (-not (Verify-Checksum -FilePath $zipPath -ExpectedHash $expectedHash)) {
-        Clean-Temp
-        exit 1
-    }
+    $payload = Resolve-Payload
 
     # Install
-    Ensure-Directory $BinDir
-    Install-Binary $zipPath
-
-    # Copy bootstrap alongside the binary
-    if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
-        Copy-Item -Path $PSCommandPath -Destination "$BinDir\bootstrap.ps1" -Force
-        Write-Ok "Copied bootstrap.ps1 alongside rake.exe"
-    }
+    Install-Binary $payload
 
     # PATH
     Add-ToPath $BinDir
@@ -268,7 +383,11 @@ function Action-Install {
     # Cleanup
     Clean-Temp
 
-    Write-Step "Rake $($release.tag_name) installed successfully!"
+    if ($Source) {
+        Write-Step "Rake installed successfully from local source!"
+    } else {
+        Write-Step "Rake installed successfully!"
+    }
     Write-Host "  Binary: $ExePath"
     Write-Host "  Run 'rake --help' to get started."
 }
@@ -277,113 +396,101 @@ function Action-Update {
     Write-Step "Updating Rake"
 
     if (-not (Test-Path $ExePath)) {
-        Write-Error "Rake is not installed. Run 'bootstrap.ps1 install' first."
+        Write-Error "Rake is not installed at $ExePath. Run 'rake self install' first."
         exit 1
     }
 
     Clean-Temp
     Ensure-Directory $TempDir
 
-    # Resolve arch
-    $suffix = Get-ArchSuffix
-    Write-Step "Target architecture: $suffix"
+    $payload = Resolve-Payload
 
-    # Fetch latest release
-    Write-Step "Querying latest release from $Repo"
-    $release = Get-LatestRelease
-    if (-not $release) {
-        Write-Error "Could not find any stable release for $Repo"
-        exit 1
-    }
-    Write-Ok "Latest: $($release.tag_name)"
-
-    # Locate asset
-    $asset = Get-Asset $release $suffix
-    if (-not $asset) {
-        Write-Error "No asset found for architecture '$suffix' in release $($release.tag_name)"
-        exit 1
-    }
-
-    $zipPath = "$TempDir\$($asset.Name)"
-
-    # Download archive
-    Download-File -Url $asset.Url -OutFile $zipPath
-
-    # Verify checksum
-    Write-Step "Verifying checksum"
-    $expectedHash = Get-Checksum $release $asset.Name
-    if (-not (Verify-Checksum -FilePath $zipPath -ExpectedHash $expectedHash)) {
-        Clean-Temp
-        exit 1
-    }
-
-    # Backup current binary
-    Write-Step "Safely replacing rake.exe"
-    $backup = Backup-Exe
-
+    Write-Step "Replacing rake.exe in place"
     try {
-        Install-Binary $zipPath
-        if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
-            Copy-Item -Path $PSCommandPath -Destination "$BinDir\bootstrap.ps1" -Force
-        }
-
-        # Remove backup on success
-        if ($backup -and (Test-Path $backup)) {
-            Remove-Item -Path $backup -Force
-        }
-
-        Clean-Temp
-        Write-Step "Rake updated to $($release.tag_name)!"
+        Install-Binary $payload
     } catch {
         Write-Error "Update failed: $_"
-        Restore-Backup $backup
         Clean-Temp
         exit 1
+    }
+
+    Clean-Temp
+    Write-Step "Rake updated successfully!"
+    if (-not $Source) {
+        Write-Host "  Run 'rake --version' to confirm."
     }
 }
 
 function Action-Uninstall {
     Write-Step "Uninstalling Rake"
 
-    if (-not (Test-Path $ExePath)) {
-        Write-Ok "Rake is not installed"
+    # When invoked via `rake self uninstall`, this script runs as a child of the very
+    # rake.exe being removed, so the binary is locked and cannot be deleted outright.
+    # Move it aside first — renaming a running image is permitted — then let a detached
+    # helper delete it once we exit. Doing it in this order means the reported result
+    # reflects what will actually be true rather than what we hope will be true.
+    $exeGone = $true
+    if (Test-Path $ExePath) {
+        $doomed = "$BinDir\rake.exe.removing"
+        Move-Item -LiteralPath $ExePath -Destination $doomed -Force
+        Write-Ok "Moved $ExePath aside for removal"
+
+        $owner = Get-OwningProcessId
+        if ($owner) {
+            Start-DeferredDelete -Path $doomed -ProcessId $owner -PruneEmptyDir $BinDir
+            $exeGone = $false
+        } else {
+            Remove-Item -LiteralPath $doomed -Force -ErrorAction SilentlyContinue
+            if (Test-Path $doomed) {
+                Write-Error "Could not remove $doomed — delete it manually."
+                $exeGone = $false
+            }
+        }
     } else {
-        Remove-Item -Path $ExePath -Force
-        Write-Ok "Removed $ExePath"
+        Write-Ok "Rake is not installed"
     }
 
-    # Remove bootstrap.ps1 from bin dir
-    $bsInBin = "$BinDir\bootstrap.ps1"
-    if (Test-Path $bsInBin) {
-        Remove-Item -Path $bsInBin -Force
-    }
-
-    # Remove bin dir if empty
-    if (Test-Path $BinDir) {
-        $remaining = Get-ChildItem $BinDir -ErrorAction SilentlyContinue
-        if (-not $remaining) {
-            Remove-Item -Path $BinDir -Force
-            Write-Ok "Removed $BinDir"
+    # bootstrap.ps1 is not running, so it goes immediately. The .old name is the
+    # deferred-delete target used by update; clean it up if it survived a crash.
+    foreach ($leftover in @("$BinDir\bootstrap.ps1", "$BinDir\rake.exe.old")) {
+        if (Test-Path $leftover) {
+            Remove-Item -Path $leftover -Force -ErrorAction SilentlyContinue
         }
     }
 
-    # PATH cleanup
+    # PATH cleanup — always, even if the binary is still finishing removal
     Remove-FromPath $BinDir
 
-    # Ask about full install root removal
-    if (Test-Path $InstallRoot) {
-        $remaining = Get-ChildItem $InstallRoot -Recurse -ErrorAction SilentlyContinue
-        if ($remaining) {
-            Write-Host ""
-            Write-Host "Note: $InstallRoot still contains files (apps, cache, etc.)."
-            Write-Host "Remove them manually if no longer needed."
-        } else {
-            Remove-Item -Path $InstallRoot -Force
-            Write-Ok "Removed $InstallRoot"
+    # Directory cleanup is deferred alongside the exe: while rake.exe.removing is still
+    # locked the bin dir cannot be emptied anyway, so leave the bookkeeping to a later
+    # run rather than pretending it succeeded.
+    if ($exeGone) {
+        if (Test-Path $BinDir) {
+            $remaining = Get-ChildItem $BinDir -ErrorAction SilentlyContinue
+            if (-not $remaining) {
+                Remove-Item -Path $BinDir -Force
+                Write-Ok "Removed $BinDir"
+            }
         }
-    }
 
-    Write-Step "Rake has been uninstalled."
+        if (Test-Path $InstallRoot) {
+            $remaining = Get-ChildItem $InstallRoot -Recurse -ErrorAction SilentlyContinue
+            if ($remaining) {
+                Write-Host ""
+                Write-Host "Note: $InstallRoot still contains files (apps, cache, etc.)."
+                Write-Host "Remove them manually if no longer needed."
+            } else {
+                Remove-Item -Path $InstallRoot -Force
+                Write-Ok "Removed $InstallRoot"
+            }
+        }
+
+        Write-Step "Rake has been uninstalled."
+    } else {
+        Write-Step "Rake has been uninstalled."
+        Write-Host "  rake.exe is still running and will be deleted as soon as this command exits."
+        Write-Host "  The bin directory will remain until then."
+    }
 }
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────

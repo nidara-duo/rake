@@ -52,10 +52,16 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
 
             let header_cells = ["Name", "Version", "Filename", "Size"]
                 .into_iter()
-                .map(|title| {
-                    Cell::new(title)
+                .enumerate()
+                .map(|(i, title)| {
+                    let cell = Cell::new(title)
                         .add_attribute(Attribute::Bold)
-                        .fg(Color::Green)
+                        .fg(Color::Green);
+                    if i == 3 {
+                        cell.set_alignment(comfy_table::CellAlignment::Right)
+                    } else {
+                        cell
+                    }
                 });
             table.set_header(header_cells);
 
@@ -67,7 +73,9 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
                     Cell::new(f.name()),
                     Cell::new(f.version()),
                     Cell::new(f.filename()).add_attribute(Attribute::Dim),
-                    Cell::new(human_size(size)).fg(Color::Green),
+                    Cell::new(human_size(size))
+                        .fg(Color::Green)
+                        .set_alignment(comfy_table::CellAlignment::Right),
                 ]);
             }
 
@@ -79,7 +87,9 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
                         .set_alignment(comfy_table::CellAlignment::Right),
                     Cell::new(format!("{} files", total_count)),
                     Cell::new(""),
-                    Cell::new(human_size(total_size)).add_attribute(Attribute::Bold),
+                    Cell::new(human_size(total_size))
+                        .add_attribute(Attribute::Bold)
+                        .set_alignment(comfy_table::CellAlignment::Right),
                 ]);
                 println!("{table}");
             } else {

@@ -1,0 +1,22 @@
+# Link the MSVC runtime statically.
+#
+# By default Rust links the CRT dynamically, which makes the binary depend on
+# `vcruntime140.dll` from the Visual C++ Redistributable. That redistributable is not
+# part of Windows, so the published binary failed to start on a clean machine with
+# "The code execution cannot proceed because VCRUNTIME140.dll was not found".
+#
+# Statically linking keeps C dependencies (libgit2-sys, lzma-sys, bzip2, zstd) working
+# while removing the requirement, so a single rake.exe runs anywhere without an
+# installer. The cost is a larger executable.
+#
+# Only the MSVC triples are listed: they are what the release workflow builds, and they
+# are the ones that use the VC runtime.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,15 +1,12 @@
 mod cmd;
-mod internal;
 mod util;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Cleanup of a locked binary runs before session setup: it must work regardless of
-    // configuration, and it deliberately skips tracing and any other startup work.
-    let args: Vec<String> = std::env::args().collect();
-    if internal::dispatch(&args) {
-        return Ok(());
-    }
+    // A binary renamed aside by a previous replacement is still on disk; this is the
+    // first moment its lock is guaranteed to be released, so clear it before anything
+    // else. Cheap, silent, and never fatal.
+    rake_core::infra::self_replace::sweep_stale_artifacts();
 
     cmd::start().await
 }

@@ -184,46 +184,112 @@ function Verify-Checksum {
 #
 # Windows holds an exclusive lock on a running image: the running rake.exe can be
 # neither overwritten nor deleted, and `Expand-Archive -Force` over it fails with
-# "Access to the path ... is denied". Renaming it aside is permitted, which frees
-# the original name for writing. The renamed file is still locked, so it is removed
-# by a detached helper once the owning process exits.
+# "Access to the path ... is denied". Renaming it aside is permitted, which frees the
+# original name for writing. The renamed file stays locked until this command exits,
+# so what happens next depends on whether there will be another run to clean up:
+#
+#   update    — leave it behind as <binary>.old and let the next Rake startup sweep
+#               it. This is what Scoop does with its old version directory.
+#   uninstall — nothing will ever run again, so a detached helper has to finish it.
 #
 # `MoveFileEx` with MOVEFILE_DELAY_UNTIL_REBOOT would defer the delete to the OS, but
 # it requires administrator rights and writes HKLM\...\PendingFileRenameOperations —
-# unacceptable for a per-user tool, so it is not used.
-
-function Report-DeferredCleanup {
-    # A running rake.exe holds a lock that survives until this command exits, so it
-    # cannot be removed from here. Report what is left and let `rake self` finish the
-    # job from a native helper — spawning a second PowerShell for one file deletion
-    # costs far more than the deletion itself.
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [string]$PruneEmptyDir = "",
-        # An executable the helper may run from. Must not be $Path itself, since a
-        # process cannot delete the image it is executing from.
-        [string]$HelperExe = ""
-    )
-
-    if (-not (Test-Path $Path)) { return }
-
-    Write-Ok "$(Split-Path -Leaf $Path) is still locked and will be removed on exit"
-    # Machine-readable, on its own line, for the caller to pick up.
-    Write-Output "RAKE_DEFER_DELETE|$Path|$PruneEmptyDir|$HelperExe"
-}
+# unacceptable for a per-user tool, so it is not used. `FileDispositionInfoEx` with
+# POSIX semantics would allow deleting an open image but was refused on the target
+# system (win32err=24).
 
 function Move-RunningExeAside {
-    # Returns the path the old binary was moved to, or $null when there was nothing to move.
+    # Renames the running binary out of the way so a replacement can be written at the
+    # original name. Returns the path it was moved to, or $null when there was nothing
+    # to move.
     if (-not (Test-Path $ExePath)) { return $null }
 
     $stale = "$BinDir\rake.exe.old"
+
+    # An earlier replacement may have left this name occupied. Normally it is already
+    # gone — every Rake startup sweeps it — but an antivirus scanner can still be
+    # holding a binary written moments ago, so retry briefly instead of failing. The
+    # fixed name is deliberate: Scoop avoids collisions by appending an incrementing
+    # suffix, which only works because it also has a directory scan to clean up
+    # afterwards. Here that scan would run on every invocation, so a name that cannot
+    # collide is worth more than tolerating one and reporting it clearly.
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        if (-not (Test-Path $stale)) { break }
+        try {
+            Remove-Item -LiteralPath $stale -Force -ErrorAction Stop
+        } catch {
+            Start-Sleep -Milliseconds (200 * $attempt)
+        }
+    }
+
     if (Test-Path $stale) {
-        Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
+        # Thrown rather than exited so the caller's rollback path still runs.
+        throw "Cannot replace $stale because another process is using it. Close any running Rake (or wait for an antivirus scan to finish) and try again."
     }
 
     Move-Item -LiteralPath $ExePath -Destination $stale -Force
-    Write-Ok "Moved existing rake.exe aside to $(Split-Path -Leaf $stale)"
+    Write-Ok "Moved existing rake.exe aside as $(Split-Path -Leaf $stale)"
     return $stale
+}
+
+function Remove-EmptyDir {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return }
+    if (Get-ChildItem $Path -ErrorAction SilentlyContinue) { return }
+    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+}
+
+function Start-DelayedCleanup {
+    # The renamed binary stays locked until this script — and the rake.exe that started
+    # it — has exited, so a detached helper finishes the job afterwards. Sweeping the
+    # leftover on the next startup, the way Scoop handles its old directory, would be
+    # simpler, but it is not available here: uninstalling removes the very binary that
+    # would do the sweeping, so no next run ever comes.
+    param(
+        [Parameter(Mandatory = $true)][string]$Stale,
+        [Parameter(Mandatory = $true)][string]$BinDir,
+        [Parameter(Mandatory = $true)][string]$InstallRoot
+    )
+
+    $script = Join-Path $env:TEMP ("rake-cleanup-{0}.cmd" -f $PID)
+    $body = @'
+@echo off
+setlocal
+set "OLD=%OLD%"
+set "BIN=%BIN%"
+set "ROOT=%ROOT%"
+
+rem Wait for the owning rake.exe to exit, then delete the binary it renamed aside.
+for /L %%i in (1,1,30) do (
+    if exist "%OLD%" (
+        ping -n 2 127.0.0.1 >nul
+        del /f /q "%OLD%" >nul 2>&1
+    )
+)
+
+call :prune "%BIN%"
+call :prune "%ROOT%"
+del /f /q "%~f0"
+exit /b 0
+
+:prune
+if not exist "%~1" exit /b 0
+rem "dir /b" prints one line per entry, so any output means the directory is not empty.
+rem Note that "if not exist <dir>\*" is not a valid emptiness test — it matches the
+rem directory itself even when empty — hence this loop.
+for /f %%i in ('dir /b /a "%~1" 2^>nul') do exit /b 0
+rmdir "%~1" >nul 2>&1
+exit /b 0
+'@
+    $body = $body.Replace('%OLD%', $Stale).Replace('%BIN%', $BinDir).Replace('%ROOT%', $InstallRoot)
+
+    try {
+        Set-Content -LiteralPath $script -Value $body -Encoding ASCII -ErrorAction Stop
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $script -WindowStyle Hidden -ErrorAction Stop | Out-Null
+        Write-Ok "Removing $(Split-Path -Leaf $Stale) as soon as this command exits"
+    } catch {
+        Write-Host "  Note: could not schedule cleanup; remove $Stale manually." -ForegroundColor Yellow
+    }
 }
 
 function Restore-MovedExe {
@@ -320,9 +386,9 @@ function Install-Binary {
     Write-Ok "Installed $ExePath"
 
     if ($stale) {
-        # The freshly written rake.exe is a different file from the one that was moved
-        # aside, so the helper can run from it.
-        Report-DeferredCleanup -Path $stale -HelperExe $ExePath
+        # Nothing to do here: the previous binary is unlocked the moment this command
+        # returns, and the next Rake startup sweeps it.
+        Write-Host "  $(Split-Path -Leaf $stale) will be removed on the next Rake run."
     }
 }
 
@@ -395,63 +461,42 @@ function Action-Uninstall {
 
     # When invoked via `rake self uninstall`, this script runs as a child of the very
     # rake.exe being removed, so the binary is locked and cannot be deleted outright.
-    # Move it aside first — renaming a running image is permitted — then let a detached
-    # helper delete it once we exit. Doing it in this order means the reported result
-    # reflects what will actually be true rather than what we hope will be true.
-    $exeGone = $true
+    # Rename it aside — permitted even while running — and let a detached helper delete
+    # it once we exit. Reporting honestly matters more than reporting optimistically.
+    $stale = $null
     if (Test-Path $ExePath) {
-        $doomed = "$BinDir\rake.exe.removing"
-        Move-Item -LiteralPath $ExePath -Destination $doomed -Force
-        Write-Ok "Moved $ExePath aside for removal"
-
-        # No helper executable is named here: the only binary left is the locked one
-        # itself, so `rake self` copies it aside before running the cleanup from it.
-        Report-DeferredCleanup -Path $doomed -PruneEmptyDir $BinDir
-        $exeGone = $false
+        $stale = Move-RunningExeAside
     } else {
         Write-Ok "Rake is not installed"
     }
 
-    # bootstrap.ps1 is not running, so it goes immediately. The .old name is the
-    # deferred-delete target used by update; clean it up if it survived a crash.
-    foreach ($leftover in @("$BinDir\bootstrap.ps1", "$BinDir\rake.exe.old")) {
-        if (Test-Path $leftover) {
-            Remove-Item -Path $leftover -Force -ErrorAction SilentlyContinue
-        }
+    # bootstrap.ps1 is not running, so it goes immediately.
+    if (Test-Path "$BinDir\bootstrap.ps1") {
+        Remove-Item -LiteralPath "$BinDir\bootstrap.ps1" -Force -ErrorAction SilentlyContinue
     }
 
     # PATH cleanup — always, even if the binary is still finishing removal
     Remove-FromPath $BinDir
 
-    # Directory cleanup is deferred alongside the exe: while rake.exe.removing is still
-    # locked the bin dir cannot be emptied anyway, so leave the bookkeeping to a later
-    # run rather than pretending it succeeded.
-    if ($exeGone) {
-        if (Test-Path $BinDir) {
-            $remaining = Get-ChildItem $BinDir -ErrorAction SilentlyContinue
-            if (-not $remaining) {
-                Remove-Item -Path $BinDir -Force
-                Write-Ok "Removed $BinDir"
-            }
-        }
-
+    if ($stale) {
+        Start-DelayedCleanup -Stale $stale -BinDir $BinDir -InstallRoot $InstallRoot
+        Write-Step "Rake has been uninstalled."
+        Write-Host "  rake.exe is still running; it and its directories will be removed"
+        Write-Host "  as soon as this command exits."
+    } else {
+        # Nothing was running, so nothing is locked and cleanup can finish here.
+        Remove-EmptyDir $BinDir
         if (Test-Path $InstallRoot) {
-            $remaining = Get-ChildItem $InstallRoot -Recurse -ErrorAction SilentlyContinue
-            if ($remaining) {
+            if (Get-ChildItem $InstallRoot -Recurse -ErrorAction SilentlyContinue) {
                 Write-Host ""
                 Write-Host "Note: $InstallRoot still contains files (apps, cache, etc.)."
                 Write-Host "Remove them manually if no longer needed."
             } else {
-                Remove-Item -Path $InstallRoot -Force
+                Remove-Item -LiteralPath $InstallRoot -Force -ErrorAction SilentlyContinue
                 Write-Ok "Removed $InstallRoot"
             }
         }
-
         Write-Step "Rake has been uninstalled."
-    } else {
-        Write-Step "Rake has been uninstalled."
-        Write-Host "  rake.exe is still running; it and the bin directory will be removed"
-        Write-Host "  as soon as this command exits."
     }
 }
 

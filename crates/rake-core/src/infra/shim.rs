@@ -37,17 +37,13 @@ impl BinEntry {
     }
 }
 
-/// Find the shim binary (shim.exe / rake-shim-bin.exe) next to the current executable.
-fn find_shim_bin() -> Option<PathBuf> {
-    let self_dir = std::env::current_exe().ok()?.parent()?.to_owned();
-    for name in &["shim.exe", "rake-shim-bin.exe"] {
-        let path = self_dir.join(name);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    None
-}
+/// The Scoop-compatible shim executable, embedded into rake at compile time.
+///
+/// `build.rs` builds the `rake-shim-bin` crate (vendored from
+/// `ScoopInstaller/Shim`) and copies the finished artifact into `OUT_DIR`, so a
+/// separate `shim.exe` never has to be shipped next to `rake.exe` nor looked up
+/// on disk at runtime. One embedded copy serves every shim.
+static SHIM_EXE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shim.exe"));
 
 /// Reject manifest-supplied names that could escape the intended output
 /// directory via path traversal (e.g. a malicious bucket manifest
@@ -68,7 +64,13 @@ fn validate_manifest_name(name: &str) -> Result<()> {
 }
 
 /// Create a single shim for a given target file.
-pub fn create_shim(target: &Path, name: &str, app_name: &str, shims_dir: &Path) -> Result<()> {
+pub fn create_shim(
+    target: &Path,
+    name: &str,
+    args: Option<&[String]>,
+    app_name: &str,
+    shims_dir: &Path,
+) -> Result<()> {
     validate_manifest_name(name)?;
     let target = target.canonicalize()?;
     let resolved_path = target.to_string_lossy().into_owned();
@@ -82,7 +84,7 @@ pub fn create_shim(target: &Path, name: &str, app_name: &str, shims_dir: &Path) 
     {
         // If name already has .exe extension, treat as exe target
         Some("exe" | "com") | None if is_exe_target(&target) => {
-            create_exe_shim(&target, &shim_base)?;
+            create_exe_shim(&target, &shim_base, args)?;
         }
         Some("bat" | "cmd") => {
             create_batch_shim(&resolved_path, &shim_base)?;
@@ -105,7 +107,7 @@ pub fn create_shim(target: &Path, name: &str, app_name: &str, shims_dir: &Path) 
                 .as_deref()
                 == Some("exe")
             {
-                create_exe_shim(&target, &shim_base)?;
+                create_exe_shim(&target, &shim_base, args)?;
             } else {
                 create_batch_shim(&resolved_path, &shim_base)?;
             }
@@ -124,24 +126,19 @@ fn is_exe_target(target: &Path) -> bool {
 }
 
 /// Create a shim for .exe / .com targets using shim.exe + .shim metadata.
-fn create_exe_shim(target: &Path, shim_base: &Path) -> Result<()> {
+fn create_exe_shim(target: &Path, shim_base: &Path, args: Option<&[String]>) -> Result<()> {
     let shim_exe_path = shim_base.with_extension("exe");
     let shim_file_path = shim_base.with_extension("shim");
 
-    // Copy shim.exe to the shim name
-    if let Some(shim_bin) = find_shim_bin() {
-        std::fs::copy(&shim_bin, &shim_exe_path)?;
-    } else {
-        // Fallback: write a basic cmd wrapper
-        let cmd_path = shim_base.with_extension("cmd");
-        let cmd_content = format!("@\"{target}\" %*\r\n", target = target.display());
-        std::fs::write(&cmd_path, cmd_content)?;
-        return Ok(());
-    }
+    // The shim binary is compiled into rake itself (see SHIM_EXE), so there is
+    // no external file to locate and no fallback path needed.
+    std::fs::write(&shim_exe_path, SHIM_EXE)?;
 
-    // Write .shim metadata (Scoop-compatible format)
-    let mut shim_content = String::new();
-    shim_content.push_str(&format!("path = \"{}\"\r\n", target.display()));
+    // .shim metadata, in the format scoop's shim reads.
+    let mut shim_content = format!("path = \"{}\"\r\n", target.display());
+    if let Some(args) = args.filter(|a| !a.is_empty()) {
+        shim_content.push_str(&format!("args = {}\r\n", args.join(" ")));
+    }
     std::fs::write(&shim_file_path, shim_content)?;
 
     Ok(())
@@ -274,7 +271,13 @@ pub fn create_shims(entries: &[BinEntry], app_dir: &Path, shims_dir: &Path) -> R
         if !target.exists() {
             continue;
         }
-        create_shim(&target, &entry.name, app_name, shims_dir)?;
+        create_shim(
+            &target,
+            &entry.name,
+            entry.args.as_deref(),
+            app_name,
+            shims_dir,
+        )?;
     }
     Ok(())
 }

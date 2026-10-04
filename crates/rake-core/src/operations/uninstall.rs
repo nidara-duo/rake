@@ -95,11 +95,10 @@ pub fn uninstall_packages(
                     session.env_service().remove_env(k)?;
                 }
             }
-            if let Some(env_add_path) = m.resolve_env_add_path(arch) {
-                for path in env_add_path.iter() {
-                    session.env_service().remove_path(path)?;
-                }
-            }
+            // Goes through install's shared resolver so the path removed is the one
+            // that was added. The previous code removed the raw manifest string
+            // ("bin"), which never appears in PATH, so the entry stayed forever.
+            crate::operations::install::remove_env_add_paths(m, arch, &app_dir.join("current"));
         }
 
         // 4. Remove shortcuts

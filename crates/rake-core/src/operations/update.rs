@@ -100,9 +100,9 @@ pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<
         };
         let old_version_dir_for_scripts = temp_backup_dir.as_ref().unwrap_or(&old_version_dir);
 
-        // --- ШАГ A: установить НОВУЮ версию первой. Если это упадёт — старая
-        // установка НЕ ТРОНУТА (ни один файл старой версии ещё не тронут),
-        // просто пропускаем этот пакет и идём дальше по батчу. ---
+        // --- STEP A: install the NEW version first. If this fails the old install is
+        // UNTOUCHED (not one file of it has been modified), so the package is simply
+        // skipped and the batch continues. ---
         let _ = tx.try_send(Event::UpdateProgress(
             "Installing new version...".to_owned(),
         ));
@@ -140,12 +140,12 @@ pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<
             }
         };
 
-        // --- ШАГ B: точка невозврата пройдена — новая версия УЖЕ живая,
-        // current уже указывает на неё (это делает install_packages внутри
-        // finalize_installation). Теперь безопасно снести артефакты старой
-        // версии, которые новая версия не переиспользовала. ---
+        // --- STEP B: the point of no return has been passed — the new version is ALIVE
+        // and `current` already points at it (install_packages does this via
+        // link_current). It is now safe to tear down whatever the old version left
+        // behind that the new one did not take over. ---
 
-        // B1. pre_uninstall script СТАРОЙ версии (best effort, не блокирует)
+        // B1. pre_uninstall script of the OLD version (best effort, never blocks)
         if let Some(script_lines) = old_manifest.resolve_pre_uninstall(spec.arch) {
             let ctx = script::HookContext {
                 version_dir: old_version_dir_for_scripts,
@@ -159,9 +159,9 @@ pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<
             );
         }
 
-        // B2. Убрать ОРФАН-шимы: те, что были в старом манифесте, но которых
-        // НЕТ в новом манифесте (если бинарник новой версии тот же — install_packages
-        // уже перезаписал файл шима новым таргетом, трогать не нужно и не надо).
+        // B2. Drop ORPHANED shims: those the old manifest declared and the new one does
+        // not. When the new version ships the same binary, install_packages has already
+        // rewritten the shim with its new target, so there is nothing left to do.
         if let Some(old_bin_val) = old_manifest.resolve_bin(spec.arch) {
             let old_entries = shim::parse_bin(old_bin_val);
             let new_bin_val = installed_new.manifest.resolve_bin(spec.arch);
@@ -184,7 +184,7 @@ pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<
             }
         }
 
-        // B3. Убрать env-переменные старой версии, которых нет в новой.
+        // B3. Drop environment variables of the old version that the new one lacks.
         if let Some(old_env) = old_manifest.resolve_env_set(spec.arch) {
             let new_env = installed_new.manifest.resolve_env_set(spec.arch);
             for k in old_env.keys() {
@@ -194,15 +194,17 @@ pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<
                 }
             }
         }
-        if let Some(old_add_path) = old_manifest.resolve_env_add_path(spec.arch) {
-            for path in old_add_path.iter() {
-                let _ = session.env_service().remove_path(path);
-            }
-        }
+        // B3b. Drop from PATH whatever the old manifest added.
+        //
+        // Goes through install's shared resolver so the entry removed is exactly the
+        // one that was added. The previous code took the raw manifest string ("bin")
+        // and tried to remove that from PATH, which can never match: installation puts
+        // the resolved "<apps>/<name>/current/bin" there instead.
+        install::remove_env_add_paths(&old_manifest, spec.arch, &app_dir.join("current"));
 
-        // B4. Убрать шорткаты старой версии (шорткаты новой версии уже создал
-        // install_packages, если имя совпадает — перезаписал; если нет — просто
-        // добавил новый, старый нужно снести отдельно).
+        // B4. Drop the old version's shortcuts (install_packages has already created the
+        // new version's: same name overwrites, a different name is simply added, and only
+        // the leftover one still needs removing).
         if let Some(old_shortcuts) = old_manifest.resolve_shortcuts(spec.arch) {
             let entries: Vec<shortcut::ShortcutEntry> = old_shortcuts
                 .iter()
@@ -219,15 +221,15 @@ pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<
             }
         }
 
-        // B5. Unlink persist старой версии (persist_root общий между версиями,
-        // трогать сами данные не нужно — только снять junction со старой
-        // директории, которую мы сейчас удалим).
+        // B5. Unlink the old version's persist entries. The persist root is shared
+        // across versions, so the stored data is left alone; only the junction pointing
+        // into the old version directory has to go before that directory is removed.
         if let Some(ref persist_val) = old_manifest.persist {
             let entries = persist::parse_persist(persist_val);
             let _ = persist::unlink(&entries, old_version_dir_for_scripts);
         }
 
-        // B6. post_uninstall script СТАРОЙ версии (best effort)
+        // B6. post_uninstall script of the OLD version (best effort)
         if let Some(script_lines) = old_manifest.resolve_post_uninstall(spec.arch) {
             let ctx = script::HookContext {
                 version_dir: old_version_dir_for_scripts,
@@ -241,7 +243,7 @@ pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<
             );
         }
 
-        // B7. Удалить директорию старой версии (или temp_backup_dir если был).
+        // B7. Remove the old version directory (or temp_backup_dir, if one was made).
         if let Some(ref backup) = temp_backup_dir {
             let _ = std::fs::rename(backup, app_dir.join(format!("{old_version_str}_old")));
         } else if old_version_dir.exists() {

@@ -128,11 +128,16 @@ pub fn reset_packages(
                     session.env_service().set_env(k, v)?;
                 }
             }
-            if let Some(env_add_path) = manifest.resolve_env_add_path(arch) {
-                for path in env_add_path.iter() {
-                    session.env_service().remove_path(path)?;
-                    session.env_service().add_path(path)?;
-                }
+            // Re-apply env vars. The PATH entries go through the same resolver the
+            // installer uses, so the removal matches what was written. The previous
+            // remove-then-add on the raw manifest string went through the broken
+            // process-PATH implementation and rewrote HKCU\Environment\PATH on every
+            // `rake reset`.
+            for path in
+                crate::operations::install::resolve_env_add_paths(&manifest, arch, &current_link)
+            {
+                let _ = crate::infra::env::remove_user_path(&path);
+                crate::infra::env::add_user_path(&path)?;
             }
         }
 

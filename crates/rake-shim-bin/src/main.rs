@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Scoop shim - Rust implementation
 //
-// Вендорино из https://github.com/ScoopInstaller/Shim (каталог `rust/`, ветка `main`).
-// Лицензия upstream: MIT OR Unlicense.
+// Vendored from https://github.com/ScoopInstaller/Shim (directory `rust/`, branch
+// `main`). Upstream license: MIT OR Unlicense.
 //
-// Файл сохранён дословно, включая `unsafe fn` без внутреннего `unsafe { }` —
-// поэтому крейт намеренно остаётся на edition 2021 (в edition 2024 линт
-// `unsafe_op_in_unsafe_fn` включён по умолчанию и код не собирается).
-// Не редактируй: при обновлении upstream заменяй файл целиком.
+// Everything below this header is upstream's code, verbatim — including the
+// `unsafe fn` bodies that call unsafe operations without an inner `unsafe { }`.
+// That is why this crate is deliberately kept on edition 2021: in edition 2024 the
+// `unsafe_op_in_unsafe_fn` lint is deny-by-default and the code does not compile.
+//
+// Do not edit the body. To pick up an upstream update, replace everything below this
+// header wholesale.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;

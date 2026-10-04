@@ -1,16 +1,15 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rake_domain::arch::Arch;
+use rake_domain::manifest::Manifest;
 use rake_domain::package::{InstallRecord, InstallState, Package, PackageSource, PackageStatus};
 
 use crate::Result;
 use crate::event::Event;
-use crate::infra::archive::{
-    ArchiveService, detect_format_for_url, extract_innosetup, extract_innosetup_with_script,
-};
+use crate::infra::archive::{ArchiveService, detect_format_for_url, extract_innosetup};
 use crate::infra::fs;
 use crate::infra::shortcut::ShortcutEntry;
-use crate::infra::{persist, script, shim, shortcut};
+use crate::infra::{env, persist, script, shim, shortcut};
 use crate::operations::download::DownloadedFile;
 use crate::session::Session;
 
@@ -78,46 +77,33 @@ pub async fn install_packages(
             // `.7z.exe`), which cache-path-based detection cannot see.
             let extraction_format = detect_format_for_url(&file.url);
 
-            // Treat manifests with `installer.script` as needing
-            // InnoSetup extraction (Scoop uses `installer.script` as an
-            // alternative to the `innosetup` boolean flag — zed is a
-            // real example).
-            let is_innosetup = pkg.manifest.innosetup == Some(true)
-                || pkg
-                    .manifest
-                    .installer
-                    .as_ref()
-                    .and_then(|i| i.script.as_ref())
-                    .is_some();
+            // InnoSetup extraction is gated on the `innosetup` flag ALONE.
+            //
+            // `installer.script` is not an alternative marker for it. Scoop treats that
+            // field as a PowerShell hook run after extraction: `lib/decompress.ps1`
+            // selects InnoSetup solely via `if ($Manifest.innosetup)` for `.exe`
+            // downloads, and `Expand-InnoArchive` never hands a script to innounp
+            // (its argument list is fixed: -x -d<dest> <path> -y -c<dir>).
+            //
+            // Coupling the two sent plain PowerShell installer scripts into innounp.
+            // In the main bucket that misrouted 37 of the 38 manifests that carry
+            // `installer.script`, leaving only the single one that also sets
+            // `innosetup` working by accident.
+            let is_innosetup = pkg.manifest.innosetup == Some(true);
 
             if is_innosetup && extraction_format.is_none() {
                 let _ = tx.try_send(Event::CommitProgress(format!(
                     "Extracting {} ...",
                     file.url.split('/').next_back().unwrap_or("file"),
                 )));
-                if let Some(script_lines) = pkg
-                    .manifest
-                    .installer
-                    .as_ref()
-                    .and_then(|i| i.script.as_ref())
-                {
-                    let lines: Vec<String> = script_lines.iter().cloned().collect();
-                    extract_innosetup_with_script(
-                        &lines,
-                        &file.cache_path,
-                        &target_dir,
-                        session.config().root_path.as_deref(),
-                    )?;
-                } else {
-                    let ed = pkg.manifest.resolve_extract_dir(arch);
-                    let ed_str = ed.and_then(|ed| ed.as_slice().first().map(|s| s.as_str()));
-                    extract_innosetup(
-                        &file.cache_path,
-                        &target_dir,
-                        session.config().root_path.as_deref(),
-                        ed_str,
-                    )?;
-                }
+                let ed = pkg.manifest.resolve_extract_dir(arch);
+                let ed_str = ed.and_then(|ed| ed.as_slice().first().map(|s| s.as_str()));
+                extract_innosetup(
+                    &file.cache_path,
+                    &target_dir,
+                    session.config().root_path.as_deref(),
+                    ed_str,
+                )?;
             } else if let Some(format) = extraction_format {
                 let archive =
                     crate::infra::archive::NativeArchive::new(session.config().root_path.clone());
@@ -145,11 +131,15 @@ pub async fn install_packages(
             script::run_powershell_script(&script_lines.iter().cloned().collect::<Vec<_>>(), &ctx)?;
         }
 
-        // 4. Apply persistence
-        apply_persistence(pkg, &version_dir, &persist_root)?;
-
-        // 5. Run post_install
-        if let Some(script_lines) = pkg.manifest.resolve_post_install(arch) {
+        // 4. Run the installer hook. `installer.script` is a PowerShell script that
+        // runs after extraction, reached in scoop via `Invoke-HookScript -HookType
+        // 'installer'` (lib/install.ps1:159-167) — still before `current` exists, so
+        // `$dir` is the version directory, same as scoop.
+        if let Some(script_lines) = pkg
+            .manifest
+            .resolve_installer(arch)
+            .and_then(|i| i.script.as_ref())
+        {
             let ctx = script::HookContext {
                 version_dir: &version_dir,
                 persist_dir: &persist_root.join(pkg.name()),
@@ -159,10 +149,21 @@ pub async fn install_packages(
             script::run_powershell_script(&script_lines.iter().cloned().collect::<Vec<_>>(), &ctx)?;
         }
 
-        // 6. Create shims
-        apply_shims(pkg, &version_dir, &shims_dir, &tx, arch)?;
+        // Create the `current` junction BEFORE shims, shortcuts and PATH, mirroring
+        // scoop's lib/install.ps1:58-63. Everything below references the junction and
+        // not the version directory: that indirection is the whole point of the
+        // junction, since a later update only has to repoint `current` for shims,
+        // shortcuts and PATH to follow. Creating it last pointed every shim at
+        // `apps/<name>/<version>`, so the link bought nothing, broke scoop
+        // interoperability, and deleting an old version directory stranded its shims.
+        let _guard = session.write_lock()?;
+        link_current(&version_dir, &app_dir)?;
+        let current_dir = app_dir.join("current");
 
-        // 7. Create Start Menu shortcuts
+        // 5. Create shims
+        apply_shims(pkg, &current_dir, &shims_dir, &tx, arch)?;
+
+        // 6. Create Start Menu shortcuts
         if let Some(shortcut_list) = pkg.manifest.resolve_shortcuts(arch) {
             let entries: Vec<ShortcutEntry> = shortcut_list
                 .iter()
@@ -175,15 +176,32 @@ pub async fn install_packages(
                 .filter(|e| !e.target.is_empty() && !e.name.is_empty())
                 .collect();
             if !entries.is_empty() {
-                let warnings = shortcut::create_shortcuts(&entries, &version_dir, false)?;
+                let warnings = shortcut::create_shortcuts(&entries, &current_dir, false)?;
                 for w in warnings {
                     let _ = tx.try_send(Event::CommitProgress(format!("⚠ {}", w)));
                 }
             }
         }
 
-        // 8. Apply env
-        apply_env(pkg, session, arch)?;
+        // 7. Apply env
+        apply_env(pkg, session, arch, &current_dir)?;
+
+        // 8. Apply persistence.
+        //
+        // Scoop persists after shims/shortcuts/env (lib/install.ps1:66), and still
+        // writes into the *version* directory rather than the junction.
+        apply_persistence(pkg, &version_dir, &persist_root)?;
+
+        // 9. Run post_install
+        if let Some(script_lines) = pkg.manifest.resolve_post_install(arch) {
+            let ctx = script::HookContext {
+                version_dir: &version_dir,
+                persist_dir: &persist_root.join(pkg.name()),
+                original_dir: &version_dir,
+                version: pkg.version(),
+            };
+            script::run_powershell_script(&script_lines.iter().cloned().collect::<Vec<_>>(), &ctx)?;
+        }
 
         // IMPORTANT — Scoop ABI contract on `url`:
         //
@@ -207,15 +225,7 @@ pub async fn install_packages(
             _ => None,
         };
 
-        let _guard = session.write_lock()?;
-        finalize_installation(
-            session,
-            pkg,
-            &version_dir,
-            &app_dir,
-            arch,
-            install_url.as_deref(),
-        )?;
+        finalize_installation(pkg, &version_dir, arch, install_url.as_deref())?;
         drop(_guard);
 
         let state = InstallState {
@@ -300,25 +310,99 @@ pub(crate) fn apply_shims(
     Ok(())
 }
 
-pub(crate) fn apply_env(pkg: &Package, session: &Session, arch: Arch) -> Result<()> {
+/// Mirror of scoop's `is_in_dir` (lib/core.ps1:695).
+///
+/// Answers whether `check` is `dir` itself or lives inside it. The trailing separator
+/// is made explicit before the prefix test — without it `C:\apps\bc` would pass as
+/// being inside `C:\apps\b`.
+fn is_in_dir(dir: &Path, check: &Path) -> bool {
+    let dir = dir.as_os_str().to_string_lossy().into_owned();
+    let check = check.as_os_str().to_string_lossy().into_owned();
+
+    if dir.to_lowercase() == check.to_lowercase() {
+        return true;
+    }
+
+    let prefix = if dir.ends_with(['\\', '/']) {
+        dir.to_lowercase()
+    } else {
+        format!("{}\\", dir.to_lowercase())
+    };
+    check.to_lowercase().starts_with(&prefix)
+}
+
+pub(crate) fn apply_env(pkg: &Package, session: &Session, arch: Arch, dir: &Path) -> Result<()> {
     if let Some(env_set) = pkg.manifest.resolve_env_set(arch) {
         for (k, v) in env_set {
             session.env_service().set_env(k, v)?;
         }
     }
-    if let Some(env_add_path) = pkg.manifest.resolve_env_add_path(arch) {
-        for path in env_add_path.iter() {
-            session.env_service().add_path(path)?;
-        }
+    for path in resolve_env_add_paths(&pkg.manifest, arch, dir) {
+        // Not `EnvService::add_path`: that one reads the *process* PATH and writes the
+        // result into HKCU\Environment\PATH, folding every machine-wide entry into the
+        // user's own value on each run and downgrading REG_EXPAND_SZ to REG_SZ.
+        env::add_user_path(&path)?;
     }
     Ok(())
 }
 
+/// Resolve a manifest's `env_add_path` entries against the app directory.
+///
+/// Scoop resolves each entry as `Join-Path $dir $_ | Get-AbsolutePath` and keeps only
+/// the results `is_in_dir` accepts (lib/install.ps1:316). Handing the raw manifest
+/// string to the PATH instead — as this used to — added a literal `bin` rather than
+/// `<app>/current/bin`.
+///
+/// `Path::join` replaces the entire path when `entry` is absolute, so an absolute entry
+/// lands outside `dir` and is dropped here instead of putting an arbitrary directory on
+/// PATH. (PowerShell's `Join-Path` concatenates instead, so scoop relies entirely on
+/// the `is_in_dir` filter there; Rust's behaviour is the stricter of the two.)
+///
+/// Shared by installation and removal so the two cannot drift. Adding
+/// `<app>/current/bin` while removing the literal `bin` would leave the entry on PATH
+/// forever, which is what the previous split implementation did.
+pub(crate) fn resolve_env_add_paths(manifest: &Manifest, arch: Arch, dir: &Path) -> Vec<PathBuf> {
+    let Some(env_add_path) = manifest.resolve_env_add_path(arch) else {
+        return Vec::new();
+    };
+    env_add_path
+        .iter()
+        .filter(|entry| !entry.trim().is_empty())
+        .map(|entry| dir.join(entry))
+        .filter(|joined| is_in_dir(dir, joined))
+        .collect()
+}
+
+/// Drop a manifest's `env_add_path` entries from the persisted user PATH.
+///
+/// Best effort, like scoop: a missing PATH entry is not an error worth failing an
+/// uninstall over.
+pub(crate) fn remove_env_add_paths(manifest: &Manifest, arch: Arch, dir: &Path) {
+    for path in resolve_env_add_paths(manifest, arch, dir) {
+        let _ = env::remove_user_path(&path);
+    }
+}
+
+/// Create the `current` junction pointing at the freshly installed version directory.
+///
+/// Split out of `finalize_installation` because scoop creates the link *before* writing
+/// shims, shortcuts and PATH (lib/install.ps1:58) and then rebinds `$dir` to it, so all
+/// three reference the junction. See the call site for the full rationale.
+pub(crate) fn link_current(version_dir: &Path, app_dir: &Path) -> Result<()> {
+    let current_link = app_dir.join("current");
+    fs::remove_symlink(&current_link)?;
+
+    #[cfg(windows)]
+    fs::create_junction(version_dir, &current_link)?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(version_dir, &current_link)?;
+
+    Ok(())
+}
+
 pub(crate) fn finalize_installation(
-    _session: &Session,
     pkg: &Package,
-    version_dir: &std::path::Path,
-    app_dir: &std::path::Path,
+    version_dir: &Path,
     arch: Arch,
     url: Option<&str>,
 ) -> Result<()> {
@@ -335,14 +419,6 @@ pub(crate) fn finalize_installation(
 
     let manifest_json = version_dir.join("manifest.json");
     std::fs::write(&manifest_json, serde_json::to_string_pretty(&pkg.manifest)?)?;
-
-    let current_link = app_dir.join("current");
-    fs::remove_symlink(&current_link)?;
-
-    #[cfg(windows)]
-    fs::create_junction(version_dir, &current_link)?;
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(version_dir, &current_link)?;
 
     Ok(())
 }

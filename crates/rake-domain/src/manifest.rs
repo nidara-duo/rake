@@ -129,6 +129,16 @@ impl Manifest {
             .and_then(|s| s.env_set.as_ref())
             .or(self.env_set.as_ref())
     }
+
+    /// Resolve the `installer` block, preferring the architecture-specific one.
+    ///
+    /// Scoop reads this through `arch_specific 'installer'`, so a manifest may
+    /// override the installer hook per architecture.
+    pub fn resolve_installer(&self, arch: Arch) -> Option<&InstallerSpec> {
+        self.arch_spec(arch)
+            .and_then(|s| s.installer.as_ref())
+            .or(self.installer.as_ref())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

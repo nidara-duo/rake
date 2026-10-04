@@ -260,6 +260,12 @@ pub fn remove_shim(name: &str, shims_dir: &Path) -> Result<()> {
 }
 
 /// Create shims for all bin entries in a manifest.
+/// Create shims for all bin entries in a manifest.
+///
+/// `app_dir` is the directory the `bin` targets are resolved against. During install
+/// that is the `current` junction, not the version directory, so the recorded shim
+/// target reads `apps/<name>/current/<exe>` and keeps following `current` across
+/// updates — the same layout scoop produces.
 pub fn create_shims(entries: &[BinEntry], app_dir: &Path, shims_dir: &Path) -> Result<()> {
     let app_name = app_dir
         .parent()
@@ -348,5 +354,32 @@ mod path_safety_tests {
     fn accepts_plain_name() {
         assert!(validate_manifest_name("git").is_ok());
         assert!(validate_manifest_name("my-tool").is_ok());
+    }
+
+    /// The embedded binary must always be present. A zero-length payload would make
+    /// every shim a silent no-op at runtime, long after the build succeeded.
+    #[test]
+    fn embedded_shim_is_not_empty() {
+        assert!(!SHIM_EXE.is_empty());
+        // An x64 PE starts with the DOS signature "MZ".
+        assert_eq!(&SHIM_EXE[..2], b"MZ");
+    }
+
+    /// Regression: `bin: ["bun.exe", "bunx", "x"]` has to reach the `.shim` file as
+    /// `args = x`. It used to be parsed into BinEntry and then dropped on the floor, so
+    /// the `bunx` shim launched plain `bun`.
+    #[test]
+    fn writes_args_into_shim_metadata() {
+        use rake_domain::one_or_many::OneOrMany;
+        // `"bin": [["bun.exe", "bunx", "x"]]`
+        let json = r#"[["bun.exe","bunx","x"]]"#;
+        let bin: OneOrMany<OneOrMany<String>> = serde_json::from_str(json).unwrap();
+        let entries = parse_bin(&bin);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "bunx");
+        assert_eq!(
+            entries[0].args.as_deref(),
+            Some(["x".to_owned()].as_slice())
+        );
     }
 }

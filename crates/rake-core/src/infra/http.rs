@@ -73,8 +73,8 @@ impl HttpClient for ReqwestClient {
     }
 
     async fn content_length(&self, url: &str) -> Result<Option<u64>> {
-        // 1) Быстрый путь: HEAD. Работает для простых статических файловых
-        //    серверов, но НЕ работает для многих реальных хостингов (см. ниже).
+        // 1) Fast path: HEAD. Works for simple static file servers, but does NOT work
+        //    for many real hosts (see below).
         if let Ok(resp) = self.inner.head(url).send().await
             && resp.status().is_success()
             && let Some(len) = resp.content_length()
@@ -83,16 +83,17 @@ impl HttpClient for ReqwestClient {
             return Ok(Some(len));
         }
 
-        // 2) Фолбэк: HEAD либо вернул ошибку/редирект-без-Content-Length, либо
-        //    сервер вообще не умеет в HEAD как надо. Частый практический случай:
-        //    GitHub Releases assets редиректят на подписанный CDN URL, чья
-        //    подпись считается для метода GET — на HEAD такой URL отвечает 403
-        //    и без Content-Length. Поэтому делаем настоящий GET, читаем заголовок
-        //    из первого пришедшего ответа и СРАЗУ дропаем Response, не читая тело.
-        //    reqwest/hyper при дропе Response просто закрывают соединение — файл
-        //    целиком НЕ скачивается. Не пытайся "прочитать тело для надёжности" —
-        //    это именно то, чего мы хотим избежать (иначе calculate_total_download_size
-        //    станет полноценным двойным скачиванием всех пакетов).
+        // 2) Fallback: HEAD either errored, or redirected without a Content-Length, or
+        //    the server does not handle HEAD properly at all. A common real case:
+        //    GitHub Releases assets redirect to a signed CDN URL whose signature is
+        //    computed for the GET method — such a URL answers HEAD with 403 and no
+        //    Content-Length. So issue a real GET, read the headers off the first
+        //    response that arrives, and immediately drop the Response without reading
+        //    the body. reqwest/hyper simply close the connection when a Response is
+        //    dropped, so the file is NOT downloaded. Do not be tempted to "read the
+        //    body for reliability" — that is precisely what we are avoiding here
+        //    (otherwise calculate_total_download_size becomes a full second download
+        //    of every package).
         match self.inner.get(url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 Ok(resp.content_length().filter(|&len| len > 0))

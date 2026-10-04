@@ -13,10 +13,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 #[async_trait]
 pub trait EnvService: Send + Sync {
-    fn add_path(&self, path: &str) -> Result<()>;
-    fn remove_path(&self, path: &str) -> Result<()>;
     fn set_env(&self, key: &str, value: &str) -> Result<()>;
     fn remove_env(&self, key: &str) -> Result<()>;
+
+    // PATH mutation deliberately does NOT live on this trait. The implementation that
+    // used to be here read the *process* PATH and wrote the whole result into
+    // HKCU\Environment\PATH, which folded every machine-wide entry into the user's own
+    // value on each run, degraded REG_EXPAND_SZ to REG_SZ, and never deduplicated. Use
+    // the free functions [`add_user_path`] / [`remove_user_path`], which operate on the
+    // persisted user value directly.
 }
 
 pub struct WindowsEnvService;
@@ -35,22 +40,6 @@ impl WindowsEnvService {
 
 #[async_trait]
 impl EnvService for WindowsEnvService {
-    fn add_path(&self, path: &str) -> Result<()> {
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{};{}", current_path, path);
-        self.set_env("PATH", &new_path)
-    }
-
-    fn remove_path(&self, path: &str) -> Result<()> {
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = current_path
-            .split(';')
-            .filter(|p| p != &path)
-            .collect::<Vec<_>>()
-            .join(";");
-        self.set_env("PATH", &new_path)
-    }
-
     fn set_env(&self, key: &str, value: &str) -> Result<()> {
         // 1. Update current process
         let key_wide: Vec<u16> = key.encode_utf16().chain(std::iter::once(0)).collect();

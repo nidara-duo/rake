@@ -156,8 +156,14 @@ pub async fn install_packages(
         // shortcuts and PATH to follow. Creating it last pointed every shim at
         // `apps/<name>/<version>`, so the link bought nothing, broke scoop
         // interoperability, and deleting an old version directory stranded its shims.
-        let _guard = session.write_lock()?;
-        link_current(&version_dir, &app_dir)?;
+        //
+        // The lock covers the junction swap alone and is released before the steps
+        // below: shim creation is several file writes, and post_install can shell out
+        // to PowerShell for seconds, neither of which should be serialised.
+        {
+            let _guard = session.write_lock()?;
+            link_current(&version_dir, &app_dir)?;
+        }
         let current_dir = app_dir.join("current");
 
         // 5. Create shims
@@ -225,6 +231,7 @@ pub async fn install_packages(
             _ => None,
         };
 
+        let _guard = session.write_lock()?;
         finalize_installation(pkg, &version_dir, arch, install_url.as_deref())?;
         drop(_guard);
 

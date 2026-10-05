@@ -18,7 +18,7 @@ sevenz-rust2 = "0.21"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "bzip2", "xz"] }
 tokio-tar = "0.3"
 futures-util = "0.3"
-remove_dir_all = "0.7"
+remove_dir_all = "0.8"
 walkdir = "2"
 dirs = "6"
 rayon = "1"

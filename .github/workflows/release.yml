@@ -96,6 +96,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           body_path: ${{ runner.temp }}/notes.md
+          # So a v0.1.4-alpha.1 is listed as a pre-release instead of sitting in
+          # the releases list as if it were the finished 0.1.4.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             rake-*.zip
             rake-*.zip.sha256

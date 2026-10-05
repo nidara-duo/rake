@@ -334,6 +334,66 @@ pub(crate) fn query_synced_matching_inner(
     Ok(packages)
 }
 
+/// Whether an app directory represents a healthy install.
+///
+/// Mirrors Scoop's `failed()` (ethalon lib/core.ps1:425-430):
+/// ```text
+/// $hasCurrent = (get_config NO_JUNCTION) -or (Test-Path "$appPath\current")
+/// return (Test-Path $appPath) -and !($hasCurrent -and (installed $app))
+/// ```
+/// So an app fails when its directory exists but either there is no
+/// `current` junction, or `current` does not resolve to a version. Under
+/// `NO_JUNCTION` the `current` check is skipped, because that layout never
+/// creates a junction.
+///
+/// The directory listing comes from `installed_apps`, which deliberately
+/// includes broken installs — that is the only way a failed install can be
+/// reported at all.
+pub fn is_failed_install(app_dir: &std::path::Path, no_junction: bool) -> bool {
+    if !app_dir.exists() {
+        return false;
+    }
+
+    let current_dir = app_dir.join("current");
+    let has_current = no_junction || current_dir.exists();
+
+    // `installed` == Select-CurrentVersion is non-null, which reads the version
+    // from the manifest and otherwise falls back to the newest version dir.
+    let installed = install_meta::read_installed_manifest(&current_dir)
+        .ok()
+        .flatten()
+        .is_some_and(|m| !m.version().is_empty())
+        || install_meta::fallback_version(app_dir, &current_dir).is_some();
+
+    !(has_current && installed)
+}
+
+/// App directories present under `<root>/apps`, excluding `scoop`.
+///
+/// This is the disk-level view (`installed_apps` in etalon
+/// lib/core.ps1:417-422), as opposed to [`query_installed`] which only returns
+/// apps whose metadata could be read. `status` needs this broader view to spot
+/// failed installs.
+pub fn installed_app_dirs(session: &Session) -> Result<Vec<std::path::PathBuf>> {
+    let root = session.config().root_path.as_ref().map(|p| p.join("apps"));
+
+    let root = match root {
+        Some(p) if p.exists() => p,
+        _ => return Ok(vec![]),
+    };
+
+    let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&root)
+        .map_err(crate::Error::Io)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter(|e| e.file_name().to_string_lossy() != SELF_APP)
+        .map(|e| e.path())
+        .collect();
+
+    dirs.sort();
+    Ok(dirs)
+}
+
 pub struct Snapshot {
     pub installed: Vec<Package>,
     pub synced: Vec<Package>,
@@ -576,6 +636,106 @@ mod tests {
         let installed = query_installed(&session).unwrap();
         assert_eq!(installed.len(), 1, "installed app must not disappear");
         assert_eq!(installed[0].name(), "zed");
+    }
+
+    /// Create `<root>/apps/<name>/<version>` with metadata and a `current` dir.
+    fn write_app_with_current(root: &std::path::Path, name: &str, version: &str) {
+        let version_dir = root.join("apps").join(name).join(version);
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(
+            version_dir.join(install_meta::INSTALLED_MANIFEST),
+            format!(r#"{{"version":"{version}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            version_dir.join(install_meta::INSTALL_RECORD),
+            format!(r#"{{"version":"{version}","bucket":"main"}}"#),
+        )
+        .unwrap();
+
+        let current = root.join("apps").join(name).join("current");
+        std::fs::create_dir_all(&current).unwrap();
+        for file in [
+            install_meta::INSTALLED_MANIFEST,
+            install_meta::INSTALL_RECORD,
+        ] {
+            std::fs::copy(version_dir.join(file), current.join(file)).unwrap();
+        }
+    }
+
+    #[test]
+    fn healthy_app_is_not_failed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_app_with_current(&root, "git", "2.50.0");
+
+        let app_dir = root.join("apps").join("git");
+        assert!(!is_failed_install(&app_dir, false));
+        assert!(!is_failed_install(&app_dir, true));
+    }
+
+    #[test]
+    fn app_without_current_is_failed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // A version dir exists but the junction was never created: this is the
+        // state an interrupted install leaves behind.
+        let version_dir = root.join("apps").join("brave").join("1.96.0");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(
+            version_dir.join(install_meta::INSTALLED_MANIFEST),
+            r#"{"version":"1.96.0"}"#,
+        )
+        .unwrap();
+
+        let app_dir = root.join("apps").join("brave");
+        assert!(is_failed_install(&app_dir, false));
+    }
+
+    #[test]
+    fn app_without_current_is_not_failed_under_no_junction() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let version_dir = root.join("apps").join("brave").join("1.96.0");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(
+            version_dir.join(install_meta::INSTALLED_MANIFEST),
+            r#"{"version":"1.96.0"}"#,
+        )
+        .unwrap();
+
+        // NO_JUNCTION layouts never create `current`, so Scoop skips that check.
+        let app_dir = root.join("apps").join("brave");
+        assert!(!is_failed_install(&app_dir, true));
+    }
+
+    #[test]
+    fn missing_app_directory_is_not_failed() {
+        let dir = tempdir().unwrap();
+        assert!(!is_failed_install(&dir.path().join("nope"), false));
+    }
+
+    #[test]
+    fn installed_app_dirs_lists_broken_apps_and_excludes_scoop() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_app_with_current(&root, "git", "2.50.0");
+        // broken: no `current`
+        std::fs::create_dir_all(root.join("apps").join("broken")).unwrap();
+        // must be excluded
+        std::fs::create_dir_all(root.join("apps").join("scoop").join("current")).unwrap();
+
+        let session = make_session(root.clone());
+        let names: Vec<String> = installed_app_dirs(&session)
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert_eq!(names, vec!["broken".to_owned(), "git".to_owned()]);
+
+        assert!(is_failed_install(&root.join("apps").join("broken"), false));
+        assert!(!is_failed_install(&root.join("apps").join("git"), false));
     }
 
     #[test]

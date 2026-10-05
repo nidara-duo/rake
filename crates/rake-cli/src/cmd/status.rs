@@ -136,7 +136,8 @@ fn build_flags_cell(flags: &[StatusInfoFlag]) -> Cell {
         || flags.contains(&StatusInfoFlag::ManifestRemoved)
     {
         Color::Red
-    } else if flags.contains(&StatusInfoFlag::Outdated)
+    } else if flags.contains(&StatusInfoFlag::Deprecated)
+        || flags.contains(&StatusInfoFlag::Outdated)
         || flags.contains(&StatusInfoFlag::MissingDependencies)
     {
         Color::Yellow

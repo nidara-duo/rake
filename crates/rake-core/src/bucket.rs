@@ -6,6 +6,14 @@ use walkdir::WalkDir;
 use crate::Result;
 use rake_domain::manifest::Manifest;
 
+/// Strip characters that are invalid in a Windows path.
+///
+/// Mirrors `sanitary_path` in ethalon lib/core.ps1:406, which Scoop applies
+/// before looking for `<bucket>/deprecated/<name>.json`.
+fn sanitize_manifest_name(name: &str) -> String {
+    name.chars().filter(|c| !"/\\?:*<>|".contains(*c)).collect()
+}
+
 pub static BUILTIN_BUCKETS: &[(&str, &str)] = &[
     ("main", "https://github.com/ScoopInstaller/Main"),
     ("extras", "https://github.com/ScoopInstaller/Extras"),
@@ -120,6 +128,36 @@ impl Bucket {
         serde_json::from_str(&content).ok()
     }
 
+    /// Path to `<bucket>/deprecated/<name>.json`, if the manifest was
+    /// deprecated rather than deleted.
+    ///
+    /// Scoop looks for the deprecated manifest recursively
+    /// (ethalon lib/core.ps1:578-580), and the file is sanitized so that
+    /// characters invalid in a path never match.
+    pub fn path_of_deprecated_manifest(&self, name: &str) -> Option<PathBuf> {
+        let deprecated_dir = self.path.join("deprecated");
+        if !deprecated_dir.exists() {
+            return None;
+        }
+
+        let filename = format!("{}.json", sanitize_manifest_name(name));
+        walkdir::WalkDir::new(&deprecated_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_type().is_file() && e.file_name() == filename.as_str())
+            .map(|e| e.path().to_owned())
+    }
+
+    pub fn is_deprecated(&self, name: &str) -> bool {
+        self.path_of_deprecated_manifest(name).is_some()
+    }
+
+    pub fn load_deprecated_manifest(&self, name: &str) -> Option<Manifest> {
+        let path = self.path_of_deprecated_manifest(name)?;
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
     pub fn manifest_paths(&self) -> Vec<PathBuf> {
         let bucket_dir = self.path.join("bucket");
         let search_dir = if bucket_dir.exists() {
@@ -165,4 +203,73 @@ pub fn added_buckets(session: &crate::session::Session) -> Result<Vec<Bucket>> {
     }
 
     Ok(buckets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bucket_with(root: &Path) -> Bucket {
+        Bucket::from(root).unwrap()
+    }
+
+    fn write(root: &Path, rel: &str, contents: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn finds_deprecated_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write(&root, "bucket/app.json", r#"{"version":"1.0"}"#);
+        write(&root, "deprecated/app.json", r#"{"version":"0.9"}"#);
+
+        let bucket = bucket_with(&root);
+        assert!(bucket.is_deprecated("app"));
+        assert_eq!(
+            bucket.load_deprecated_manifest("app").unwrap().version(),
+            "0.9"
+        );
+    }
+
+    #[test]
+    fn active_manifest_is_not_deprecated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write(&root, "bucket/app.json", r#"{"version":"1.0"}"#);
+
+        assert!(!bucket_with(&root).is_deprecated("app"));
+    }
+
+    #[test]
+    fn no_deprecated_dir_means_not_deprecated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write(&root, "bucket/app.json", r#"{"version":"1.0"}"#);
+        assert!(!bucket_with(&root).is_deprecated("anything"));
+    }
+
+    #[test]
+    fn finds_deprecated_manifest_in_subdirectory() {
+        // Scoop searches the deprecated dir recursively.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write(
+            &root,
+            "deprecated/a/nested/app.json",
+            r#"{"version":"0.5"}"#,
+        );
+        assert!(bucket_with(&root).is_deprecated("app"));
+    }
+
+    #[test]
+    fn sanitizes_names_like_scoop() {
+        // etalon lib/core.ps1:406 strips / \ ? : * < > |
+        assert_eq!(sanitize_manifest_name("a/b"), "ab");
+        assert_eq!(sanitize_manifest_name("a\\b"), "ab");
+        assert_eq!(sanitize_manifest_name("a:b*c?d<e>f|g"), "abcdefg");
+        assert_eq!(sanitize_manifest_name("plain-name"), "plain-name");
+    }
 }

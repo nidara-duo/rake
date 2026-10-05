@@ -274,6 +274,46 @@ impl GitService for Git {
         }
     }
 
+    async fn remote_head_sha(&self, path: &Path, branch: &str) -> Result<Option<String>> {
+        let result = tokio::task::spawn_blocking({
+            let path = path.to_owned();
+            let branch = branch.to_owned();
+            move || -> Result<Option<String>> {
+                let repo = open_repo(&path)?;
+                let mut remote = match repo.find_remote("origin") {
+                    Ok(r) => r,
+                    Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+                    Err(e) => return Err(crate::Error::Git(e.to_string())),
+                };
+
+                remote
+                    .connect_auth(git2::Direction::Fetch, Some(callbacks()), None)
+                    .map_err(|e| crate::Error::Git(e.to_string()))?;
+                // `Remote::list` takes no ref filter and returns every advertised
+                // head, so filter locally.
+                let wanted = format!("refs/heads/{branch}");
+                let sha = remote
+                    .list()
+                    .map_err(|e| crate::Error::Git(e.to_string()))?
+                    .iter()
+                    .find(|head| head.name() == wanted)
+                    .map(|head| head.oid().to_string());
+                drop(remote);
+                Ok(sha)
+            }
+        })
+        .await
+        .map_err(|e| crate::Error::Git(e.to_string()))?;
+
+        match result {
+            Ok(sha) => Ok(sha),
+            Err(e) => {
+                tracing::debug!("libgit2 ls_remote failed, falling back to git: {e}");
+                self.fallback.remote_head_sha(path, branch).await
+            }
+        }
+    }
+
     /// Always true: libgit2 is linked into the binary, so Git is available even on a
     /// machine where nothing has been installed.
     async fn is_installed(&self) -> bool {

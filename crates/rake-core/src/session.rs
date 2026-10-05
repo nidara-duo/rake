@@ -6,6 +6,8 @@ use crate::Result;
 use crate::config_resolver;
 use crate::event::EventBus;
 use crate::infra::env::{EnvService, WindowsEnvService};
+use crate::infra::git::GitService;
+use crate::infra::git_libgit2::Git;
 use crate::infra::http::{HttpClient, ReqwestClient};
 
 #[derive(Clone)]
@@ -18,6 +20,7 @@ struct SessionInner {
     event_bus: EventBus,
     http_client: Box<dyn HttpClient>,
     env_service: Box<dyn EnvService>,
+    git_service: Box<dyn GitService>,
     state_lock: RwLock<()>,
 }
 
@@ -30,6 +33,7 @@ impl Session {
             Some("Rake/0.1.0 (+https://github.com/username/rake)"),
         )?);
         let env_service = Box::new(WindowsEnvService::new());
+        let git_service = Box::new(Git::new());
 
         Ok(Self {
             inner: Arc::new(SessionInner {
@@ -37,6 +41,7 @@ impl Session {
                 event_bus,
                 http_client,
                 env_service,
+                git_service,
                 state_lock: RwLock::new(()),
             }),
         })
@@ -56,6 +61,10 @@ impl Session {
 
     pub fn env_service(&self) -> &dyn EnvService {
         self.inner.env_service.as_ref()
+    }
+
+    pub fn git_service(&self) -> &dyn GitService {
+        self.inner.git_service.as_ref()
     }
 
     pub fn read_lock(&self) -> Result<std::sync::RwLockReadGuard<'_, ()>> {
@@ -84,6 +93,7 @@ impl Session {
                     ReqwestClient::new(None, Some("test")).expect("build reqwest client"),
                 ),
                 env_service: Box::new(WindowsEnvService::new()),
+                git_service: Box::new(Git::new()),
                 state_lock: RwLock::new(()),
             }),
         }

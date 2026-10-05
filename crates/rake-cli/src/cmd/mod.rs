@@ -121,7 +121,7 @@ pub async fn start() -> Result<()> {
         Command::Search(args) => search::execute(args, &session)?,
         Command::Self_(args) => self_::execute(args, &session).await?,
         Command::Shim(args) => shim::execute(args, &session)?,
-        Command::Status(args) => status::execute(args, &session)?,
+        Command::Status(args) => status::execute(args, &session).await?,
         Command::Unhold(args) => unhold::execute(args, &session)?,
         Command::Uninstall(args) => uninstall::execute(args, &session)?,
         Command::Update(args) => update::execute(args, &session).await?,

@@ -17,8 +17,8 @@ pub struct Args {
     pub json: bool,
 }
 
-pub fn execute(args: Args, session: &Session) -> Result<()> {
-    let report = rake_core::operations::status::collect_status(session, args.local)?;
+pub async fn execute(args: Args, session: &Session) -> Result<()> {
+    let report = rake_core::operations::status::collect_status(session, args.local).await?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -29,6 +29,14 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
         println!(
             "{} One or more buckets are outdated. Run `rake update` to sync.",
             style("!").yellow()
+        );
+    }
+
+    if !report.buckets_unknown.is_empty() {
+        println!(
+            "{} Could not check bucket freshness: {}",
+            style("!").yellow(),
+            report.buckets_unknown.join(", ")
         );
     }
 

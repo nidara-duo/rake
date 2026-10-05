@@ -1,17 +1,20 @@
-use std::path::Path;
-
 use rake_domain::package::PackageStatus;
-use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::Result;
+use crate::bucket::Bucket;
 use crate::operations::query;
 use crate::session::Session;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusReport {
     pub entries: Vec<StatusEntry>,
+    /// True when at least one bucket is behind its remote.
     pub buckets_outdated: bool,
+    /// Buckets whose freshness could not be determined (no remote, network
+    /// failure, detached HEAD). Kept separate from `buckets_outdated` so a
+    /// failed check is never reported as "everything is fine".
+    pub buckets_unknown: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,39 +47,96 @@ impl StatusInfoFlag {
     }
 }
 
-fn check_bucket_outdated(repo_path: &Path) -> bool {
-    if !repo_path.join(".git").exists() {
-        return false;
+/// How far behind its remote a bucket is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketFreshness {
+    /// Local HEAD matches what the remote advertises.
+    UpToDate,
+    /// The remote has commits the local checkout does not have.
+    Outdated,
+    /// Could not be determined.
+    Unknown,
+}
+
+pub async fn check_bucket_freshness(session: &Session, bucket: &Bucket) -> BucketFreshness {
+    let path = bucket.path();
+
+    if !path.join(".git").exists() {
+        return BucketFreshness::Unknown;
     }
-    let Ok(repo) = git2::Repository::open(repo_path) else {
-        return false;
+
+    let Ok(repo) = git2::Repository::open(path) else {
+        return BucketFreshness::Unknown;
     };
     let Ok(head) = repo.head() else {
-        return false;
+        return BucketFreshness::Unknown;
     };
     let Some(head_id) = head.target() else {
-        return false;
+        return BucketFreshness::Unknown;
     };
-    let branch = head.shorthand().unwrap_or("main");
-    let remote_ref_name = format!("refs/remotes/origin/{branch}");
-    match repo.find_reference(&remote_ref_name) {
-        Ok(remote_ref) => remote_ref.target().is_some_and(|id| id != head_id),
-        Err(_) => false,
+    let Some(branch) = head.shorthand().map(str::to_owned) else {
+        return BucketFreshness::Unknown;
+    };
+
+    // The previous implementation compared HEAD against the local
+    // `refs/remotes/origin/<branch>`, which only changes on fetch — so it
+    // could never notice new upstream commits and reported every bucket as
+    // fine forever. `ls-remote` asks the remote directly.
+    match session.git_service().remote_head_sha(path, &branch).await {
+        Ok(Some(remote_sha)) => {
+            let Ok(remote_id) = git2::Oid::from_str(&remote_sha) else {
+                return BucketFreshness::Unknown;
+            };
+            if remote_id == head_id {
+                BucketFreshness::UpToDate
+            } else {
+                BucketFreshness::Outdated
+            }
+        }
+        Ok(None) => BucketFreshness::Unknown,
+        Err(e) => {
+            tracing::debug!("bucket {}: ls-remote failed: {e}", bucket.name());
+            BucketFreshness::Unknown
+        }
     }
 }
 
-pub fn collect_bucket_freshness(session: &Session) -> Result<bool> {
-    let buckets = crate::operations::bucket::bucket_list(session)?;
-    Ok(buckets.par_iter().any(|b| check_bucket_outdated(b.path())))
+/// Aggregate bucket freshness across every configured bucket.
+///
+/// `local_only` skips all network access and reports `Unknown`, which callers
+/// must present as "not checked" rather than "up to date".
+pub async fn collect_bucket_freshness(session: &Session) -> (bool, Vec<String>) {
+    let buckets = crate::operations::bucket::bucket_list(session).unwrap_or_default();
+
+    let results: Vec<(String, BucketFreshness)> =
+        futures_util::future::join_all(buckets.iter().map(|b| async move {
+            (
+                b.name().to_owned(),
+                check_bucket_freshness(session, b).await,
+            )
+        }))
+        .await;
+
+    let mut outdated = false;
+    let mut unknown = Vec::new();
+    for (name, freshness) in results {
+        match freshness {
+            BucketFreshness::Outdated => outdated = true,
+            BucketFreshness::Unknown => unknown.push(name),
+            BucketFreshness::UpToDate => {}
+        }
+    }
+
+    (outdated, unknown)
 }
 
-pub fn collect_status(session: &Session, local_only: bool) -> Result<StatusReport> {
+pub async fn collect_status(session: &Session, local_only: bool) -> Result<StatusReport> {
     let installed = query::query_installed(session)?;
     let latest_versions = query::latest_versions_for_installed(session, &installed)?;
-    let buckets_outdated = if local_only {
-        false
+    let (buckets_outdated, buckets_unknown) = if local_only {
+        (false, Vec::new())
     } else {
-        collect_bucket_freshness(session)?
+        collect_bucket_freshness(session).await
     };
 
     let ignored = ["lessmsi", "innounp", "7zip", "dark", "scoop"];
@@ -146,5 +206,6 @@ pub fn collect_status(session: &Session, local_only: bool) -> Result<StatusRepor
     Ok(StatusReport {
         entries,
         buckets_outdated,
+        buckets_unknown,
     })
 }

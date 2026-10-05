@@ -47,9 +47,55 @@ jobs:
           Set-Content -Path "$zip.sha256" -Value "$hash  $zip"
           Write-Output "Packaged: $zip"
 
+      - name: Extract release notes for this tag
+        shell: pwsh
+        run: |
+          # Take the section of CHANGELOG.md that matches the tag, so the release
+          # body is the entry for this version rather than the whole history.
+          $tag = "${{ github.ref_name }}"
+          # Tags carry a `v`; the changelog headings do not.
+          $version = $tag -replace '^v', ''
+
+          # A tag that disagrees with the workspace version would ship a binary
+          # whose --version does not match the release it is filed under.
+          $declared = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"$' |
+                       Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($declared -ne $version) {
+            Write-Error "tag is $tag but Cargo.toml says $declared"
+            exit 1
+          }
+
+          $notes = "$env:RUNNER_TEMP\notes.md"
+          $lines = Get-Content CHANGELOG.md
+
+          $header = "## [$version]"
+          $start = 0
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i].Trim() -eq $header) { $start = $i; break }
+          }
+          if ($start -eq 0) {
+            Write-Error "CHANGELOG.md has no '$header' section, refusing to publish an empty body"
+            exit 1
+          }
+
+          $section = [System.Collections.Generic.List[string]]::new()
+          for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^## \[') { break }
+            $section.Add($lines[$i])
+          }
+
+          $body = ($section -join "`n").Trim()
+          if (-not $body) {
+            Write-Error "section '$header' is empty"
+            exit 1
+          }
+          Set-Content -Path $notes -Value $body -NoNewline
+          Write-Output "Release notes: $($body.Length) chars from '$header'"
+
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          body_path: ${{ runner.temp }}/notes.md
           files: |
             rake-*.zip
             rake-*.zip.sha256

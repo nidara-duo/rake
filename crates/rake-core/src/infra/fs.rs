@@ -73,3 +73,106 @@ pub fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Reject a manifest-supplied name that could escape the directory it will be
+/// joined onto.
+///
+/// Manifest `bin` and `persist` entries are untrusted third-party input, and
+/// `Path::join` does not constrain them: joining `"..\..\Startup\evil"` onto an
+/// app directory yields a path that still *reads* as being inside it, because the
+/// `..` components are unresolved. `create_dir_all` then happily creates the
+/// directory outside, and a junction or a data move follows.
+///
+/// Comparing path strings against a prefix is therefore not enough — the check has
+/// to look at the components themselves, which is what this does.
+///
+/// `is_absolute()` alone is *also* not enough on Windows: `/etc/passwd` has no drive
+/// prefix, so it is not "absolute", yet joining it onto `C:\apps\demo` yields
+/// `C:/etc/passwd`, which escapes. Rooted paths are therefore rejected as well, by
+/// refusing every component that is not a plain `Normal`.
+pub fn validate_relative_path(field: &str, name: &str) -> Result<()> {
+    let path = Path::new(name);
+
+    let escapes = path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)));
+
+    if escapes {
+        return Err(crate::Error::Io(std::io::Error::other(format!(
+            "manifest supplied an unsafe {field}: '{name}' (absolute paths, rooted paths and '..' are not allowed)"
+        ))));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod path_guard_tests {
+    use super::*;
+
+    #[test]
+    fn refuses_parent_dir() {
+        assert!(validate_relative_path("bin name", "..\\..\\Startup\\evil").is_err());
+        assert!(validate_relative_path("persist source", "../../etc/passwd").is_err());
+        assert!(validate_relative_path("persist target", "a/../../b").is_err());
+    }
+
+    #[test]
+    fn refuses_absolute() {
+        assert!(validate_relative_path("persist source", "C:\\Windows\\System32\\evil").is_err());
+    }
+
+    /// A rooted path is not `is_absolute()` on Windows — it has no drive prefix — yet
+    /// joining it onto `C:\apps\demo` produces `C:/etc/passwd`, which escapes. Found by
+    /// this test rather than by reading, so it is worth stating explicitly.
+    #[test]
+    fn refuses_rooted_paths_that_are_not_absolute() {
+        assert!(
+            !Path::new("/etc/passwd").is_absolute(),
+            "premise of the test"
+        );
+        assert!(validate_relative_path("persist source", "/etc/passwd").is_err());
+        assert!(validate_relative_path("persist source", r"\Windows\evil").is_err());
+        assert!(validate_relative_path("persist source", "sub/../../escape").is_err());
+    }
+
+    #[test]
+    fn refuses_unc_prefix() {
+        assert!(validate_relative_path("persist source", r"\\server\share\evil").is_err());
+    }
+
+    /// The reason a string-prefix check is not enough: the joined path still starts
+    /// with the base directory as a string while resolving outside it.
+    #[test]
+    fn joined_path_still_looks_contained() {
+        let base = Path::new("/root/apps/evil/current");
+        let joined = base.join("..\\..\\..\\Startup\\pwned");
+        assert!(
+            joined.starts_with(base),
+            "premise of the test: the string prefix matches"
+        );
+        assert!(
+            validate_relative_path("persist source", "..\\..\\..\\Startup\\pwned").is_err(),
+            "yet the component check still refuses it"
+        );
+    }
+
+    #[test]
+    fn accepts_ordinary_relative_paths() {
+        for good in [
+            "git",
+            "config",
+            "sub\\dir\\file",
+            "a/b/c",
+            "file.with.dots",
+            "..leading-dots-name",
+            "name..",
+        ] {
+            assert!(
+                validate_relative_path("persist source", good).is_ok(),
+                "{good} should be allowed"
+            );
+        }
+    }
+}

@@ -181,3 +181,216 @@ impl InstallRecord {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::Arch;
+
+    /// The on-disk record is a stable ABI shared with Scoop, and real machines contain
+    /// every historical spelling. Getting one wrong silently installs the wrong
+    /// architecture's files, so the whole table is pinned here.
+    #[test]
+    fn arch_enum_reads_every_historical_spelling() {
+        for (text, expected) in [
+            ("32bit", Arch::Ia32),
+            ("x86", Arch::Ia32),
+            ("i386", Arch::Ia32),
+            ("i686", Arch::Ia32),
+            ("64bit", Arch::Amd64),
+            ("x86_64", Arch::Amd64),
+            ("amd64", Arch::Amd64),
+            ("x64", Arch::Amd64),
+            ("arm64", Arch::Aarch64),
+            ("aarch64", Arch::Aarch64),
+        ] {
+            let record = InstallRecord {
+                version: "1".to_owned(),
+                bucket: None,
+                arch: text.to_owned(),
+                held: false,
+                url: None,
+            };
+            assert_eq!(record.arch_enum(), expected, "arch {text}");
+        }
+    }
+
+    #[test]
+    fn arch_enum_is_case_insensitive() {
+        for (text, expected) in [
+            ("64BIT", Arch::Amd64),
+            ("X86_64", Arch::Amd64),
+            ("AmD64", Arch::Amd64),
+            ("32BIT", Arch::Ia32),
+            ("X86", Arch::Ia32),
+            ("ARM64", Arch::Aarch64),
+            ("AaRcH64", Arch::Aarch64),
+        ] {
+            let record = InstallRecord {
+                version: "1".to_owned(),
+                bucket: None,
+                arch: text.to_owned(),
+                held: false,
+                url: None,
+            };
+            assert_eq!(record.arch_enum(), expected, "arch {text}");
+        }
+    }
+
+    /// An unrecognised value falls back to the running machine rather than guessing
+    /// 64-bit, so a future Scoop spelling does not break installs.
+    #[test]
+    fn unknown_arch_falls_back_to_the_current_machine() {
+        let record = InstallRecord {
+            version: "1".to_owned(),
+            bucket: None,
+            arch: "riscv64".to_owned(),
+            held: false,
+            url: None,
+        };
+        assert_eq!(record.arch_enum(), Arch::current());
+    }
+
+    /// Scoop writes `architecture` and `hold`; older rake builds wrote `arch` and
+    /// `held`. Both spellings must decode, because both are on disk right now.
+    #[test]
+    fn scoop_key_names_decode() {
+        let r: InstallRecord =
+            serde_json::from_str(r#"{"version":"1","architecture":"64bit","hold":true}"#).unwrap();
+        assert_eq!(r.arch, "64bit");
+        assert!(r.held);
+    }
+
+    #[test]
+    fn legacy_key_names_decode() {
+        let r: InstallRecord =
+            serde_json::from_str(r#"{"version":"1","arch":"32bit","held":true}"#).unwrap();
+        assert_eq!(r.arch, "32bit");
+        assert!(r.held);
+    }
+
+    #[test]
+    fn absent_fields_default_rather_than_fail() {
+        let r: InstallRecord = serde_json::from_str(r#"{"version":"1"}"#).unwrap();
+        assert_eq!(r.version, "1");
+        assert_eq!(r.arch, "");
+        assert!(!r.held);
+        assert!(r.bucket.is_none());
+        assert!(r.url.is_none());
+    }
+
+    /// Null-valued keys are absent, not null: Scoop strips them, and a literal `"url":
+    /// null` in the wild must not turn into Some("null").
+    #[test]
+    fn null_url_is_treated_as_absent() {
+        let r: InstallRecord =
+            serde_json::from_str(r#"{"version":"1","architecture":"64bit","url":null}"#).unwrap();
+        assert!(r.url.is_none());
+    }
+
+    /// `url` is the manifest location, never the archive. A bucket-sourced install must
+    /// not carry one, because Scoop's `manifest()` prefers it over the bucket.
+    #[test]
+    fn bucket_install_round_trips_without_a_url() {
+        let record = InstallRecord {
+            version: "1.2.3".to_owned(),
+            bucket: Some("main".to_owned()),
+            arch: "64bit".to_owned(),
+            held: false,
+            url: None,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            !json.contains("\"url\""),
+            "empty url must be omitted: {json}"
+        );
+
+        let back: InstallRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.bucket.as_deref(), Some("main"));
+        assert!(back.url.is_none());
+    }
+
+    #[test]
+    fn ident_display_is_bucket_slash_name() {
+        let ident = PackageIdent::new("main", "git");
+        assert_eq!(ident.as_str(), "main/git");
+        assert_eq!(ident.to_string(), "main/git");
+    }
+
+    fn manifest() -> Manifest {
+        serde_json::from_str(r#"{"version":"1.2.3"}"#).unwrap()
+    }
+
+    #[test]
+    fn installed_package_exposes_its_version() {
+        let pkg = Package::new(
+            PackageIdent::new("main", "git"),
+            manifest(),
+            Some(PackageSource::Bucket("main".to_owned())),
+            PackageStatus::Installed(InstallState {
+                version: "1.2.3".to_owned(),
+                bucket: Some("main".to_owned()),
+                arch: "64bit".to_owned(),
+                held: false,
+                url: None,
+            }),
+        );
+
+        assert!(pkg.status.is_installed());
+        assert_eq!(pkg.version(), "1.2.3");
+        assert_eq!(pkg.status.version(), Some("1.2.3"));
+        assert_eq!(pkg.name(), "git");
+        assert_eq!(pkg.bucket(), "main");
+        assert!(!pkg.status.is_held());
+        assert!(!pkg.is_nightly());
+        assert_eq!(pkg.homepage(), None);
+    }
+
+    #[test]
+    fn not_installed_package_has_no_version() {
+        let pkg = Package::new(
+            PackageIdent::new("main", "git"),
+            manifest(),
+            Some(PackageSource::Bucket("main".to_owned())),
+            PackageStatus::NotInstalled,
+        );
+        assert!(!pkg.status.is_installed());
+        assert_eq!(pkg.status.version(), None);
+        assert!(!pkg.status.is_held());
+    }
+
+    /// `nightly` is a directory name rather than a version, so it needs its own marker.
+    #[test]
+    fn nightly_is_recognised() {
+        let pkg = Package::new(
+            PackageIdent::new("main", "vscode"),
+            serde_json::from_str(r#"{"version":"nightly"}"#).unwrap(),
+            None,
+            PackageStatus::Installed(InstallState {
+                version: "nightly".to_owned(),
+                bucket: None,
+                arch: "64bit".to_owned(),
+                held: false,
+                url: None,
+            }),
+        );
+        assert!(pkg.is_nightly());
+    }
+
+    #[test]
+    fn held_install_reports_held() {
+        let pkg = Package::new(
+            PackageIdent::new("main", "pinned"),
+            manifest(),
+            None,
+            PackageStatus::Installed(InstallState {
+                version: "1.2.3".to_owned(),
+                bucket: Some("main".to_owned()),
+                arch: "64bit".to_owned(),
+                held: true,
+                url: None,
+            }),
+        );
+        assert!(pkg.status.is_held());
+    }
+}

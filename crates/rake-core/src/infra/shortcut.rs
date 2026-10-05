@@ -38,30 +38,17 @@ pub fn create_shortcuts(
     Ok(Vec::new())
 }
 
-/// See the identical helper and rationale in infra/shim.rs — manifest
-/// `shortcuts` names must be validated the same way `bin` names are,
-/// since they are joined onto `start_menu_dir` the same unsafe way.
-#[cfg(windows)]
-fn validate_manifest_name(name: &str) -> Result<()> {
-    let p = Path::new(name);
-    if p.is_absolute()
-        || p.components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(crate::Error::Io(std::io::Error::other(format!(
-            "manifest supplied an unsafe name: '{name}' (absolute paths and '..' are not allowed)"
-        ))));
-    }
-    Ok(())
-}
-
 #[cfg(windows)]
 fn create_single_shortcut(
     entry: &ShortcutEntry,
     version_dir: &Path,
     start_menu_dir: &Path,
 ) -> Result<()> {
-    validate_manifest_name(&entry.name)?;
+    // Both names come from the manifest and both are joined onto a directory
+    // unconstrained, so both need the shared guard — see infra/fs.rs for why
+    // comparing against a prefix is not enough.
+    crate::infra::fs::validate_relative_path("shortcut name", &entry.name)?;
+    crate::infra::fs::validate_relative_path("shortcut target", &entry.target)?;
     let target = version_dir.join(&entry.target);
     if !target.exists() {
         let mut diag = format!(
@@ -288,5 +275,95 @@ mod tests {
 
         let valid_link = start_menu.join("Valid.lnk");
         assert!(valid_link.exists(), "valid shortcut should be created");
+
+        // The Start Menu folder is the real one, so the test has to take its
+        // shortcut back out again rather than leave it on the user's machine.
+        std::fs::remove_file(&valid_link).unwrap();
+    }
+
+    /// A shortcut name is joined onto the Start Menu directory the same unsafe way a
+    /// `bin` name is joined onto `shims`, so it gets the same guard.
+    ///
+    /// `create_shortcuts` reports a per-entry failure as a warning rather than an
+    /// error, so the refusal shows up there — and, since the guard runs before
+    /// anything is written, nothing reaches the Start Menu at all.
+    #[test]
+    #[cfg(windows)]
+    fn shortcut_name_escaping_the_start_menu_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let version_dir = tmp.path().join("current");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("real.exe"), b"x").unwrap();
+        let start_menu = shortcut_folder(false).unwrap();
+
+        for bad in [
+            "..\\..\\..\\Startup\\evil",
+            "/Windows/evil",
+            r"\\server\share\evil",
+            r"C:\Windows\System32\evil",
+        ] {
+            let entries = vec![ShortcutEntry {
+                target: "real.exe".to_string(),
+                name: bad.to_string(),
+                arguments: None,
+                icon: None,
+            }];
+            let warnings = create_shortcuts(&entries, &version_dir, false).unwrap();
+            assert_eq!(
+                warnings.len(),
+                1,
+                "shortcut name {bad:?} should produce exactly one warning, got {warnings:?}"
+            );
+            assert!(
+                warnings[0].contains("unsafe shortcut name"),
+                "warning should name the reason, got: {}",
+                warnings[0]
+            );
+        }
+
+        assert!(
+            !tmp.path().join("Startup").exists(),
+            "nothing may be created outside the Start Menu directory"
+        );
+        assert!(
+            fs::read_dir(&start_menu)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .all(|e| !e.file_name().to_string_lossy().contains("evil")),
+            "no shortcut for the rejected names may appear in the Start Menu"
+        );
+    }
+
+    /// The target is joined onto the version directory and was not validated at all
+    /// before: `..` in it let a shortcut point anywhere on the disk.
+    #[test]
+    #[cfg(windows)]
+    fn shortcut_target_escaping_the_version_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let version_dir = tmp.path().join("current");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        // A real file outside the version directory, so only the guard can refuse it.
+        std::fs::write(tmp.path().join("outside.exe"), b"x").unwrap();
+        let start_menu = shortcut_folder(false).unwrap();
+        let _ = fs::remove_file(start_menu.join("Escape.lnk"));
+
+        let entries = vec![ShortcutEntry {
+            target: "..\\outside.exe".to_string(),
+            name: "Escape".to_string(),
+            arguments: None,
+            icon: None,
+        }];
+        let warnings = create_shortcuts(&entries, &version_dir, false).unwrap();
+
+        assert_eq!(warnings.len(), 1, "got {warnings:?}");
+        assert!(
+            warnings[0].contains("unsafe shortcut target"),
+            "warning should name the reason, got: {}",
+            warnings[0]
+        );
+        assert!(
+            !start_menu.join("Escape.lnk").exists(),
+            "a shortcut pointing outside the version directory must not be created"
+        );
     }
 }

@@ -50,17 +50,11 @@ static SHIM_EXE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shim.exe"));
 /// setting a `bin` name to `"..\\..\\Startup\\evil"`). Manifest data is
 /// untrusted third-party input and must never be joined onto a
 /// filesystem path without this check.
+///
+/// The check itself lives in [`crate::infra::fs::validate_relative_path`],
+/// shared with `persist`, which has the same exposure.
 fn validate_manifest_name(name: &str) -> Result<()> {
-    let p = Path::new(name);
-    if p.is_absolute()
-        || p.components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(crate::Error::Io(std::io::Error::other(format!(
-            "manifest supplied an unsafe name: '{name}' (absolute paths and '..' are not allowed)"
-        ))));
-    }
-    Ok(())
+    crate::infra::fs::validate_relative_path("bin name", name)
 }
 
 /// Create a single shim for a given target file.

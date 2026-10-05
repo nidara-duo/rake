@@ -260,7 +260,6 @@ pub fn remove_shim(name: &str, shims_dir: &Path) -> Result<()> {
 }
 
 /// Create shims for all bin entries in a manifest.
-/// Create shims for all bin entries in a manifest.
 ///
 /// `app_dir` is the directory the `bin` targets are resolved against. During install
 /// that is the `current` junction, not the version directory, so the recorded shim
@@ -381,5 +380,178 @@ mod path_safety_tests {
             entries[0].args.as_deref(),
             Some(["x".to_owned()].as_slice())
         );
+    }
+
+    /// Lay out `apps/<app>/current` with a binary plus an empty `shims` dir, and return
+    /// both. Mirrors the paths an install produces.
+    fn layout(dir: &Path, app: &str, exe: &str) -> (PathBuf, PathBuf) {
+        let app_dir = dir.join("apps").join(app).join("current");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join(exe), b"MZ").unwrap();
+        let shims_dir = dir.join("shims");
+        std::fs::create_dir_all(&shims_dir).unwrap();
+        (app_dir, shims_dir)
+    }
+
+    fn entry(target: &str, name: &str, args: Option<&str>) -> BinEntry {
+        BinEntry {
+            target: target.to_owned(),
+            name: name.to_owned(),
+            args: args.map(|a| vec![a.to_owned()]),
+        }
+    }
+
+    /// End-to-end for the bug this file was written around: a manifest `bin` carrying
+    /// arguments has to produce a `.shim` that actually contains them.
+    ///
+    /// The parse-only test above cannot catch a regression here, because the args used
+    /// to parse correctly and were then dropped when the file was written. This one
+    /// checks the bytes on disk.
+    #[test]
+    fn manifest_args_reach_the_shim_file() {
+        use rake_domain::one_or_many::OneOrMany;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (app_dir, shims_dir) = layout(dir.path(), "bun", "bun.exe");
+
+        let bin: OneOrMany<OneOrMany<String>> =
+            serde_json::from_str(r#"[["bun.exe","bunx","x"]]"#).unwrap();
+        create_shims(&parse_bin(&bin), &app_dir, &shims_dir).unwrap();
+
+        let content = std::fs::read_to_string(shims_dir.join("bunx.shim")).unwrap();
+        assert!(content.contains("path = "), "path missing in:\n{content}");
+        assert!(content.contains("args = x"), "args missing in:\n{content}");
+    }
+
+    /// Scoop writes arguments verbatim, quotes and spaces included — a real example on
+    /// disk is `args = --user-data-dir="...brave\current\User Data"`. Re-joining the
+    /// parts must not re-quote or re-escape them.
+    #[test]
+    fn shim_args_keep_quotes_and_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_dir, shims_dir) = layout(dir.path(), "brave", "brave.exe");
+
+        let arg = r#"--user-data-dir="C:\some path\User Data""#;
+        create_shims(
+            &[entry("brave.exe", "brave", Some(arg))],
+            &app_dir,
+            &shims_dir,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(shims_dir.join("brave.shim")).unwrap();
+        assert!(
+            content.contains(&format!("args = {arg}")),
+            "expected the argument verbatim in:\n{content}"
+        );
+    }
+
+    /// The shim executable must be the embedded payload, not a stray file found
+    /// elsewhere on disk.
+    #[test]
+    fn shim_exe_is_the_embedded_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_dir, shims_dir) = layout(dir.path(), "git", "git.exe");
+
+        create_shims(&[entry("git.exe", "git", None)], &app_dir, &shims_dir).unwrap();
+
+        let written = std::fs::read(shims_dir.join("git.exe")).unwrap();
+        assert_eq!(written, SHIM_EXE);
+        assert_eq!(&written[..2], b"MZ");
+    }
+
+    /// No `args` line at all when the manifest has none — Scoop omits the key rather than
+    /// writing an empty one.
+    #[test]
+    fn shim_without_args_omits_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_dir, shims_dir) = layout(dir.path(), "git", "git.exe");
+
+        create_shims(&[entry("git.exe", "git", None)], &app_dir, &shims_dir).unwrap();
+
+        let content = std::fs::read_to_string(shims_dir.join("git.shim")).unwrap();
+        assert!(!content.contains("args"), "unexpected args in:\n{content}");
+        assert!(content.contains("path = "));
+    }
+
+    /// The recorded path has to go through `current`, not the version directory, so a
+    /// later update that only repoints the junction leaves the shim valid.
+    #[test]
+    fn shim_path_goes_through_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_dir, shims_dir) = layout(dir.path(), "brave", "brave.exe");
+
+        create_shims(&[entry("brave.exe", "brave", None)], &app_dir, &shims_dir).unwrap();
+
+        let content = std::fs::read_to_string(shims_dir.join("brave.shim")).unwrap();
+        assert!(
+            content.contains(r"current\brave.exe"),
+            "expected the current junction in:\n{content}"
+        );
+    }
+
+    /// A bin entry naming a file that was never installed is skipped silently instead of
+    /// failing the whole install.
+    #[test]
+    fn missing_target_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_dir, shims_dir) = layout(dir.path(), "bun", "bun.exe");
+
+        create_shims(
+            &[
+                entry("bun.exe", "bun", None),
+                entry("not-installed.exe", "ghost", None),
+            ],
+            &app_dir,
+            &shims_dir,
+        )
+        .unwrap();
+
+        assert!(shims_dir.join("bun.shim").is_file());
+        assert!(!shims_dir.join("ghost.shim").exists());
+    }
+
+    /// `bin` may name the shim with or without the `.exe` suffix; both must land on the
+    /// same shim names.
+    #[test]
+    fn bin_name_with_exe_suffix_is_accepted() {
+        use rake_domain::one_or_many::OneOrMany;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (app_dir, shims_dir) = layout(dir.path(), "bun", "bun.exe");
+
+        let bin: OneOrMany<OneOrMany<String>> =
+            serde_json::from_str(r#"[["bun.exe","bunx.exe","x"]]"#).unwrap();
+        create_shims(&parse_bin(&bin), &app_dir, &shims_dir).unwrap();
+
+        let content = std::fs::read_to_string(shims_dir.join("bunx.shim")).unwrap();
+        assert!(content.contains("args = x"), "args missing in:\n{content}");
+        assert!(shims_dir.join("bunx.exe").is_file());
+    }
+
+    /// With a single part the shim name is the target minus its extension.
+    #[test]
+    fn bin_name_defaults_to_stripped_target() {
+        use rake_domain::one_or_many::OneOrMany;
+
+        let bin: OneOrMany<OneOrMany<String>> = serde_json::from_str(r#"["git.exe"]"#).unwrap();
+        let entries = parse_bin(&bin);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "git");
+        assert_eq!(entries[0].args, None);
+    }
+
+    /// A manifest-supplied name must not escape the shims directory, whatever it claims.
+    #[test]
+    fn traversal_in_bin_name_is_refused_at_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_dir, shims_dir) = layout(dir.path(), "evil", "evil.exe");
+
+        let err = create_shims(
+            &[entry("evil.exe", r"..\..\Startup\evil", None)],
+            &app_dir,
+            &shims_dir,
+        );
+        assert!(err.is_err(), "traversal must be refused");
     }
 }

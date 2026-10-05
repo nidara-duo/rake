@@ -9,6 +9,14 @@ Scoop root belongs here.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.4-alpha.1]
+
+A development build: the features below are in, but `install <app>` and
+`update <app>` are still open and this release does not claim otherwise. It
+sorts above 0.1.3 and below a future 0.1.4.
+
 ### Added
 
 - `rake status` reports `Install failed`, `Manifest removed` and `Deprecated`,
@@ -18,6 +26,10 @@ Scoop root belongs here.
 - `rake status --check-buckets` fetches every bucket before judging it, so the
   verdict is against upstream. The fetch is reused by a later `rake update`
   instead of being repeated.
+- Manifest `installer.script` hooks now run. They are not standalone
+  PowerShell — they call Scoop's own functions, which only resolve when
+  Scoop's library is loaded — so Rake vendors it and dot-sources it for that
+  one hook. Other hooks keep running standalone.
 
 ### Changed
 
@@ -37,6 +49,11 @@ Scoop root belongs here.
 
 ### Fixed
 
+- `rake update` no longer breaks `scoop update`. It left every bucket in
+  detached HEAD, and Scoop's `git pull` then failed with "You are not currently
+  on a branch" — silently, since Scoop carries on past the error and still
+  reports success. Buckets are shared between the two tools, so they now stay
+  on a branch, and a bucket an older build already detached is repaired.
 - An installed app whose manifest is missing or corrupt no longer disappears
   from `list` and `status`; its version falls back to the `current` junction
   target.

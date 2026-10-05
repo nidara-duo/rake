@@ -1,6 +1,6 @@
 [package]
 name = "rake-hash"
-version = "0.1.3"
+version = "0.1.4-alpha.1"
 edition = "2024"
 description = "Hash verification for Rake — SHA256, MD5, SHA1"
 

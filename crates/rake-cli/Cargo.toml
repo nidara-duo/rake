@@ -1,6 +1,6 @@
 [package]
 name = "rake-cli"
-version = "0.1.3"
+version = "0.1.4-alpha.1"
 edition = "2024"
 description = "Rake CLI binary"
 

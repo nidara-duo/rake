@@ -13,13 +13,33 @@
 .PARAMETER Source
     Install from a local rake.exe instead of downloading a release.
 
+.PARAMETER Version
+    Install a specific release tag, e.g. v0.1.4-alpha.1. Without it the latest
+    stable release is used.
+
+.PARAMETER Prerelease
+    Install the most recent pre-release instead of the latest stable one.
+    GitHub's `/releases/latest` deliberately excludes pre-releases, so this is
+    the only way to opt into one.
+
 .EXAMPLE
-    iwr -useb https://raw.githubusercontent.com/nidara-duo/rake/main/scripts/bootstrap.ps1 | iex
+    # stable
+    & ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/nidara-duo/rake/main/scripts/bootstrap.ps1)))
+
+    # newest pre-release
+    & ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/nidara-duo/rake/main/scripts/bootstrap.ps1))) -Prerelease
+
+    # exact tag
+    & ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/nidara-duo/rake/main/scripts/bootstrap.ps1))) -Version v0.1.4-alpha.1
+
+    # from a local build
     .\bootstrap.ps1 -Source ..\target\release\rake.exe
 #>
 
 param(
-    [string]$Source = ""
+    [string]$Source = "",
+    [string]$Version = "",
+    [switch]$Prerelease
 )
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -36,6 +56,22 @@ function Write-Step { param([string]$m) Write-Host "==> $m" -ForegroundColor Cya
 function Write-Err  { param([string]$m) Write-Host "ERROR: $m" -ForegroundColor Red }
 function Write-Ok   { param([string]$m) Write-Host "  OK $m" -ForegroundColor Green }
 
+# Refuse the install by throwing rather than calling `exit`.
+#
+# This script is documented to be run with `Invoke-Expression`, which executes in
+# the caller's session. `exit` would close the user's terminal window instead of
+# reporting why the install was refused, which is how a checksum mismatch — the
+# one error worth reading carefully — would become invisible.
+#
+# A terminating error keeps the message visible, still propagates to the caller,
+# and still yields exit code 1 under `powershell -Command`, so CI and
+# `if ($LASTEXITCODE -ne 0)` keep working.
+function Stop-Install {
+    param([string]$m)
+    Write-Err $m
+    throw $m
+}
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function Get-ArchSuffix {
@@ -48,16 +84,45 @@ function Get-ArchSuffix {
     return "i686-pc-windows-msvc"
 }
 
-function Get-LatestAssetUrl {
+function Resolve-Release {
+    # Returns the release whose asset we want.
+    #
+    # Three modes: an exact tag, the newest pre-release, or whatever
+    # /releases/latest gives — which never includes pre-releases, so asking for
+    # one has to go through /releases and filter.
     param([string]$AssetName)
 
-    $release = Invoke-RestMethod -Uri "$ApiUrl/latest" -UseBasicParsing -ErrorAction Stop
+    if ($Version) {
+        $release = Invoke-RestMethod -Uri "$ApiUrl/tags/$Version" -UseBasicParsing -ErrorAction Stop
+        $label = $Version
+    }
+    elseif ($Prerelease) {
+        $all = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing -ErrorAction Stop
+        # A pre-release is anything whose tag carries a SemVer pre-release suffix,
+        # whether or not GitHub's own flag is set. That flag is written once at
+        # release-creation time, so a release published before the workflow
+        # started setting it keeps prerelease=false forever — the tag is the
+        # intent, the flag is derived metadata that can lag.
+        $release = $all |
+            Where-Object { -not $_.draft -and ($_.prerelease -or $_.tag_name -match '-') } |
+            Sort-Object -Property published_at -Descending |
+            Select-Object -First 1
+        if (-not $release) {
+            Stop-Install "No pre-release found on $Repo"
+        }
+        $label = "pre-release $($release.tag_name)"
+    }
+    else {
+        $release = Invoke-RestMethod -Uri "$ApiUrl/latest" -UseBasicParsing -ErrorAction Stop
+        $label = $release.tag_name
+    }
+
     $asset = $release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
     if (-not $asset) {
-        Write-Err "Release $($release.tag_name) has no asset named $AssetName"
-        exit 1
+        Stop-Install "Release $label has no asset named $AssetName"
     }
-    Write-Ok "Latest: $($release.tag_name)"
+
+    Write-Ok "Selected: $label"
     return $asset.browser_download_url
 }
 
@@ -78,8 +143,7 @@ function Install-Exe {
     param([string]$ExeSource)
 
     if (-not (Test-Path $ExeSource)) {
-        Write-Err "Binary not found: $ExeSource"
-        exit 1
+        Stop-Install "Binary not found: $ExeSource"
     }
 
     New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
@@ -121,7 +185,7 @@ function Add-ToPath {
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
-try {
+function Invoke-Main {
     Write-Step "Installing Rake to $InstallRoot"
 
     if ($Source) {
@@ -130,7 +194,7 @@ try {
     } else {
         $assetName = "rake-$(Get-ArchSuffix).zip"
         Write-Step "Fetching $assetName"
-        $url = Get-LatestAssetUrl $assetName
+        $url = Resolve-Release $assetName
 
         $zip = Join-Path $env:TEMP $assetName
         Write-Step "Downloading"
@@ -140,17 +204,13 @@ try {
         Write-Step "Verifying checksum"
         $expected = Get-Checksum $url
         if (-not $expected) {
-            Write-Err "No usable SHA-256 published for this release; refusing to install"
             Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
-            exit 1
+            Stop-Install "No usable SHA-256 published for this release; refusing to install"
         }
         $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
         if ($actual -ne $expected.ToLower()) {
-            Write-Err "Checksum mismatch"
-            Write-Err "  Expected: $expected"
-            Write-Err "  Actual:   $actual"
             Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
-            exit 1
+            Stop-Install "Checksum mismatch`n  Expected: $expected`n  Actual:   $actual"
         }
         Write-Ok "Checksum verified"
 
@@ -170,7 +230,22 @@ try {
     Write-Step "Rake installed."
     Write-Host "  Binary: $ExePath"
     Write-Host "  Open a new terminal, then run 'rake --help'."
-} catch {
-    Write-Err $_.Exception.Message
-    exit 1
+}
+
+# Run unless this file is being dot-sourced, which is how the functions above get
+# exercised without touching the machine: dot-sourcing defines them and returns.
+#
+# Verified against all four invocation styles: running the file, `.`-importing it,
+# `iwr | iex`, and `& ([scriptblock]::Create(...))` all run the installer, and only
+# dot-sourcing skips it.
+if ($MyInvocation.InvocationName -ne '.') {
+    try {
+        Invoke-Main
+    } catch {
+        Write-Err $_.Exception.Message
+        # Re-throw rather than exiting: `exit` would close the caller's terminal
+        # when the script is run with Invoke-Expression. The re-thrown error still
+        # makes `powershell -Command` return 1, so scripted callers keep working.
+        throw
+    }
 }

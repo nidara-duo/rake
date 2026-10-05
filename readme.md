@@ -59,11 +59,28 @@ The project is split into a set of highly decoupled, modular crates to ensure co
 
 ### Method 1: Automated Bootstrap Script (Recommended)
 
-You can install Rake via a single PowerShell command. The script automatically detects your CPU architecture (`x86_64`, `i686`, `aarch64`), pulls the latest release, verifies hashes, and updates your system `PATH`:
+You can install Rake via a single PowerShell command. The script automatically detects your CPU architecture (`x86_64`, `i686`, `aarch64`), pulls the release, verifies hashes, and updates your system `PATH`:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/nidara-duo/rake/main/scripts/bootstrap.ps1 | iex"
+& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/nidara-duo/rake/main/scripts/bootstrap.ps1)))
 ```
+
+The command runs the script in a child scope rather than piping it into `Invoke-Expression`, so its variables and helper functions do not leak into your session.
+
+GitHub's "latest release" endpoint never returns pre-releases, so if you want to try one, ask for it explicitly — either the newest pre-release:
+
+```powershell
+& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/nidara-duo/rake/main/scripts/bootstrap.ps1))) -Prerelease
+```
+
+or a specific tag:
+
+```powershell
+& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/nidara-duo/rake/main/scripts/bootstrap.ps1))) -Version v0.1.4-alpha.1
+```
+
+> Run these from PowerShell. From `cmd.exe`, keep the wrapper so a throw still yields a non-zero exit code:
+> `powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/nidara-duo/rake/main/scripts/bootstrap.ps1)))"`
 
 Method 2: Manual Build from Source
 If you prefer building it yourself, ensure you have the Rust toolchain installed:

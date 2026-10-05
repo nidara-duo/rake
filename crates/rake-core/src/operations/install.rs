@@ -8,6 +8,7 @@ use crate::Result;
 use crate::event::Event;
 use crate::infra::archive::{ArchiveService, detect_format_for_url, extract_innosetup};
 use crate::infra::fs;
+use crate::infra::install_meta;
 use crate::infra::shortcut::ShortcutEntry;
 use crate::infra::{env, persist, script, shim, shortcut};
 use crate::operations::download::DownloadedFile;
@@ -34,6 +35,11 @@ pub async fn install_packages(
         .unwrap_or_else(|| PathBuf::from("apps"));
     let shims_dir = root.join("shims");
     let persist_root = root.join("persist");
+    let global_root = session
+        .config()
+        .global_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\rake"));
     let tx = session.event_bus().core_sender();
 
     for pkg in packages {
@@ -47,11 +53,10 @@ pub async fn install_packages(
 
         let version_dir = apps_version_dir(session, pkg);
         let app_dir = apps_dir(session, pkg);
+        let pkg_persist_dir = persist_root.join(pkg.name());
 
         if version_dir.exists() {
-            let install_json = version_dir.join("install.json");
-            let manifest_json = version_dir.join("manifest.json");
-            if install_json.exists() && manifest_json.exists() {
+            if install_meta::is_installed(&version_dir) {
                 return Err(crate::Error::Domain(
                     rake_domain::Error::PackageAlreadyExists(pkg.name().to_owned()),
                 ));
@@ -122,12 +127,12 @@ pub async fn install_packages(
 
         // 3. Run pre_install
         if let Some(script_lines) = pkg.manifest.resolve_pre_install(arch) {
-            let ctx = script::HookContext {
-                version_dir: &version_dir,
-                persist_dir: &persist_root.join(pkg.name()),
-                original_dir: &version_dir,
-                version: pkg.version(),
-            };
+            let ctx = script::HookContext::new(
+                &version_dir,
+                &pkg_persist_dir,
+                &version_dir,
+                pkg.version(),
+            );
             script::run_powershell_script(&script_lines.iter().cloned().collect::<Vec<_>>(), &ctx)?;
         }
 
@@ -140,12 +145,17 @@ pub async fn install_packages(
             .resolve_installer(arch)
             .and_then(|i| i.script.as_ref())
         {
-            let ctx = script::HookContext {
-                version_dir: &version_dir,
-                persist_dir: &persist_root.join(pkg.name()),
-                original_dir: &version_dir,
-                version: pkg.version(),
-            };
+            // `installer.script` bodies call scoop's own functions, so the library has
+            // to be loaded. The other hooks do not, and paying ~0.7s each for it is
+            // not worth it.
+            let ctx = script::HookContext::with_scoop_lib(
+                &version_dir,
+                &pkg_persist_dir,
+                &version_dir,
+                pkg.version(),
+                &root,
+                &global_root,
+            );
             script::run_powershell_script(&script_lines.iter().cloned().collect::<Vec<_>>(), &ctx)?;
         }
 
@@ -200,12 +210,12 @@ pub async fn install_packages(
 
         // 9. Run post_install
         if let Some(script_lines) = pkg.manifest.resolve_post_install(arch) {
-            let ctx = script::HookContext {
-                version_dir: &version_dir,
-                persist_dir: &persist_root.join(pkg.name()),
-                original_dir: &version_dir,
-                version: pkg.version(),
-            };
+            let ctx = script::HookContext::new(
+                &version_dir,
+                &pkg_persist_dir,
+                &version_dir,
+                pkg.version(),
+            );
             script::run_powershell_script(&script_lines.iter().cloned().collect::<Vec<_>>(), &ctx)?;
         }
 
@@ -413,7 +423,7 @@ pub(crate) fn finalize_installation(
     arch: Arch,
     url: Option<&str>,
 ) -> Result<()> {
-    let install_info = InstallRecord {
+    let install_info = &InstallRecord {
         version: pkg.version().to_owned(),
         bucket: Some(pkg.bucket().to_owned()),
         arch: arch.to_string(),
@@ -421,11 +431,10 @@ pub(crate) fn finalize_installation(
         url: url.map(str::to_owned),
     };
 
-    let install_json = version_dir.join("install.json");
-    std::fs::write(&install_json, serde_json::to_string_pretty(&install_info)?)?;
-
-    let manifest_json = version_dir.join("manifest.json");
-    std::fs::write(&manifest_json, serde_json::to_string_pretty(&pkg.manifest)?)?;
+    // Written under both spellings so that old and new Scoop can each read
+    // what Rake installed (see infra::install_meta).
+    install_meta::write_install_record(version_dir, install_info)?;
+    install_meta::write_installed_manifest(version_dir, &pkg.manifest)?;
 
     Ok(())
 }

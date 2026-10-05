@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use rake_domain::arch::Arch;
-use rake_domain::package::InstallRecord;
 
 use crate::Result;
 use crate::event::Event;
@@ -71,9 +70,8 @@ pub fn reset_packages(
         fs::create_junction(&version_dir, &current_link)?;
 
         // Re-create shims & shortcuts
-        let manifest_path = current_link.join("manifest.json");
-        if let Ok(content) = std::fs::read_to_string(&manifest_path)
-            && let Ok(manifest) = serde_json::from_str::<rake_domain::manifest::Manifest>(&content)
+        if let Ok(Some(manifest)) =
+            crate::infra::install_meta::read_installed_manifest(&current_link)
         {
             let arch = load_arch(&version_dir);
 
@@ -148,10 +146,7 @@ pub fn reset_packages(
 }
 
 fn load_arch(version_dir: &std::path::Path) -> Arch {
-    let path = version_dir.join("install.json");
-    if let Ok(content) = std::fs::read_to_string(&path)
-        && let Ok(info) = serde_json::from_str::<InstallRecord>(&content)
-    {
+    if let Ok(Some(info)) = crate::infra::install_meta::read_install_record(version_dir) {
         match info.arch.to_lowercase().as_str() {
             "x86_64" | "amd64" | "x64" | "64bit" => Arch::Amd64,
             "x86" | "i386" | "i686" | "32bit" => Arch::Ia32,
@@ -164,7 +159,13 @@ fn load_arch(version_dir: &std::path::Path) -> Arch {
 }
 
 fn resolve_installed_version(app_dir: &std::path::Path) -> Option<String> {
-    let manifest_path = app_dir.join("current").join("manifest.json");
+    let current_dir = app_dir.join("current");
+    let manifest_path = crate::infra::install_meta::INSTALLED_MANIFEST;
+    let manifest_path = if current_dir.join(manifest_path).is_file() {
+        current_dir.join(manifest_path)
+    } else {
+        current_dir.join(crate::infra::install_meta::INSTALLED_MANIFEST_LEGACY)
+    };
     if let Ok(content) = std::fs::read_to_string(&manifest_path)
         && let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content)
         && let Some(ver) = manifest.get("version").and_then(|v| v.as_str())

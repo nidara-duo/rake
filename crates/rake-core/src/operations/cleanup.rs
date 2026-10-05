@@ -112,8 +112,7 @@ pub fn cleanup_packages(
 }
 
 fn load_manifest(version_dir: &Path) -> Option<rake_domain::manifest::Manifest> {
-    let path = version_dir.join("manifest.json");
-    std::fs::read_to_string(&path)
+    crate::infra::install_meta::read_installed_manifest(version_dir)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .flatten()
 }

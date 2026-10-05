@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use rake_domain::arch::Arch;
-use rake_domain::package::InstallRecord;
 
 use crate::Result;
 use crate::infra::fs;
@@ -63,17 +62,18 @@ pub fn uninstall_packages(
         };
         let manifest = load_manifest(&version_dir);
         let arch = load_arch(&version_dir);
+        let pkg_persist_dir = persist_root.join(&name);
 
         // 1. Run pre_uninstall script
         if let Some(ref m) = manifest
             && let Some(script_lines) = m.resolve_pre_uninstall(arch)
         {
-            let ctx = script::HookContext {
-                version_dir: &version_dir,
-                persist_dir: &persist_root.join(&name),
-                original_dir: &version_dir,
-                version: version.as_deref().unwrap_or(""),
-            };
+            let ctx = script::HookContext::new(
+                &version_dir,
+                &pkg_persist_dir,
+                &version_dir,
+                version.as_deref().unwrap_or(""),
+            );
             let _ = script::run_powershell_script(
                 &script_lines.iter().cloned().collect::<Vec<_>>(),
                 &ctx,
@@ -164,12 +164,12 @@ pub fn uninstall_packages(
             let persist_dir = persist_root.join(&name);
             if persist_dir.exists() {
                 // Keep persist_dir alive for script to use
-                let ctx = script::HookContext {
-                    version_dir: &version_dir,
-                    persist_dir: &persist_dir,
-                    original_dir: &version_dir,
-                    version: version.as_deref().unwrap_or(""),
-                };
+                let ctx = script::HookContext::new(
+                    &version_dir,
+                    &persist_dir,
+                    &version_dir,
+                    version.as_deref().unwrap_or(""),
+                );
                 let _ = script::run_powershell_script(
                     &script_lines.iter().cloned().collect::<Vec<_>>(),
                     &ctx,
@@ -195,7 +195,13 @@ pub fn uninstall_packages(
 }
 
 fn resolve_version(app_dir: &std::path::Path) -> Option<String> {
-    let manifest_path = app_dir.join("current").join("manifest.json");
+    let current_dir = app_dir.join("current");
+    let manifest_path = crate::infra::install_meta::INSTALLED_MANIFEST;
+    let manifest_path = if current_dir.join(manifest_path).is_file() {
+        current_dir.join(manifest_path)
+    } else {
+        current_dir.join(crate::infra::install_meta::INSTALLED_MANIFEST_LEGACY)
+    };
     if let Ok(content) = std::fs::read_to_string(&manifest_path)
         && let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content)
         && let Some(ver) = manifest.get("version").and_then(|v| v.as_str())
@@ -216,17 +222,13 @@ fn resolve_version(app_dir: &std::path::Path) -> Option<String> {
 }
 
 fn load_manifest(version_dir: &std::path::Path) -> Option<rake_domain::manifest::Manifest> {
-    let path = version_dir.join("manifest.json");
-    std::fs::read_to_string(&path)
+    crate::infra::install_meta::read_installed_manifest(version_dir)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .flatten()
 }
 
 fn load_arch(version_dir: &std::path::Path) -> Arch {
-    let path = version_dir.join("install.json");
-    if let Ok(content) = std::fs::read_to_string(&path)
-        && let Ok(info) = serde_json::from_str::<InstallRecord>(&content)
-    {
+    if let Ok(Some(info)) = crate::infra::install_meta::read_install_record(version_dir) {
         match info.arch.to_lowercase().as_str() {
             "x86_64" | "amd64" | "x64" | "64bit" => Arch::Amd64,
             "x86" | "i386" | "i686" | "32bit" => Arch::Ia32,

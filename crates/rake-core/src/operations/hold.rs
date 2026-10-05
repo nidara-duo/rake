@@ -1,7 +1,5 @@
 use std::path::PathBuf;
 
-use rake_domain::package::InstallRecord;
-
 use crate::Result;
 use crate::session::Session;
 
@@ -15,21 +13,18 @@ pub fn set_held(session: &Session, name: &str, held: bool) -> Result<()> {
         .cloned()
         .unwrap_or_else(|| PathBuf::from("apps"));
 
-    let install_json = root
-        .join("apps")
-        .join(name)
-        .join("current")
-        .join("install.json");
-    if !install_json.exists() {
+    let current_dir = root.join("apps").join(name).join("current");
+
+    let Some(mut info) = crate::infra::install_meta::read_install_record(&current_dir)? else {
         return Err(crate::Error::Domain(rake_domain::Error::PackageNotFound(
             name.to_owned(),
         )));
-    }
+    };
 
-    let content = std::fs::read_to_string(&install_json)?;
-    let mut info: InstallRecord = serde_json::from_str(&content)?;
     info.held = held;
-    std::fs::write(&install_json, serde_json::to_string_pretty(&info)?)?;
+    // Read-modify-write through the canonical writer, so both file spellings
+    // stay in sync and `url`/`bucket` are preserved.
+    crate::infra::install_meta::write_install_record(&current_dir, &info)?;
 
     Ok(())
 }

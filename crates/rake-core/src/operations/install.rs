@@ -332,7 +332,7 @@ pub(crate) fn apply_shims(
 /// Answers whether `check` is `dir` itself or lives inside it. The trailing separator
 /// is made explicit before the prefix test — without it `C:\apps\bc` would pass as
 /// being inside `C:\apps\b`.
-fn is_in_dir(dir: &Path, check: &Path) -> bool {
+pub(crate) fn is_in_dir(dir: &Path, check: &Path) -> bool {
     let dir = dir.as_os_str().to_string_lossy().into_owned();
     let check = check.as_os_str().to_string_lossy().into_owned();
 
@@ -385,6 +385,13 @@ pub(crate) fn resolve_env_add_paths(manifest: &Manifest, arch: Arch, dir: &Path)
     env_add_path
         .iter()
         .filter(|entry| !entry.trim().is_empty())
+        // The name comes from the manifest and is joined onto `dir`, so it has to clear
+        // the same guard as `bin` and `persist`: `..` or an absolute path in it would
+        // otherwise place a PATH entry anywhere on the disk. `is_in_dir` below cannot
+        // catch this — a joined path with unresolved `..` still starts with `dir` as a
+        // string, so `..\..\..\..\Startup` passes the prefix test while resolving to
+        // `C:\Startup`.
+        .filter(|entry| crate::infra::fs::validate_relative_path("env_add_path", entry).is_ok())
         .map(|entry| dir.join(entry))
         .filter(|joined| is_in_dir(dir, joined))
         .collect()

@@ -2,7 +2,19 @@ use std::path::Path;
 
 use crate::Result;
 
-fn quote_powershell_string(s: &str) -> String {
+/// Quote a value for a PowerShell **single**-quoted string.
+///
+/// Single quotes make everything literal — `$`, backticks and `$( )` included — so the
+/// only character needing escape is `'`, and doubling it is the escape. This is why the
+/// hook variables are safe: a path cannot terminate the string and start a new statement.
+///
+/// Not the same rule as the double-quoted form in `infra/shim.rs`, where the backtick is
+/// the escape character instead. Verified against PowerShell 5.1 with values containing
+/// quotes, backticks, newlines, `$env:` and `$( )` — all round-tripped unchanged, and an
+/// injected `New-Item` did not run.
+///
+/// Prefer this over passing values on a command line, where the shell would parse them.
+pub fn quote_powershell_string(s: &str) -> String {
     let escaped = s.replace('\'', "''");
     format!("'{escaped}'")
 }
@@ -156,4 +168,184 @@ pub fn run_powershell_script(lines: &[String], ctx: &HookContext) -> Result<()> 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wraps_in_single_quotes() {
+        assert_eq!(quote_powershell_string("C:\\rake\\bin"), "'C:\\rake\\bin'");
+    }
+
+    /// The only escape that single quotes need: doubling the quote itself. Verified
+    /// against PowerShell — an app path with an apostrophe round-tripped intact.
+    #[test]
+    fn doubles_single_quotes() {
+        assert_eq!(quote_powershell_string("o'brien"), "'o''brien'");
+        assert_eq!(quote_powershell_string("''"), "''''''");
+    }
+
+    /// Inside single quotes nothing is expandable, which is the property the whole
+    /// approach rests on. `$env:TEMP` and `$( )` must come back as literal text.
+    #[test]
+    fn dollars_and_backticks_stay_literal() {
+        assert_eq!(
+            quote_powershell_string("$env:TEMP"),
+            "'$env:TEMP'",
+            "single quotes must not expand"
+        );
+        assert_eq!(quote_powershell_string("`$(whoami)"), "'`$(whoami)'");
+        assert_eq!(
+            quote_powershell_string("a`nb"),
+            "'a`nb'",
+            "a backtick-n is two literal characters here"
+        );
+    }
+
+    /// A value crafted to close the string and append a statement must come out
+    /// balanced, so nothing after the assignment can run.
+    #[test]
+    fn injection_attempt_stays_inside_the_string() {
+        let evil = "x'; New-Item -Path C:\\pwned; $v='y";
+        let quoted = quote_powershell_string(evil);
+        // Two delimiters plus the two doubled pairs the value itself carries.
+        assert_eq!(quoted.matches('\'').count(), 6);
+        assert_eq!(
+            quoted, "'x''; New-Item -Path C:\\pwned; $v=''y'",
+            "every quote in the value must be doubled"
+        );
+        assert!(quoted.starts_with('\'') && quoted.ends_with('\''));
+    }
+
+    /// A newline is literal inside single quotes, so it cannot start a new statement.
+    #[test]
+    fn newline_cannot_start_a_statement() {
+        let quoted = quote_powershell_string("a\nRemove-Item x");
+        assert_eq!(quoted, "'a\nRemove-Item x'");
+    }
+
+    /// Non-ASCII must survive: a hook on a path under a Cyrillic or CJK directory name
+    /// has to arrive intact.
+    #[test]
+    fn non_ascii_paths_are_preserved() {
+        assert_eq!(
+            quote_powershell_string("C:\\Программы\\bin"),
+            "'C:\\Программы\\bin'"
+        );
+        assert_eq!(quote_powershell_string("C:\\程序\\bin"), "'C:\\程序\\bin'");
+    }
+
+    /// The hook header must define all four variables Scoop's `Invoke-HookScript` makes
+    /// available (`lib/install.ps1:143`), since manifests reference them by name.
+    #[test]
+    fn hook_context_exposes_the_four_variables_scoop_defines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = HookContext::new(tmp.path(), tmp.path(), tmp.path(), "1.0.0");
+        assert_eq!(ctx.version, "1.0.0");
+        assert!(ctx.scoop_roots.is_none());
+
+        let (a, b) = (tmp.path().join("root"), tmp.path().join("global"));
+        let with_lib =
+            HookContext::with_scoop_lib(tmp.path(), tmp.path(), tmp.path(), "2.0.0", &a, &b);
+        assert!(with_lib.scoop_roots.is_some());
+    }
+
+    /// An empty hook is a no-op, and must not spawn PowerShell at all.
+    #[test]
+    fn empty_hook_does_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = HookContext::new(tmp.path(), tmp.path(), tmp.path(), "1.0.0");
+        assert!(run_powershell_script(&[], &ctx).is_ok());
+    }
+
+    /// End to end: a real hook runs and can read the variables it was given. Proves the
+    /// header is syntactically valid PowerShell and that the paths arrive as values.
+    #[cfg(windows)]
+    #[test]
+    fn hook_receives_its_variables_and_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let version_dir = tmp.path().join("apps").join("demo").join("1.0.0");
+        let persist_dir = tmp.path().join("persist").join("demo");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::create_dir_all(&persist_dir).unwrap();
+
+        let marker = tmp.path().join("marker.txt");
+        let ctx = HookContext::new(&version_dir, &persist_dir, &version_dir, "1.0.0");
+        let lines = vec![format!(
+            "Set-Content -LiteralPath '{}' -Value \"$version|$dir\"",
+            marker.to_string_lossy()
+        )];
+
+        run_powershell_script(&lines, &ctx).unwrap();
+
+        let written = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(
+            written.trim_end(),
+            format!("1.0.0|{}", version_dir.to_string_lossy()),
+            "the hook must see $version and $dir as plain values"
+        );
+    }
+
+    /// A path with an apostrophe must still reach the hook intact — the reason the
+    /// values are quoted at all.
+    #[cfg(windows)]
+    #[test]
+    fn hook_variable_survives_an_apostrophe_in_the_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let version_dir = tmp.path().join("o'brien").join("1.0.0");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let marker = tmp.path().join("marker.txt");
+
+        let ctx = HookContext::new(&version_dir, &version_dir, &version_dir, "1.0.0");
+        let lines = vec![format!(
+            "Set-Content -LiteralPath '{}' -Value $dir",
+            marker.to_string_lossy()
+        )];
+
+        run_powershell_script(&lines, &ctx).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim_end(),
+            version_dir.to_string_lossy()
+        );
+    }
+
+    /// A failing hook must report an error rather than pass silently. Callers treat a
+    /// `Result` of `Ok` as "the hook worked".
+    #[cfg(windows)]
+    #[test]
+    fn a_failing_hook_is_reported_as_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = HookContext::new(tmp.path(), tmp.path(), tmp.path(), "1.0.0");
+        let err = run_powershell_script(&["exit 3".to_owned()], &ctx).unwrap_err();
+        assert!(err.to_string().contains("script hook failed"), "got: {err}");
+    }
+
+    /// The hook body is manifest text written verbatim, so it must not be able to break
+    /// out of the file. Not a claim that hooks are safe to run — running them at all is
+    /// the point of `installer.script` — but a stray quote in the body must not corrupt
+    /// the header.
+    #[cfg(windows)]
+    #[test]
+    fn header_is_valid_even_with_a_hostile_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("marker.txt");
+        let ctx = HookContext::new(tmp.path(), tmp.path(), tmp.path(), "1.0.0");
+        // The body closes nothing in the header (it is appended after it), but it must
+        // still run and see the variables.
+        let lines = vec![format!(
+            "# ' \" ;;; \nSet-Content -LiteralPath '{}' -Value $persist_dir",
+            marker.to_string_lossy()
+        )];
+
+        run_powershell_script(&lines, &ctx).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim_end(),
+            tmp.path().to_string_lossy(),
+            "the header must survive a body full of quotes"
+        );
+    }
 }

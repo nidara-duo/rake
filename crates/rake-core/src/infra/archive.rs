@@ -627,6 +627,237 @@ fn find_helper(name: &str, root_path: Option<&Path>) -> Option<std::path::PathBu
 }
 
 #[cfg(test)]
+mod extraction_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, data) in entries {
+            if name.ends_with('/') {
+                w.add_directory(*name, opts).unwrap();
+            } else {
+                w.start_file(*name, opts).unwrap();
+                w.write_all(data).unwrap();
+            }
+        }
+        w.finish().unwrap();
+    }
+
+    /// The ordinary case, so the guard tests below cannot pass by extraction simply
+    /// being broken.
+    #[test]
+    fn extracts_a_zip_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in.zip");
+        let dest = tmp.path().join("out");
+        write_zip(&src, &[("app.exe", b"binary"), ("readme.txt", b"hello")]);
+
+        extract_zip(&src, &dest).unwrap();
+
+        assert_eq!(std::fs::read(dest.join("app.exe")).unwrap(), b"binary");
+        assert_eq!(std::fs::read(dest.join("readme.txt")).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn extracts_nested_directories_and_directory_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in.zip");
+        let dest = tmp.path().join("out");
+        write_zip(
+            &src,
+            &[
+                ("bin/", b""),
+                ("bin/tool/", b""),
+                ("bin/tool/deep.txt", b"x"),
+            ],
+        );
+
+        extract_zip(&src, &dest).unwrap();
+
+        assert_eq!(std::fs::read(dest.join("bin/tool/deep.txt")).unwrap(), b"x");
+    }
+
+    /// Zip-slip. Extraction holds because `extract_zip` goes through
+    /// `ZipFile::enclosed_name()`, which returns `None` for a path that leaves the
+    /// destination — and the code skips those entries.
+    ///
+    /// Worth pinning explicitly: swapping `enclosed_name()` for the raw `name()`
+    /// would reintroduce the vulnerability with no other test noticing.
+    #[test]
+    fn zip_entries_escaping_the_destination_are_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        for evil in [
+            "../escaped.txt",
+            "../../escaped.txt",
+            "sub/../../escaped.txt",
+        ] {
+            let src = tmp.path().join("evil.zip");
+            write_zip(&src, &[(evil, b"pwned"), ("safe.txt", b"ok")]);
+
+            extract_zip(&src, &dest).unwrap();
+
+            assert!(
+                !dest.parent().unwrap().join("escaped.txt").exists(),
+                "{evil} must not be written outside the destination"
+            );
+            assert!(
+                !tmp.path().join("escaped.txt").exists(),
+                "{evil} must not be written anywhere above the destination"
+            );
+            // The harmless entry still extracted, so this is a real extraction.
+            assert!(dest.join("safe.txt").is_file());
+            std::fs::remove_file(dest.join("safe.txt")).unwrap();
+        }
+    }
+
+    /// An absolute entry name is refused for the same reason.
+    #[test]
+    fn zip_entries_with_absolute_paths_are_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("evil.zip");
+        let dest = tmp.path().join("out");
+
+        let absolute = if cfg!(windows) {
+            r"C:\escaped.txt"
+        } else {
+            "/escaped.txt"
+        };
+        write_zip(&src, &[(absolute, b"pwned"), ("safe.txt", b"ok")]);
+
+        extract_zip(&src, &dest).unwrap();
+
+        assert!(
+            !Path::new(absolute).exists(),
+            "an absolute entry must not be written"
+        );
+        assert!(dest.join("safe.txt").is_file());
+    }
+
+    /// Detection happens on the extension, so a manifest pointing at a URL with a
+    /// query string must not be misread.
+    #[test]
+    fn query_strings_do_not_confuse_detection() {
+        assert_eq!(
+            detect_format("https://x/tool.zip?token=abc"),
+            Some(ArchiveFormat::Zip)
+        );
+        assert_eq!(
+            detect_format("HTTPS://X/TOOL.ZIP"),
+            Some(ArchiveFormat::Zip),
+            "detection should be case-insensitive"
+        );
+    }
+
+    fn put_octal(field: &mut [u8], value: u64) {
+        let digits = format!("{:0width$o}", value, width = field.len() - 1);
+        field[..digits.len()].copy_from_slice(digits.as_bytes());
+        field[field.len() - 1] = 0;
+    }
+
+    /// A hand-built ustar header, so the entry name can be anything at all — including
+    /// a path that escapes. `tokio_tar::Builder` would not necessarily let us write one.
+    fn tar_with_entry(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        let name_bytes = name.as_bytes();
+        assert!(
+            name_bytes.len() < 100,
+            "test helper handles short names only"
+        );
+        header[..name_bytes.len()].copy_from_slice(name_bytes);
+        put_octal(&mut header[100..108], 0o644); // mode
+        put_octal(&mut header[108..116], 0); // uid
+        put_octal(&mut header[116..124], 0); // gid
+        put_octal(&mut header[124..136], data.len() as u64); // size
+        put_octal(&mut header[136..148], 0); // mtime
+        header[148..156].fill(b' '); // checksum placeholder
+        header[156] = b'0'; // typeflag: regular file
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        header[265..269].copy_from_slice(b"root");
+
+        let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+        let checksum = format!("{sum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum.as_bytes());
+
+        let mut out = header.to_vec();
+        out.extend_from_slice(data);
+        out.resize(out.len().next_multiple_of(512), 0);
+        out.resize(out.len() + 1024, 0); // two terminating zero blocks
+        out
+    }
+
+    #[tokio::test]
+    async fn extracts_a_tar_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in.tar");
+        let dest = tmp.path().join("out");
+        std::fs::write(&src, tar_with_entry("app/bin/tool", b"hello")).unwrap();
+
+        extract_tar(&src, &dest).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(dest.join("app").join("bin").join("tool")).unwrap(),
+            b"hello"
+        );
+    }
+
+    /// The tar equivalent of zip-slip. Unlike zip, this one relies on `tokio_tar`
+    /// refusing the path rather than on any check in this crate, so it is worth
+    /// proving rather than assuming — a regression in the dependency would otherwise
+    /// turn into a silent write outside the version directory.
+    #[tokio::test]
+    async fn tar_entries_escaping_the_destination_are_not_written_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let escaped = dest.parent().unwrap().join("escaped.txt");
+        let _ = std::fs::remove_file(&escaped);
+
+        let src = tmp.path().join("evil.tar");
+        std::fs::write(&src, tar_with_entry("../escaped.txt", b"pwned")).unwrap();
+
+        extract_tar(&src, &dest).await.unwrap();
+
+        assert!(
+            !escaped.exists(),
+            "tar entry ../escaped.txt must not land outside the destination"
+        );
+    }
+
+    /// And the deeper form, plus a check that ordinary entries in the same archive
+    /// still extract — so this cannot pass by the whole archive being rejected.
+    #[tokio::test]
+    async fn deep_tar_traversal_is_refused_while_ordinary_entries_extract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let escaped = tmp.path().join("escaped.txt");
+        let _ = std::fs::remove_file(&escaped);
+
+        let mut archive = tar_with_entry("good.txt", b"ok");
+        let evil = tar_with_entry("../../escaped.txt", b"pwned");
+        archive.extend_from_slice(&evil[..evil.len() - 1024]);
+
+        let src = tmp.path().join("mixed.tar");
+        std::fs::write(&src, &archive).unwrap();
+
+        extract_tar(&src, &dest).await.unwrap();
+
+        assert!(!escaped.exists(), "the traversal entry must not escape");
+        assert!(
+            dest.join("good.txt").is_file(),
+            "the ordinary entry must still extract"
+        );
+    }
+}
+
+#[cfg(test)]
 mod format_detection_tests {
     use super::*;
 

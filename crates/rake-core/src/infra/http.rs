@@ -92,7 +92,7 @@ impl HttpClient for ReqwestClient {
         //    the body. reqwest/hyper simply close the connection when a Response is
         //    dropped, so the file is NOT downloaded. Do not be tempted to "read the
         //    body for reliability" — that is precisely what we are avoiding here
-        //    (otherwise calculate_total_download_size becomes a full second download
+        //    (otherwise calculate_download_size becomes a full second download
         //    of every package).
         match self.inner.get(url).send().await {
             Ok(resp) if resp.status().is_success() => {

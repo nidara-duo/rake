@@ -84,9 +84,8 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
 
     let reuse_cache = !args.force;
     let size = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(download::calculate_total_download_size(
-            session, &packages, arch,
-        ))
+        tokio::runtime::Handle::current()
+            .block_on(download::calculate_download_size(session, &packages, arch))
     })?;
 
     writeln!(stdout, "✓ Calculated download size")?;

@@ -147,7 +147,7 @@ pub async fn download_packages(
     Ok(results)
 }
 
-pub async fn calculate_total_download_size(
+pub async fn calculate_download_size(
     session: &Session,
     packages: &[Package],
     arch: Arch,

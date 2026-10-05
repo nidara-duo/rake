@@ -447,7 +447,7 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
         let mut total_size: u64 = 0;
         let mut estimated = false;
         for spec in &specs {
-            let s = download::calculate_total_download_size(
+            let s = download::calculate_download_size(
                 session,
                 std::slice::from_ref(&spec.candidate),
                 spec.arch,

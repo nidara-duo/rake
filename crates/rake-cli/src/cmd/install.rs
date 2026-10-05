@@ -72,7 +72,7 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
     write!(stdout, "Calculating download size...\r")?;
     stdout.flush()?;
 
-    let size = download::calculate_total_download_size(session, &packages, arch).await?;
+    let size = download::calculate_download_size(session, &packages, arch).await?;
 
     writeln!(stdout, "✓ Calculated download size")?;
 

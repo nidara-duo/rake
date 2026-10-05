@@ -1,6 +1,6 @@
 [package]
 name = "rake-shim-bin"
-version = "0.1.4-alpha.1"
+version = "0.1.4-alpha.2"
 # edition 2021 is REQUIRED, not a style choice: the vendored upstream source has
 # `unsafe fn` bodies that call unsafe operations without an inner `unsafe { }`
 # block. In edition 2024 the `unsafe_op_in_unsafe_fn` lint is deny-by-default,

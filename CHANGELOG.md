@@ -7,9 +7,52 @@ Each release section lists the user-visible effect, not the commits that
 produced it. Anything that changes behaviour, output, or the on-disk layout of a
 Scoop root belongs here.
 
-## [Unreleased]
+## [0.1.4-alpha.2]
 
-Nothing yet.
+A development build. As with 0.1.4-alpha.1, `install <app>` and `update <app>`
+are still open; this release does not claim otherwise. It sorts above 0.1.4-alpha.1
+and below 0.1.4.
+
+### Fixed
+
+- Installing over an existing install no longer fails with `AlreadyExists` when
+  the new version ships its own copy of a persisted directory. Scoop keeps that
+  copy as `<name>.original` next to the app; Rake now does the same, so the
+  shipped defaults stay recoverable instead of colliding with the junction.
+- `rake cleanup` and `rake uninstall` no longer report success for files they
+  could not delete. An app still running from the old version made both discard
+  the error and print a success line while the directory was still on disk. Both
+  now stop at the failure and say what could not be removed and why, as Scoop does.
+- `rake cleanup -k` no longer deletes the cached download for the version you are
+  running. It emptied the whole cache; Scoop keeps the current version's entry and
+  removes only stale mirrors and interrupted `.download` files. `-k` is also now
+  scoped to the apps actually being cleaned rather than hitting every app.
+- A shortcut's `target` is validated, not only its `name`. A `..` in the target
+  let a manifest point a Start Menu shortcut at any file on the disk.
+- `persist` entries can no longer name a path outside `apps/` and `persist/`. A
+  `..` in either half of a manifest's `persist` field created a junction, or moved
+  your data, elsewhere on the disk.
+- Manifest values interpolated into generated PowerShell are escaped. An app name
+  containing `"` closed the string in the `.ps1` shim and turned the rest of the
+  name into code, which ran every time the shim was invoked.
+- `env_add_path` entries containing `..` are refused. They passed a check that
+  compared path strings, so an entry like `..\..\..\..\Startup` was accepted and
+  resolved to `C:\Startup` — a PATH entry that persists after uninstall.
+
+### Added
+
+- 107 tests, most of them covering behaviour that had none: manifest parsing and
+  architecture fallback, the install-record format on disk, persist data safety,
+  archive extraction guards, `cleanup`, `uninstall` and the PowerShell quoting
+  rules.
+
+### Internal
+
+- `validate_relative_path` is now the single place that rejects a manifest-supplied
+  path which could escape its directory. `bin`, `persist`, shortcuts and
+  `env_add_path` all go through it; three divergent copies of the check existed.
+- Test sessions record environment writes instead of performing them, so tests
+  cannot modify `HKCU\Environment`.
 
 ## [0.1.4-alpha.1]
 

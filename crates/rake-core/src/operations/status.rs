@@ -40,39 +40,61 @@ pub enum StatusInfoFlag {
 }
 
 impl StatusInfoFlag {
+    /// Label shown in the `Info` column.
+    ///
+    /// The wording is lifted verbatim from `scoop status`
+    /// (ethalon libexec/scoop-status.ps1:69-74) so that the two commands read
+    /// identically. `Outdated` and `MissingDependencies` have no counterpart
+    /// there: Scoop signals outdated via the populated `Latest Version` column
+    /// and missing deps via its own column, so neither belongs in `Info`.
     pub fn as_str(&self) -> &'static str {
         match self {
-            StatusInfoFlag::Outdated => "outdated",
-            StatusInfoFlag::InstallFailed => "install_failed",
-            StatusInfoFlag::Held => "held",
-            StatusInfoFlag::ManifestRemoved => "manifest_removed",
-            StatusInfoFlag::Deprecated => "deprecated",
-            StatusInfoFlag::MissingDependencies => "missing_deps",
+            StatusInfoFlag::InstallFailed => "Install failed",
+            StatusInfoFlag::Held => "Held package",
+            StatusInfoFlag::ManifestRemoved => "Manifest removed",
+            StatusInfoFlag::Deprecated => "Deprecated",
+            StatusInfoFlag::Outdated | StatusInfoFlag::MissingDependencies => "",
         }
+    }
+
+    /// Whether this flag contributes a label to the `Info` column.
+    pub fn shown_in_info(&self) -> bool {
+        !matches!(
+            self,
+            StatusInfoFlag::Outdated | StatusInfoFlag::MissingDependencies
+        )
     }
 }
 
 /// How far behind its remote a bucket is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketFreshness {
-    /// Local HEAD matches what the remote advertises.
+    /// Local HEAD matches the last known upstream state.
     UpToDate,
-    /// The remote has commits the local checkout does not have.
+    /// The last known upstream state has commits the local checkout lacks.
     Outdated,
-    /// Could not be determined.
+    /// Could not be determined (no repository, no remote ref, detached HEAD).
     Unknown,
 }
 
-pub async fn check_bucket_freshness(session: &Session, bucket: &Bucket) -> BucketFreshness {
-    let path = bucket.path();
+/// Whether to touch the network while checking buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckBuckets {
+    /// No network: compare HEAD against `refs/remotes/origin/<branch>` as it
+    /// was left by the last fetch. Instant, but only as fresh as that fetch.
+    Local,
+    /// Fetch first, then compare. Costs a round trip per bucket, but leaves the
+    /// remote-tracking refs updated, which is exactly what a later `rake update`
+    /// needs — so the work is not repeated.
+    Fetch,
+}
 
-    if !path.join(".git").exists() {
-        return BucketFreshness::Unknown;
-    }
-
-    let Ok(repo) = git2::Repository::open(path) else {
-        return BucketFreshness::Unknown;
-    };
+/// Compare a bucket's HEAD with its recorded upstream state.
+///
+/// Only meaningful after a fetch: `refs/remotes/origin/<branch>` is written by
+/// fetch and by nothing else, so reading it without fetching answers "is the
+/// bucket behind what we last knew", never "is it behind upstream".
+fn compare_with_remote_ref(repo: &git2::Repository, path: &std::path::Path) -> BucketFreshness {
     let Ok(head) = repo.head() else {
         return BucketFreshness::Unknown;
     };
@@ -83,41 +105,66 @@ pub async fn check_bucket_freshness(session: &Session, bucket: &Bucket) -> Bucke
         return BucketFreshness::Unknown;
     };
 
-    // The previous implementation compared HEAD against the local
-    // `refs/remotes/origin/<branch>`, which only changes on fetch — so it
-    // could never notice new upstream commits and reported every bucket as
-    // fine forever. `ls-remote` asks the remote directly.
-    match session.git_service().remote_head_sha(path, &branch).await {
-        Ok(Some(remote_sha)) => {
-            let Ok(remote_id) = git2::Oid::from_str(&remote_sha) else {
-                return BucketFreshness::Unknown;
-            };
-            if remote_id == head_id {
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    match repo.find_reference(&remote_ref) {
+        Ok(reference) => {
+            if reference.target().is_some_and(|id| id == head_id) {
                 BucketFreshness::UpToDate
             } else {
                 BucketFreshness::Outdated
             }
         }
-        Ok(None) => BucketFreshness::Unknown,
+        // A bucket cloned without remote-tracking refs, or one whose branch has
+        // never been fetched, cannot be judged at all.
         Err(e) => {
-            tracing::debug!("bucket {}: ls-remote failed: {e}", bucket.name());
+            tracing::debug!("{}: no {}: {e}", path.display(), remote_ref);
             BucketFreshness::Unknown
         }
     }
 }
 
+pub async fn check_bucket_freshness(
+    session: &Session,
+    bucket: &Bucket,
+    mode: CheckBuckets,
+) -> BucketFreshness {
+    let path = bucket.path();
+
+    if !path.join(".git").exists() {
+        return BucketFreshness::Unknown;
+    }
+
+    // A failed fetch invalidates the comparison: the remote-tracking ref still
+    // holds whatever the previous fetch left behind, and reporting that as a
+    // verdict would pass a stale answer off as a current one.
+    if mode == CheckBuckets::Fetch && session.git_service().fetch(path).await.is_err() {
+        tracing::debug!("bucket {}: fetch failed", bucket.name());
+        return BucketFreshness::Unknown;
+    }
+
+    let Ok(repo) = git2::Repository::open(path) else {
+        return BucketFreshness::Unknown;
+    };
+
+    compare_with_remote_ref(&repo, path)
+}
+
 /// Aggregate bucket freshness across every configured bucket.
 ///
-/// `local_only` skips all network access and reports `Unknown`, which callers
-/// must present as "not checked" rather than "up to date".
-pub async fn collect_bucket_freshness(session: &Session) -> (bool, Vec<String>) {
+/// Buckets are checked concurrently: the network round trip dominates and there
+/// is no dependency between buckets, so serialising them would only add up the
+/// latencies.
+pub async fn collect_bucket_freshness(
+    session: &Session,
+    mode: CheckBuckets,
+) -> (bool, Vec<String>) {
     let buckets = crate::operations::bucket::bucket_list(session).unwrap_or_default();
 
     let results: Vec<(String, BucketFreshness)> =
         futures_util::future::join_all(buckets.iter().map(|b| async move {
             (
                 b.name().to_owned(),
-                check_bucket_freshness(session, b).await,
+                check_bucket_freshness(session, b, mode).await,
             )
         }))
         .await;
@@ -191,14 +238,10 @@ fn resolve_bucket_manifest(
     (ManifestSource::Missing, None)
 }
 
-pub async fn collect_status(session: &Session, local_only: bool) -> Result<StatusReport> {
+pub async fn collect_status(session: &Session, mode: CheckBuckets) -> Result<StatusReport> {
     let installed = query::query_installed(session)?;
     let latest_versions = query::latest_versions_for_installed(session, &installed)?;
-    let (buckets_outdated, buckets_unknown) = if local_only {
-        (false, Vec::new())
-    } else {
-        collect_bucket_freshness(session).await
-    };
+    let (buckets_outdated, buckets_unknown) = collect_bucket_freshness(session, mode).await;
 
     let buckets = crate::operations::bucket::bucket_list(session)?;
     let no_junction = session.config().no_junction.unwrap_or(false);
@@ -369,7 +412,7 @@ mod tests {
     /// `local_only` skips the network, so the bucket checks are inert here.
     async fn status_of(root: std::path::PathBuf) -> StatusReport {
         let session = make_session(root);
-        collect_status(&session, true).await.unwrap()
+        collect_status(&session, CheckBuckets::Local).await.unwrap()
     }
 
     fn flags_of<'a>(report: &'a StatusReport, name: &str) -> &'a [StatusInfoFlag] {
@@ -576,6 +619,26 @@ mod tests {
         assert!(status_of(root).await.entries.is_empty());
     }
 
+    #[test]
+    fn info_labels_match_scoop_wording() {
+        // etalon libexec/scoop-status.ps1:70-73
+        assert_eq!(StatusInfoFlag::InstallFailed.as_str(), "Install failed");
+        assert_eq!(StatusInfoFlag::Held.as_str(), "Held package");
+        assert_eq!(StatusInfoFlag::Deprecated.as_str(), "Deprecated");
+        assert_eq!(StatusInfoFlag::ManifestRemoved.as_str(), "Manifest removed");
+    }
+
+    #[test]
+    fn outdated_and_missing_deps_stay_out_of_info() {
+        // Scoop signals these through their own columns, never in Info.
+        assert!(!StatusInfoFlag::Outdated.shown_in_info());
+        assert!(!StatusInfoFlag::MissingDependencies.shown_in_info());
+        assert!(StatusInfoFlag::InstallFailed.shown_in_info());
+        assert!(StatusInfoFlag::Held.shown_in_info());
+        assert!(StatusInfoFlag::Deprecated.shown_in_info());
+        assert!(StatusInfoFlag::ManifestRemoved.shown_in_info());
+    }
+
     #[tokio::test]
     async fn entries_are_sorted_case_insensitively() {
         let dir = tempdir().unwrap();
@@ -597,5 +660,176 @@ mod tests {
             .map(|e| e.name.to_ascii_lowercase())
             .collect();
         assert_eq!(names, vec!["apple", "mango", "zebra"]);
+    }
+
+    /// Build a bare git repo at `<root>/buckets/<name>` on branch `master` with
+    /// one commit, plus a second commit upstream that the local checkout lacks.
+    fn init_bucket(root: &std::path::Path, name: &str, extra_upstream_commits: usize) {
+        let path = root.join("buckets").join(name);
+        std::fs::create_dir_all(&path).unwrap();
+
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} in {} failed: {}",
+                cwd.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        git(&["init", "-q", "-b", "master"], &path);
+        git(&["config", "user.email", "t@example.com"], &path);
+        git(&["config", "user.name", "test"], &path);
+        std::fs::write(path.join("f.txt"), b"v1").unwrap();
+        git(&["add", "-A"], &path);
+        git(&["commit", "-q", "-m", "first"], &path);
+
+        let _ = extra_upstream_commits;
+    }
+
+    /// Simulate an upstream that has moved on: make a commit, then rewind the
+    /// local branch and point `refs/remotes/origin/master` at the newer commit.
+    ///
+    /// Rewinding matters — committing alone would also move HEAD, leaving the
+    /// bucket genuinely up to date and the test meaningless.
+    fn advance_remote_ref(root: &std::path::Path, name: &str) -> git2::Oid {
+        let path = root.join("buckets").join(name);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&path)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        let rev_parse = |refname: &str| {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", refname])
+                .current_dir(&path)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+
+        let before = rev_parse("HEAD");
+
+        std::fs::write(path.join("f.txt"), b"v2").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "second"]);
+        let ahead = rev_parse("HEAD");
+
+        git(&["reset", "-q", "--hard", &before]);
+        git(&["update-ref", "refs/remotes/origin/master", &ahead]);
+
+        git2::Oid::from_str(&ahead).unwrap()
+    }
+
+    #[tokio::test]
+    async fn local_mode_reports_nothing_when_no_remote_ref_exists() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        init_bucket(&root, "main", 0);
+
+        let session = make_session(root);
+        let (outdated, unknown) = collect_bucket_freshness(&session, CheckBuckets::Local).await;
+        assert!(!outdated);
+        assert_eq!(unknown, vec!["main".to_owned()], "never fetched");
+    }
+
+    #[tokio::test]
+    async fn local_mode_detects_outdated_via_remote_ref() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        init_bucket(&root, "main", 0);
+        advance_remote_ref(&root, "main");
+
+        let session = make_session(root);
+        let (outdated, unknown) = collect_bucket_freshness(&session, CheckBuckets::Local).await;
+        assert!(outdated, "local HEAD is behind the fetched remote ref");
+        assert!(unknown.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_mode_reports_up_to_date_when_refs_match() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        init_bucket(&root, "main", 0);
+        let sha = {
+            let path = root.join("buckets/main");
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(path)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        let path = root.join("buckets/main");
+        std::process::Command::new("git")
+            .args(["update-ref", "refs/remotes/origin/master", &sha])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+
+        let session = make_session(root);
+        let (outdated, unknown) = collect_bucket_freshness(&session, CheckBuckets::Local).await;
+        assert!(!outdated);
+        assert!(unknown.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_mode_never_fetches() {
+        // The offline guarantee: with an unreachable remote, Local must still
+        // reach a verdict rather than reporting Unknown.
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        init_bucket(&root, "main", 0);
+        advance_remote_ref(&root, "main");
+
+        let path = root.join("buckets/main");
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                "https://invalid.invalid/nope.git",
+            ])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+
+        let session = make_session(root);
+        let (outdated, unknown) = collect_bucket_freshness(&session, CheckBuckets::Local).await;
+        assert!(outdated, "answered from local refs");
+        assert!(unknown.is_empty(), "no network attempt, no failure");
+    }
+
+    #[tokio::test]
+    async fn fetch_mode_marks_bucket_unknown_when_fetch_fails() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        init_bucket(&root, "main", 0);
+        advance_remote_ref(&root, "main");
+
+        let path = root.join("buckets/main");
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                "https://invalid.invalid/nope.git",
+            ])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+
+        let session = make_session(root);
+        let (outdated, unknown) = collect_bucket_freshness(&session, CheckBuckets::Fetch).await;
+        assert!(!outdated, "the failed fetch left the old ref in place");
+        assert!(!unknown.is_empty(), "a failed fetch must be visible");
     }
 }

@@ -182,9 +182,33 @@ impl GitService for Git {
                 let mut remote = repo
                     .find_remote("origin")
                     .map_err(|e| crate::Error::Git(e.to_string()))?;
+
+                // Fetch the remote's configured refspecs explicitly. Relying on the
+                // config would leave the remote-tracking refs behind whenever a
+                // bucket was cloned by an older build, and every freshness check
+                // then silently reads a stale SHA.
+                // No configured refspec means nothing to fetch into; fall back to
+                // the conventional one so a bucket cloned by an older build still
+                // gets its remote-tracking refs.
+                const DEFAULT_REFSPEC: [&str; 1] = ["+refs/heads/*:refs/remotes/origin/*"];
+
+                let configured = remote
+                    .fetch_refspecs()
+                    .map_err(|e| crate::Error::Git(e.to_string()))?;
+
+                // `StringArray` iterates as `Option<&str>`, where `None` marks a
+                // non-UTF-8 entry — a refspec git would choke on anyway.
+                let configured: Vec<String> =
+                    configured.iter().flatten().map(str::to_owned).collect();
+                let refspecs: Vec<&str> = if configured.is_empty() {
+                    DEFAULT_REFSPEC.to_vec()
+                } else {
+                    configured.iter().map(String::as_str).collect()
+                };
+
                 let mut opts = fetch_options();
                 remote
-                    .fetch(&[] as &[&str], Some(&mut opts), None)
+                    .fetch(&refspecs, Some(&mut opts), None)
                     .map_err(|e| crate::Error::Git(e.to_string()))
             }
         })
@@ -271,46 +295,6 @@ impl GitService for Git {
                 .ok()
                 .and_then(|r| r.url().map(str::to_owned))),
             Err(_) => self.fallback.remote_url(path),
-        }
-    }
-
-    async fn remote_head_sha(&self, path: &Path, branch: &str) -> Result<Option<String>> {
-        let result = tokio::task::spawn_blocking({
-            let path = path.to_owned();
-            let branch = branch.to_owned();
-            move || -> Result<Option<String>> {
-                let repo = open_repo(&path)?;
-                let mut remote = match repo.find_remote("origin") {
-                    Ok(r) => r,
-                    Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
-                    Err(e) => return Err(crate::Error::Git(e.to_string())),
-                };
-
-                remote
-                    .connect_auth(git2::Direction::Fetch, Some(callbacks()), None)
-                    .map_err(|e| crate::Error::Git(e.to_string()))?;
-                // `Remote::list` takes no ref filter and returns every advertised
-                // head, so filter locally.
-                let wanted = format!("refs/heads/{branch}");
-                let sha = remote
-                    .list()
-                    .map_err(|e| crate::Error::Git(e.to_string()))?
-                    .iter()
-                    .find(|head| head.name() == wanted)
-                    .map(|head| head.oid().to_string());
-                drop(remote);
-                Ok(sha)
-            }
-        })
-        .await
-        .map_err(|e| crate::Error::Git(e.to_string()))?;
-
-        match result {
-            Ok(sha) => Ok(sha),
-            Err(e) => {
-                tracing::debug!("libgit2 ls_remote failed, falling back to git: {e}");
-                self.fallback.remote_head_sha(path, branch).await
-            }
         }
     }
 

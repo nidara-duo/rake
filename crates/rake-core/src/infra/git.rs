@@ -8,6 +8,11 @@ use crate::Result;
 pub trait GitService: Send + Sync {
     async fn clone(&self, url: &str, path: &Path) -> Result<()>;
 
+    /// Update `refs/remotes/origin/*` from the remote.
+    ///
+    /// This is the call that costs network time, and the one later commands get
+    /// to reuse: after a fetch, bucket freshness is answerable entirely from
+    /// local refs, so `rake update` and `rake status` do not repeat the work.
     async fn fetch(&self, path: &Path) -> Result<()>;
 
     async fn pull(&self, path: &Path) -> Result<()>;
@@ -15,13 +20,6 @@ pub trait GitService: Send + Sync {
     async fn reset_hard(&self, path: &Path) -> Result<()>;
 
     fn remote_url(&self, path: &Path) -> Result<Option<String>>;
-
-    /// Head SHA the remote currently advertises for `branch`.
-    ///
-    /// This is a metadata-only query (`git ls-remote`) that never touches the
-    /// working tree or any local ref, so it is safe to call during a read-only
-    /// `rake status`.
-    async fn remote_head_sha(&self, path: &Path, branch: &str) -> Result<Option<String>>;
 
     async fn is_installed(&self) -> bool;
 }
@@ -194,38 +192,6 @@ impl GitService for ExternalGit {
         }
     }
 
-    async fn remote_head_sha(&self, path: &Path, branch: &str) -> Result<Option<String>> {
-        let branch = branch.to_owned();
-        let path = path.to_owned();
-
-        let output = tokio::task::spawn_blocking(move || {
-            let mut cmd = Self::git_cmd();
-            cmd.current_dir(&path);
-            cmd.arg("ls-remote")
-                .arg("--exit-code")
-                .arg("origin")
-                .arg(format!("refs/heads/{branch}"));
-            cmd.output()
-        })
-        .await
-        .map_err(|e| crate::Error::Git(e.to_string()))?
-        .map_err(spawn_error)?;
-
-        // Exit code 2 means "no such ref", which is a legitimate answer
-        // (branch gone upstream) rather than an error.
-        if !output.status.success() && output.status.code() != Some(2) {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(crate::Error::Git(format!(
-                "git ls-remote failed: {}",
-                stderr.trim()
-            )));
-        }
-
-        Ok(parse_ls_remote_sha(&String::from_utf8_lossy(
-            &output.stdout,
-        )))
-    }
-
     async fn is_installed(&self) -> bool {
         let output = tokio::task::spawn_blocking(|| {
             std::process::Command::new("git").arg("--version").output()
@@ -239,48 +205,93 @@ impl GitService for ExternalGit {
     }
 }
 
-/// Pull the SHA out of a `git ls-remote` line: `<sha>\t<ref>`.
-fn parse_ls_remote_sha(stdout: &str) -> Option<String> {
-    stdout
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .find(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()))
-        .map(str::to_owned)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::parse_ls_remote_sha;
+    use super::*;
 
-    #[test]
-    fn parses_single_ref() {
-        let out = "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee\trefs/heads/master\n";
-        assert_eq!(
-            parse_ls_remote_sha(out).as_deref(),
-            Some("aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee")
-        );
+    /// Build a throwaway repository with one commit on `master`.
+    fn init_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repo");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        run(&["init", "-q", "-b", "master"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "test"]);
+        std::fs::write(path.join("f.txt"), b"v1").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "first"]);
+
+        (dir, path)
+    }
+
+    fn head_sha(path: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
     #[test]
-    fn parses_padded_ref() {
-        let out = "1111111122222222333333334444444455555555\trefs/heads/main\n";
-        assert!(parse_ls_remote_sha(out).is_some());
+    fn fetch_updates_remote_tracking_ref() {
+        // The whole design rests on this: after fetch, the remote-tracking ref
+        // carries the upstream head, so freshness is answerable offline.
+        let (_upstream_dir, upstream) = init_repo();
+        let (_down_dir, down) = init_repo();
+
+        let url = upstream.to_string_lossy().to_string();
+        let out = std::process::Command::new("git")
+            .args(["remote", "add", "origin", &url])
+            .current_dir(&down)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        // A second upstream commit that `down` has not seen.
+        std::fs::write(upstream.join("f.txt"), b"v2").unwrap();
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "second"]] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&upstream)
+                .output()
+                .unwrap();
+        }
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(ExternalGit::new().fetch(&down)).unwrap();
+
+        let remote_sha = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "refs/remotes/origin/master"])
+                .current_dir(&down)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+
+        assert_eq!(remote_sha, head_sha(&upstream));
+        assert_ne!(remote_sha, head_sha(&down), "local head should lag");
     }
 
     #[test]
-    fn empty_output_yields_none() {
-        assert!(parse_ls_remote_sha("").is_none());
-    }
-
-    #[test]
-    fn rejects_non_sha_lines() {
-        assert!(parse_ls_remote_sha("not a ref\nwarning: something\n").is_none());
-    }
-
-    #[test]
-    fn picks_the_sha_not_the_ref_name() {
-        let out = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\trefs/heads/main\n";
-        let sha = parse_ls_remote_sha(out).unwrap();
-        assert_eq!(sha, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    fn fetch_on_missing_remote_reports_error() {
+        let (_dir, path) = init_repo();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(runtime.block_on(ExternalGit::new().fetch(&path)).is_err());
     }
 }

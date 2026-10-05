@@ -11,8 +11,8 @@ use crate::bucket::Bucket;
 use crate::infra::install_meta;
 use crate::session::Session;
 
-/// Scoop's own `scoop` app is excluded from `installed_apps`
-/// (ethalon lib/core.ps1:417-422) so that `rake list` and `scoop list` agree.
+/// Scoop's own `scoop` app is excluded from `installed_apps` in lib/core.ps1,
+/// so that `rake list` and `scoop list` agree.
 const SELF_APP: &str = "scoop";
 
 /// Backward-compatibility shim: for install.json files written by old rake
@@ -336,7 +336,7 @@ pub(crate) fn query_synced_matching_inner(
 
 /// Whether an app directory represents a healthy install.
 ///
-/// Mirrors Scoop's `failed()` (ethalon lib/core.ps1:425-430):
+/// Mirrors Scoop's `failed()` in lib/core.ps1:
 /// ```text
 /// $hasCurrent = (get_config NO_JUNCTION) -or (Test-Path "$appPath\current")
 /// return (Test-Path $appPath) -and !($hasCurrent -and (installed $app))

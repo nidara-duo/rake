@@ -122,7 +122,7 @@ fn note_substitutions(session: &Session, query: &str) -> Vec<(&'static str, Stri
 }
 
 /// Replace `$`-placeholders, longest first so `$original_dir` is not clobbered
-/// by a `$dir` match. Mirrors `substitute` in ethalon lib/core.ps1.
+/// by a `$dir` match. Mirrors `substitute` in Scoop's lib/core.ps1.
 fn substitute(text: &str, substitutions: &[(&str, String)]) -> String {
     let mut out = text.to_owned();
     for (key, value) in substitutions {

@@ -42,11 +42,11 @@ pub enum StatusInfoFlag {
 impl StatusInfoFlag {
     /// Label shown in the `Info` column.
     ///
-    /// The wording is lifted verbatim from `scoop status`
-    /// (ethalon libexec/scoop-status.ps1:69-74) so that the two commands read
-    /// identically. `Outdated` and `MissingDependencies` have no counterpart
-    /// there: Scoop signals outdated via the populated `Latest Version` column
-    /// and missing deps via its own column, so neither belongs in `Info`.
+    /// The wording is lifted verbatim from the `Info` column assembly in
+    /// libexec/scoop-status.ps1 so that the two commands read identically.
+    /// `Outdated` and `MissingDependencies` have no counterpart there: Scoop
+    /// signals outdated via the populated `Latest Version` column and missing
+    /// deps via its own column, so neither belongs in `Info`.
     pub fn as_str(&self) -> &'static str {
         match self {
             StatusInfoFlag::InstallFailed => "Install failed",

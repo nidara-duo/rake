@@ -141,7 +141,8 @@ fn fetch_all_then_reset(path: &Path) -> Result<()> {
 ///
 /// The local branch is moved to the fetched commit and then checked out, which
 /// is what Scoop does with `checkout -B <branch> -t origin/<branch>` followed
-/// by `reset --hard` (ethalon libexec/scoop-update.ps1:133-137).
+/// by `reset --hard` — see `Update-ScoopBucket` in Scoop's
+/// libexec/scoop-update.ps1.
 ///
 /// The earlier version called `set_head("refs/remotes/origin/<branch>")`.
 /// libgit2 treats any ref outside `refs/heads/*` as "not a branch" and writes a

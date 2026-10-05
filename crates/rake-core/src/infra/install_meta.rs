@@ -9,10 +9,12 @@
 //! | install    | `scoop-install.json`| `install.json` |
 //! | manifest   | `scoop-manifest.json` | `manifest.json` |
 //!
-//! References in `ethalon/current/lib/manifest.ps1`:
-//!   * `install_info`   — `scoop-install.json`, falls back to `install.json`
-//!   * `installed_manifest` — `scoop-manifest.json`, falls back to `manifest.json`
-//!   * `Get-InstalledVersion` (lib/versions.ps1) globs both spellings
+//! References in Scoop (`ScoopInstaller/Scoop`):
+//!   * `install_info` in lib/manifest.ps1 — `scoop-install.json`, falls back to
+//!     `install.json`
+//!   * `installed_manifest` in lib/manifest.ps1 — `scoop-manifest.json`, falls
+//!     back to `manifest.json`
+//!   * `Get-InstalledVersion` in lib/versions.ps1 — globs both spellings
 //!
 //! Rake must read **both**, newest name first, or it silently loses every
 //! package installed by a recent Scoop. Writing goes to both names so that

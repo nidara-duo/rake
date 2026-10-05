@@ -8,7 +8,7 @@ use rake_domain::manifest::Manifest;
 
 /// Strip characters that are invalid in a Windows path.
 ///
-/// Mirrors `sanitary_path` in ethalon lib/core.ps1:406, which Scoop applies
+/// Mirrors `sanitary_path` in Scoop's lib/core.ps1, which Scoop applies
 /// before looking for `<bucket>/deprecated/<name>.json`.
 fn sanitize_manifest_name(name: &str) -> String {
     name.chars().filter(|c| !"/\\?:*<>|".contains(*c)).collect()
@@ -131,9 +131,9 @@ impl Bucket {
     /// Path to `<bucket>/deprecated/<name>.json`, if the manifest was
     /// deprecated rather than deleted.
     ///
-    /// Scoop looks for the deprecated manifest recursively
-    /// (ethalon lib/core.ps1:578-580), and the file is sanitized so that
-    /// characters invalid in a path never match.
+    /// `app_status` in Scoop's lib/core.ps1 looks for the deprecated manifest
+    /// recursively, and the file is sanitized so that characters invalid in a
+    /// path never match.
     pub fn path_of_deprecated_manifest(&self, name: &str) -> Option<PathBuf> {
         let deprecated_dir = self.path.join("deprecated");
         if !deprecated_dir.exists() {

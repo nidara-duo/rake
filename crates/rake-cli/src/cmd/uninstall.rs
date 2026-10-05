@@ -38,14 +38,27 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
             pkg.name,
             pkg.version,
         )?;
-        // TODO: remove shortcuts
-        // TODO: remove env_add_path / env_set
-        writeln!(
-            std::io::stdout(),
-            " {} '{}' was uninstalled.",
-            style("✓").green(),
-            style(&pkg.name).green(),
-        )?;
+        if pkg.failed.is_empty() {
+            writeln!(
+                std::io::stdout(),
+                " {} '{}' was uninstalled.",
+                style("✓").green(),
+                style(&pkg.name).green(),
+            )?;
+        } else {
+            writeln!(
+                std::io::stdout(),
+                " '{}' was mostly uninstalled, but some files could not be removed.",
+                style(&pkg.name).yellow(),
+            )?;
+            for reason in &pkg.failed {
+                writeln!(
+                    std::io::stdout(),
+                    "   {} couldn't remove {reason}; it may be in use",
+                    style("!").red(),
+                )?;
+            }
+        }
     }
 
     Ok(())

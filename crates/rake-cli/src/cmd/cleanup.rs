@@ -41,6 +41,9 @@ pub fn execute(args: Args, session: &rake_core::session::Session) -> anyhow::Res
         for ver in res.removed_versions {
             println!("  {} Removed {}", "✔".green(), ver);
         }
+        for (ver, reason) in res.failed_versions {
+            println!("  {} Couldn't remove {ver}; {reason}", "!".red());
+        }
     }
 
     if args.all || names.iter().any(|a| a == "*") || names.len() > 1 {

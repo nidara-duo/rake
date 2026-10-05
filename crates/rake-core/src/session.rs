@@ -98,4 +98,63 @@ impl Session {
             }),
         }
     }
+
+    /// A session whose environment writes are recorded instead of performed.
+    ///
+    /// [`Session::from_config`] installs the real `WindowsEnvService`, so any operation
+    /// that sets or removes an environment variable — `uninstall` does, for every
+    /// `env_set` key — would write to the actual HKCU\Environment. Tests use this so
+    /// they cannot touch the user's environment.
+    ///
+    /// Note this does not cover PATH: `add_user_path`/`remove_user_path` are free
+    /// functions, deliberately outside the trait. They only write when the entry is
+    /// actually present, so a temp directory that was never added is a safe no-op.
+    pub fn from_config_recording_env(config: Config) -> (Self, RecordingEnvService) {
+        let recorder = RecordingEnvService::default();
+        let handle = recorder.clone();
+        let session = Self {
+            inner: Arc::new(SessionInner {
+                config,
+                event_bus: EventBus::new(),
+                http_client: Box::new(
+                    ReqwestClient::new(None, Some("test")).expect("build reqwest client"),
+                ),
+                env_service: Box::new(handle),
+                git_service: Box::new(Git::new()),
+                state_lock: RwLock::new(()),
+            }),
+        };
+        (session, recorder)
+    }
+}
+
+/// Test double for [`EnvService`]: records what would have been written.
+///
+/// Cloneable and sharing one set of recorders, so a test can hold on to the handle
+/// after the session has been handed to the code under test.
+#[cfg(test)]
+#[derive(Debug, Default, Clone)]
+pub struct RecordingEnvService {
+    pub set: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    pub removed: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl EnvService for RecordingEnvService {
+    fn set_env(&self, key: &str, value: &str) -> Result<()> {
+        self.set
+            .lock()
+            .expect("recorder poisoned")
+            .push((key.to_owned(), value.to_owned()));
+        Ok(())
+    }
+
+    fn remove_env(&self, key: &str) -> Result<()> {
+        self.removed
+            .lock()
+            .expect("recorder poisoned")
+            .push(key.to_owned());
+        Ok(())
+    }
 }

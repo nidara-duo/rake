@@ -89,6 +89,7 @@ pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<
         };
         let old_version_dir = app_dir.join(&old_version_str);
         let old_manifest = spec.installed.manifest.clone();
+        let pkg_persist_dir = persist_root.join(spec.installed.name());
 
         let same_version = spec.installed.version() == spec.candidate.version();
         let temp_backup_dir = if same_version && old_version_dir.exists() {
@@ -147,12 +148,12 @@ pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<
 
         // B1. pre_uninstall script of the OLD version (best effort, never blocks)
         if let Some(script_lines) = old_manifest.resolve_pre_uninstall(spec.arch) {
-            let ctx = script::HookContext {
-                version_dir: old_version_dir_for_scripts,
-                persist_dir: &persist_root.join(spec.installed.name()),
-                original_dir: old_version_dir_for_scripts,
-                version: spec.installed.version(),
-            };
+            let ctx = script::HookContext::new(
+                old_version_dir_for_scripts,
+                &pkg_persist_dir,
+                old_version_dir_for_scripts,
+                spec.installed.version(),
+            );
             let _ = script::run_powershell_script(
                 &script_lines.iter().cloned().collect::<Vec<_>>(),
                 &ctx,
@@ -231,12 +232,12 @@ pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<
 
         // B6. post_uninstall script of the OLD version (best effort)
         if let Some(script_lines) = old_manifest.resolve_post_uninstall(spec.arch) {
-            let ctx = script::HookContext {
-                version_dir: old_version_dir_for_scripts,
-                persist_dir: &persist_root.join(spec.installed.name()),
-                original_dir: old_version_dir_for_scripts,
-                version: spec.installed.version(),
-            };
+            let ctx = script::HookContext::new(
+                old_version_dir_for_scripts,
+                &pkg_persist_dir,
+                old_version_dir_for_scripts,
+                spec.installed.version(),
+            );
             let _ = script::run_powershell_script(
                 &script_lines.iter().cloned().collect::<Vec<_>>(),
                 &ctx,

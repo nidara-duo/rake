@@ -261,8 +261,18 @@ fn replace_binary(src: &Path, dest: &Path) -> Result<Option<PathBuf>> {
     match std::fs::copy(src, dest) {
         Ok(_) => Ok(replaced.then_some(stale)),
         Err(e) => {
-            if replaced {
-                let _ = std::fs::rename(&stale, dest);
+            if replaced && let Err(rollback) = std::fs::rename(&stale, dest) {
+                // The rollback failing is the worst outcome here: the old binary has
+                // been renamed away and the new one did not land, so there is no
+                // executable at `dest` at all. The previous code discarded this error,
+                // while the doc comment above promised "a failed update never leaves
+                // Rake uninstalled". Say where the old binary actually is, because it is
+                // still on disk under its temporary name and is otherwise unfindable.
+                return Err(crate::Error::Custom(format!(
+                    "copying the new binary failed ({e}), and restoring the previous one \
+                     failed as well ({rollback}). The previous binary is still at {}",
+                    stale.display()
+                )));
             }
             Err(crate::Error::Io(e))
         }

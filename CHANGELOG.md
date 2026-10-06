@@ -65,6 +65,15 @@ and below 0.1.4.
 
 ### Fixed
 
+- `rake cache rm` no longer reports files it failed to delete. The count was taken
+  before anything was removed, so a cache file held open by another process was still
+  announced as removed.
+- Cache sidecar `.txt` files are no longer listed or counted as cache entries of their
+  own. Their names contain `#`, so they parsed as entries and every archive with a
+  sidecar was reported twice.
+- `rake self update` no longer silently loses the previous binary when a failed
+  update cannot be rolled back. The old executable is reported at the temporary path
+  it is still sitting at, instead of the error being discarded.
 - `rake checkup` no longer reports the Windows Defender exclusion check as passing
   when it could not be performed. Two separate problems combined: the exclusion
   query answered "excluded" whenever PowerShell could not be started or its own

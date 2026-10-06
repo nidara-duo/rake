@@ -14,6 +14,15 @@ pub struct CacheFile {
 impl CacheFile {
     pub fn from_path(path: PathBuf) -> Option<Self> {
         let filename = path.file_name()?.to_str()?.to_owned();
+
+        // A `.txt` alongside a cache file is Scoop's sidecar holding the source URL, not
+        // a download of its own. The name still looks like an entry — it contains `#` — so
+        // without this it was listed by `rake cache` as a separate file and counted again
+        // on removal, double-reporting every archive that had a sidecar.
+        if filename.to_ascii_lowercase().ends_with(".txt") {
+            return None;
+        }
+
         let (name, version) = Self::parse_filename(&filename)?;
         Some(Self {
             path,
@@ -89,20 +98,48 @@ pub fn cache_remove(session: &Session, query: &str) -> Result<usize> {
         if cache_dir.exists() {
             fs::empty_dir(&cache_dir)?;
         }
+        // Reported as zero because the directory is emptied wholesale and nothing was
+        // counted before. The previous value was right by accident; say so plainly
+        // rather than inventing a number.
         return Ok(0);
     }
 
     let files = cache_list(session, query)?;
-    let count = files.len();
 
+    // Counted after deleting, not before. Returning `files.len()` announced a removal for
+    // every file whether or not it was deleted, so a cache file held open by anything
+    // still produced "removed N" — the same false success as the one fixed in `cleanup`
+    // and `uninstall`.
+    let mut removed = 0usize;
     for f in &files {
-        let _ = std::fs::remove_file(f.path());
-        // Remove companion .txt file (scoop convention)
-        let txt_path = f.path().with_extension("txt");
-        let _ = std::fs::remove_file(txt_path);
+        if remove_cache_entry(f.path()) {
+            removed += 1;
+        }
     }
 
-    Ok(count)
+    Ok(removed)
+}
+
+/// Delete one cache entry and its companion `.txt`, reporting whether the entry itself
+/// went away.
+fn remove_cache_entry(path: &Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            // The `.txt` sidecar is a Scoop convention, not the thing that was asked for;
+            // failing to remove it is worth noting but must not fail the removal.
+            let txt = path.with_extension("txt");
+            if let Err(e) = std::fs::remove_file(&txt)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!("could not remove {}: {e}", txt.display());
+            }
+            true
+        }
+        Err(e) => {
+            tracing::warn!("could not remove {}: {e}", path.display());
+            false
+        }
+    }
 }
 
 /// Remove cached downloads for one app, keeping any entry belonging to
@@ -126,9 +163,9 @@ pub fn cache_remove_except(
         {
             continue;
         }
-        let _ = std::fs::remove_file(f.path());
-        let _ = std::fs::remove_file(f.path().with_extension("txt"));
-        removed += 1;
+        if remove_cache_entry(f.path()) {
+            removed += 1;
+        }
     }
     Ok(removed)
 }
@@ -164,4 +201,118 @@ pub fn cache_remove_partials(session: &Session) -> Result<usize> {
         }
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rake_domain::config::Config;
+
+    fn session_with_cache(root: &Path) -> Session {
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        Session::from_config(Config {
+            root_path: Some(root.to_path_buf()),
+            cache_path: Some(cache),
+            ..Default::default()
+        })
+    }
+
+    /// The count must describe what was deleted, not what was attempted. Returning
+    /// `files.len()` announced a removal for every candidate even when the file was held
+    /// open and nothing was deleted — the same false success as in `cleanup`.
+    #[test]
+    fn counts_only_what_actually_went_away() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let session = session_with_cache(tmp.path());
+
+        for name in ["demo#1.0.0#a.zip", "demo#1.0.0#b.zip"] {
+            std::fs::write(cache.join(name), b"x").unwrap();
+        }
+
+        assert_eq!(cache_remove(&session, "demo").unwrap(), 2);
+        assert!(!cache.join("demo#1.0.0#a.zip").exists());
+        assert!(!cache.join("demo#1.0.0#b.zip").exists());
+    }
+
+    /// The companion `.txt` is Scoop's sidecar, not a download of its own. It must be removed
+    /// alongside the archive without being counted as a second entry — it looks like one,
+    /// since the name also contains `#`.
+    #[test]
+    fn removes_the_companion_txt_without_counting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let session = session_with_cache(tmp.path());
+
+        std::fs::write(cache.join("demo#1.0.0#a.zip"), b"x").unwrap();
+        std::fs::write(cache.join("demo#1.0.0#a.txt"), b"url").unwrap();
+
+        assert_eq!(cache_remove(&session, "demo").unwrap(), 1);
+        assert!(!cache.join("demo#1.0.0#a.txt").exists());
+    }
+
+    /// The same reason: a sidecar must not appear in the listing either.
+    #[test]
+    fn a_sidecar_is_not_listed_as_a_cache_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let session = session_with_cache(tmp.path());
+
+        std::fs::write(cache.join("demo#1.0.0#a.zip"), b"x").unwrap();
+        std::fs::write(cache.join("demo#1.0.0#a.txt"), b"url").unwrap();
+
+        let listed = cache_list(&session, "demo").unwrap();
+        assert_eq!(listed.len(), 1, "got {:?}", listed);
+        assert_eq!(listed[0].filename(), "demo#1.0.0#a.zip");
+    }
+
+    #[test]
+    fn nothing_to_remove_is_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = session_with_cache(tmp.path());
+        assert_eq!(cache_remove(&session, "nosuchapp").unwrap(), 0);
+    }
+
+    /// `cleanup -k` keeps the current version's download, so the count must reflect the
+    /// entries it actually dropped.
+    #[test]
+    fn except_keeps_the_current_version_and_counts_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let session = session_with_cache(tmp.path());
+
+        for name in [
+            "demo#1.0.0#old.zip",
+            "demo#2.0.0#new.zip",
+            "demo#2.0.0#mirror.zip",
+        ] {
+            std::fs::write(cache.join(name), b"x").unwrap();
+        }
+
+        let removed = cache_remove_except(&session, "demo", Some("2.0.0")).unwrap();
+        assert_eq!(removed, 1, "only the stale version should be counted");
+        assert!(!cache.join("demo#1.0.0#old.zip").exists());
+        assert!(cache.join("demo#2.0.0#new.zip").exists());
+        assert!(cache.join("demo#2.0.0#mirror.zip").exists());
+    }
+
+    /// Interrupted downloads are swept, and only those are counted.
+    #[test]
+    fn partials_are_swept_and_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let session = session_with_cache(tmp.path());
+
+        std::fs::write(cache.join("demo#1.0.0#a.zip"), b"x").unwrap();
+        std::fs::write(cache.join("demo#1.0.0#a.zip.download"), b"partial").unwrap();
+        std::fs::write(cache.join("demo#1.0.0#b.zip.download"), b"partial").unwrap();
+
+        assert_eq!(cache_remove_partials(&session).unwrap(), 2);
+        assert!(
+            cache.join("demo#1.0.0#a.zip").exists(),
+            "finished entries stay"
+        );
+        assert!(!cache.join("demo#1.0.0#a.zip.download").exists());
+    }
 }

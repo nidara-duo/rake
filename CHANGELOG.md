@@ -21,6 +21,11 @@ and below 0.1.4.
   Reported values remain Scoop-compatible.
 - Command names in `rake status` output are shown in bold instead of wrapped in
   backticks, which a terminal prints verbatim.
+- Packages, buckets and the cache now always live in Scoop's directory layout
+  (`~/scoop`, or `$SCOOP` when set). Rake previously fell back to a `~/rake`
+  directory when Scoop was not installed, which split the two tools into separate
+  package trees. Sharing one layout means installing Scoop later finds the packages
+  already there rather than starting empty.
 
 ### Added
 

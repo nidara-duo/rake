@@ -58,13 +58,22 @@ and below 0.1.4.
 - `rake status --quiet` (`-q`) suppresses informational notes. Warnings and
   errors are unaffected, so an out-of-date or uncheckable bucket is still
   reported.
-- 107 tests, most of them covering behaviour that had none: manifest parsing and
+- 211 new tests, most of them covering behaviour that had none: manifest parsing and
   architecture fallback, the install-record format on disk, persist data safety,
-  archive extraction guards, `cleanup`, `uninstall` and the PowerShell quoting
-  rules.
+  archive extraction guards, `cleanup`, `uninstall`, the PowerShell quoting
+  rules, settings loading, bucket classification, HTTP downloads and `checkup`.
 
 ### Fixed
 
+- A download that returned an HTTP error no longer wrote the error page into the cache
+  under the archive's name and reported success. A dead mirror is routine, and the
+  corruption used to surface much later as a broken archive.
+- The final download progress event is no longer dropped when the event bus is full. It
+  is the event carrying `downloaded == total`, which is what ends the progress display,
+  so a busy channel left the bar spinning on a download that had actually finished.
+- `rake bucket add` and `rake bucket remove` reject a bucket name containing `..` or an
+  absolute path. The name was joined onto `<root>/buckets` unconstrained, so
+  `rake bucket remove ..\apps` would have removed an arbitrary directory.
 - `rake update` no longer prints "Everything is up to date!" when it just failed. It
   did so unconditionally, after the progress display had already shown the failures.
 - `rake update` reports what happened to each bucket as plain lines. The results were
@@ -76,9 +85,6 @@ and below 0.1.4.
   command reported success over a tree it had deliberately left stale. A held bucket
   also says how to release it.
 - `rake update` exits non-zero when a bucket fails, so a script running it notices.
-
-### Fixed
-
 - `rake cache rm` no longer reports files it failed to delete. The count was taken
   before anything was removed, so a cache file held open by another process was still
   announced as removed.

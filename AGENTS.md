@@ -30,6 +30,30 @@ cargo test
 
 Only commit when all pass clean.
 
+## Toolchain
+
+CI and the release workflow both install `@stable`, so the compiler that checks
+the code is the one that ships it. That only holds while the local toolchain is
+current, and nothing enforces it:
+
+```sh
+rustup update stable
+rustc --version
+```
+
+Skipping this is how `0.1.4-alpha.2` failed its first build. 1.99 had turned on
+`clippy::single_element_loop`, and `settings.rs` carried a `for section in
+["status"]` loop since before the previous release. Locally the lints were clean,
+so the failure only appeared in CI, after the tag was pushed.
+
+So: run the two commands above before committing anything that is meant to
+release. `cargo clippy` locally is only evidence about the compiler you happen to
+have installed.
+
+When a new stable does introduce lints, fix them on the version that raised them
+rather than pinning backwards — the alternative is a release built by a compiler
+nobody ran the checks on.
+
 ## Push policy
 
 Never push to remote unless explicitly asked.

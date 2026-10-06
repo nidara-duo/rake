@@ -174,6 +174,11 @@ and below 0.1.4.
   crate that actually produces `rake.exe`. It used to read the workspace root,
   where the only version on offer was a `[workspace] version` key that Cargo does
   not read at all. Clippy is now clean with no exceptions.
+- `settings.rs` validated its sections with a one-element loop, a placeholder that
+  read as "more coming" without saying which. It is a function over a section name
+  now, so the fallback wording follows the name instead of being a literal repeated
+  per section — which is how a copy-paste would have told the user their `status`
+  defaults were replaced when the problem was elsewhere.
 - Test sessions record environment writes instead of performing them, so tests
   cannot modify `HKCU\Environment`.
 

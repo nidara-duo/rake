@@ -22,6 +22,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Both this and ci.yml track stable, so a release is built by the same
+      # toolchain that checked it — as long as stable has not moved between the
+      # two runs. Keep the local toolchain current; see AGENTS.md.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

@@ -15,6 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Tracks stable on purpose, so the build uses the same compiler the project is
+      # developed against locally. The cost is that stable moves: 1.99 turned on
+      # `single_element_loop` and failed `rake-core` over a loop that had been in
+      # the tree since before the previous release, purely because the local
+      # toolchain had not been updated. So `rustc --version` is part of the
+      # pre-commit checklist — see AGENTS.md. If this line and the local version
+      # disagree, run `rustup update stable` before committing, not after CI says so.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

@@ -13,6 +13,25 @@ A development build. As with 0.1.4-alpha.1, `install <app>` and `update <app>`
 are still open; this release does not claim otherwise. It sorts above 0.1.4-alpha.1
 and below 0.1.4.
 
+### Changed
+
+- `rake status` column headings are now `Name`, `Installed`, `Latest`,
+  `Missing Deps` and `Info`. This reverses an earlier change that matched Scoop's
+  headings word for word — the extra words were noise in a table this narrow.
+  Reported values remain Scoop-compatible.
+- Command names in `rake status` output are shown in bold instead of wrapped in
+  backticks, which a terminal prints verbatim.
+
+### Added
+
+- `rake status --quiet` (`-q`) suppresses informational notes. Warnings and
+  errors are unaffected, so an out-of-date or uncheckable bucket is still
+  reported.
+- 107 tests, most of them covering behaviour that had none: manifest parsing and
+  architecture fallback, the install-record format on disk, persist data safety,
+  archive extraction guards, `cleanup`, `uninstall` and the PowerShell quoting
+  rules.
+
 ### Fixed
 
 - Installing over an existing install no longer fails with `AlreadyExists` when
@@ -38,13 +57,6 @@ and below 0.1.4.
 - `env_add_path` entries containing `..` are refused. They passed a check that
   compared path strings, so an entry like `..\..\..\..\Startup` was accepted and
   resolved to `C:\Startup` — a PATH entry that persists after uninstall.
-
-### Added
-
-- 107 tests, most of them covering behaviour that had none: manifest parsing and
-  architecture fallback, the install-record format on disk, persist data safety,
-  archive extraction guards, `cleanup`, `uninstall` and the PowerShell quoting
-  rules.
 
 ### Internal
 

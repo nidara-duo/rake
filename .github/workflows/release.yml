@@ -56,12 +56,21 @@ jobs:
           # Tags carry a `v`; the changelog headings do not.
           $version = $tag -replace '^v', ''
 
-          # A tag that disagrees with the workspace version would ship a binary
-          # whose --version does not match the release it is filed under.
-          $declared = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"$' |
+          # A tag that disagrees with the crate version would ship a binary whose
+          # --version does not match the release it is filed under.
+          #
+          # Read from the crate that actually produces the binary, not from the workspace
+          # root: `[workspace]` has no version of its own — Cargo rejects that key, so a
+          # copy of it there was dead weight that only this check happened to read.
+          $cliManifest = "crates/rake-cli/Cargo.toml"
+          if (-not (Test-Path $cliManifest)) {
+            Write-Error "cannot find $cliManifest"
+            exit 1
+          }
+          $declared = (Select-String -Path $cliManifest -Pattern '^version = "(.+)"$' |
                        Select-Object -First 1).Matches[0].Groups[1].Value
           if ($declared -ne $version) {
-            Write-Error "tag is $tag but Cargo.toml says $declared"
+            Write-Error "tag is $tag but $cliManifest says $declared"
             exit 1
           }
 

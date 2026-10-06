@@ -26,6 +26,12 @@ and below 0.1.4.
   directory when Scoop was not installed, which split the two tools into separate
   package trees. Sharing one layout means installing Scoop later finds the packages
   already there rather than starting empty.
+- Rake reads the same settings file Scoop writes: `%USERPROFILE%\.config\scoop\
+  config.json`, or `%XDG_CONFIG_HOME%` when that is set. It previously looked only
+  at `<root>/config.json`, which is the portable-install case, so on a normal
+  machine the file was never found and settings such as the chosen shim were
+  silently ignored. `$SCOOP_CACHE` is now honoured too, matching Scoop's
+  precedence for the cache directory.
 
 ### Added
 
@@ -39,6 +45,10 @@ and below 0.1.4.
 
 ### Fixed
 
+- JSON files carrying a UTF-8 byte order mark are now read correctly. This
+  affected bucket manifests, installed manifests and the settings file: the file
+  was discarded and the app simply did not appear, while Scoop — which strips the
+  mark — carried on working. Windows tooling writes one readily.
 - Installing over an existing install no longer fails with `AlreadyExists` when
   the new version ships its own copy of a persisted directory. Scoop keeps that
   copy as `<name>.original` next to the app; Rake now does the same, so the

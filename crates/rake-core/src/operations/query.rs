@@ -190,7 +190,7 @@ pub(crate) fn query_synced_inner(session: &Session) -> Result<Vec<Package>> {
                 .into_iter()
                 .filter_map(|entry| {
                     let manifest_path = entry.path();
-                    if let Ok(content) = std::fs::read_to_string(manifest_path)
+                    if let Ok(content) = crate::infra::json::read_to_string(manifest_path)
                         && let Ok(manifest) = serde_json::from_str::<Manifest>(&content)
                     {
                         let file_stem = manifest_path
@@ -271,7 +271,7 @@ pub(crate) fn query_synced_matching_inner(
                 manifest_paths
                     .into_iter()
                     .filter_map(|manifest_path| {
-                        if let Ok(content) = std::fs::read_to_string(&manifest_path)
+                        if let Ok(content) = crate::infra::json::read_to_string(&manifest_path)
                             && let Ok(manifest) = serde_json::from_str::<Manifest>(&content)
                         {
                             let file_stem = manifest_path
@@ -308,7 +308,7 @@ pub(crate) fn query_synced_matching_inner(
                         })
                     })
                     .filter_map(|manifest_path| {
-                        if let Ok(content) = std::fs::read_to_string(&manifest_path)
+                        if let Ok(content) = crate::infra::json::read_to_string(&manifest_path)
                             && let Ok(manifest) = serde_json::from_str::<Manifest>(&content)
                         {
                             let file_stem = manifest_path

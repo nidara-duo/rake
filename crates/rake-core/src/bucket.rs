@@ -124,8 +124,7 @@ impl Bucket {
 
     pub fn load_manifest(&self, name: &str) -> Option<Manifest> {
         let path = self.path_of_manifest(name)?;
-        let content = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&content).ok()
+        crate::infra::json::read(&path).ok()
     }
 
     /// Path to `<bucket>/deprecated/<name>.json`, if the manifest was
@@ -154,8 +153,7 @@ impl Bucket {
 
     pub fn load_deprecated_manifest(&self, name: &str) -> Option<Manifest> {
         let path = self.path_of_deprecated_manifest(name)?;
-        let content = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&content).ok()
+        crate::infra::json::read(&path).ok()
     }
 
     pub fn manifest_paths(&self) -> Vec<PathBuf> {

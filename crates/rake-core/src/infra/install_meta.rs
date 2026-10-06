@@ -50,7 +50,7 @@ fn read_first<T: serde::de::DeserializeOwned>(dir: &Path, names: &[&str]) -> Res
         if !path.is_file() {
             continue;
         }
-        let content = std::fs::read_to_string(&path)?;
+        let content = crate::infra::json::read_to_string(&path)?;
         match serde_json::from_str(&content) {
             Ok(value) => return Ok(Some(value)),
             Err(e) => {

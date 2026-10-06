@@ -24,10 +24,9 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
         }
     };
 
-    let content = std::fs::read_to_string(&path)?;
-
-    // Pretty-print with serde_json
-    let parsed: serde_json::Value = serde_json::from_str(&content)?;
+    // Read through the shared helper so a BOM in the manifest does not make `cat`
+    // fail where Scoop reads the same file fine.
+    let parsed: serde_json::Value = rake_core::infra::json::read(&path)?;
     let pretty = serde_json::to_string_pretty(&parsed)?;
 
     println!("{}:", path.display().to_string().green());

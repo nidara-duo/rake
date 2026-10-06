@@ -166,7 +166,7 @@ fn resolve_installed_version(app_dir: &std::path::Path) -> Option<String> {
     } else {
         current_dir.join(crate::infra::install_meta::INSTALLED_MANIFEST_LEGACY)
     };
-    if let Ok(content) = std::fs::read_to_string(&manifest_path)
+    if let Ok(content) = crate::infra::json::read_to_string(&manifest_path)
         && let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content)
         && let Some(ver) = manifest.get("version").and_then(|v| v.as_str())
     {

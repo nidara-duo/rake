@@ -126,8 +126,30 @@ pub fn run_powershell_script(lines: &[String], ctx: &HookContext) -> Result<()> 
         ),
     };
 
-    let content = format!("{header}{script_body}");
+    run_body(&format!("{header}{script_body}")).map(|_| ())
+}
 
+/// Run a PowerShell snippet and return what it printed to stdout.
+///
+/// For callers that need the answer rather than just success — `checkup` asks Windows
+/// Defender a question this way. Like [`run_powershell_script`] the body goes through a
+/// temporary file rather than `-Command`, because a script passed on the command line is
+/// re-parsed by the C runtime before PowerShell ever sees it, and a double quote inside it
+/// no longer survives as written.
+pub fn run_powershell_capture(lines: &[String]) -> Result<String> {
+    let body = if cfg!(windows) {
+        lines.join("\r\n")
+    } else {
+        lines.join("\n")
+    };
+    run_body(&body)
+}
+
+/// Write `content` to a temporary `.ps1` and run it with `powershell.exe -File`.
+///
+/// Returns stdout on success, or an error naming stderr. The temporary file is removed
+/// when the returned path goes out of scope.
+fn run_body(content: &str) -> Result<String> {
     let mut tmp = tempfile::Builder::new()
         .prefix("rake-hook-")
         .suffix(".ps1")
@@ -144,6 +166,7 @@ pub fn run_powershell_script(lines: &[String], ctx: &HookContext) -> Result<()> 
     let out = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
+            "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-File",
@@ -167,7 +190,7 @@ pub fn run_powershell_script(lines: &[String], ctx: &HookContext) -> Result<()> 
         ))));
     }
 
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(test)]

@@ -183,9 +183,19 @@ fn check_developer_mode() -> CheckupItem {
 }
 
 fn check_defender(session: &Session) -> Result<CheckupItem> {
-    let running = system::is_windows_defender_running()?;
-    if !running {
-        return Ok(CheckupItem::ok("Windows Defender exclusion"));
+    match system::is_windows_defender_running()? {
+        // Only a positive answer lets the question through. Treating "could not tell" as
+        // "not running" reported a healthy checkup on a machine where PowerShell could
+        // not even be started.
+        None => {
+            return Ok(CheckupItem::warn(
+                "Windows Defender exclusion",
+                "Could not read the Defender service state.",
+                Some("Check that PowerShell is available"),
+            ));
+        }
+        Some(false) => return Ok(CheckupItem::ok("Windows Defender exclusion")),
+        Some(true) => {}
     }
 
     let root = session
@@ -197,16 +207,23 @@ fn check_defender(session: &Session) -> Result<CheckupItem> {
 
     let excluded = system::check_defender_exclusion(&root)?;
 
-    Ok(if excluded {
-        CheckupItem::ok("Windows Defender exclusion")
-    } else {
-        CheckupItem::warn(
+    // Three outcomes, not two. `Some(false)` is a real "not excluded"; `None` means the
+    // question could not be answered, and reporting that as either verdict would be a lie
+    // in one direction or the other.
+    Ok(match excluded {
+        Some(true) => CheckupItem::ok("Windows Defender exclusion"),
+        Some(false) => CheckupItem::warn(
             "Windows Defender exclusion",
             "Windows Defender may slow down or disrupt installs with realtime scanning.",
             Some(format!(
                 "Run: Add-MpPreference -ExclusionPath '{}'",
                 root.display()
             )),
-        )
+        ),
+        None => CheckupItem::warn(
+            "Windows Defender exclusion",
+            "Could not read the Defender exclusion list.",
+            Some("Check that PowerShell is available and run: Get-MpPreference"),
+        ),
     })
 }

@@ -45,6 +45,13 @@ and below 0.1.4.
 
 ### Fixed
 
+- `rake checkup` no longer reports the Windows Defender exclusion check as passing
+  when it could not be performed. Two separate problems combined: the exclusion
+  query answered "excluded" whenever PowerShell could not be started or its own
+  `catch` fired, and the service query answered "Defender is not running" in the
+  same situation, which short-circuited the check to OK before it even ran. Both
+  now distinguish "no" from "could not tell", and an unanswered check is reported
+  as such.
 - JSON files carrying a UTF-8 byte order mark are now read correctly. This
   affected bucket manifests, installed manifests and the settings file: the file
   was discarded and the app simply did not appear, while Scoop — which strips the

@@ -198,57 +198,181 @@ pub fn is_developer_mode_enabled() -> Result<bool> {
     }
 }
 
-pub fn check_defender_exclusion(path: &Path) -> Result<bool> {
+/// Is `path` covered by a Windows Defender exclusion?
+///
+/// Returns `None` when the question could not be answered — PowerShell unavailable, the
+/// cmdlet refusing to run, Defender disabled mid-check. The previous version returned
+/// `true` in every one of those cases, including from a `catch` inside the script, so
+/// `checkup` printed "OK" for a check that had not happened. A check that cannot be
+/// performed is not a passing check.
+pub fn check_defender_exclusion(path: &Path) -> Result<Option<bool>> {
     #[cfg(windows)]
     {
         let path_str = path.to_str().unwrap_or(".");
-        let escaped_path = path_str.replace('\'', "''");
-        let script = format!(
-            "try {{$c=[System.IO.Path]::GetFullPath('{p}').TrimEnd('\\').TrimEnd('/');$e=@((Get-MpPreference).ExclusionPath);if($e.Count -eq 0 -or ($e.Count -eq 1 -and $null -eq $e[0])){{'TRUE';return}}foreach($x in $e){{if($null -eq $x){{continue}}$n=[System.IO.Path]::GetFullPath($x).TrimEnd('\\').TrimEnd('/');if($c -eq $n){{'TRUE';return}}if($c.StartsWith($n+'\\',[StringComparison]::OrdinalIgnoreCase)){{'TRUE';return}}}}'FALSE'}}catch{{'TRUE'}}",
-            p = escaped_path
-        );
+        // Single quotes make the value literal, so the doubling below is the whole
+        // escaping rule — see infra::script for why this differs from the double-quoted
+        // form used elsewhere.
+        let escaped = path_str.replace('\'', "''");
 
-        let output = match std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .output()
-        {
-            Ok(o) => o,
-            Err(_) => return Ok(true),
+        // Three distinct answers, because conflating "not excluded" with "could not tell"
+        // is what produced the false OK. No `catch`: a failure has to surface as a
+        // failure, not as a verdict.
+        let script = vec![format!(
+            "$target = [System.IO.Path]::GetFullPath('{escaped}').TrimEnd('\\').TrimEnd('/')
+$found = $false
+foreach ($x in @((Get-MpPreference).ExclusionPath)) {{
+    if ($null -eq $x) {{ continue }}
+    $n = [System.IO.Path]::GetFullPath($x).TrimEnd('\\').TrimEnd('/')
+    if ($target -eq $n -or $target.StartsWith($n + '\\', [StringComparison]::OrdinalIgnoreCase)) {{
+        $found = $true
+        break
+    }}
+}}
+if ($found) {{ 'EXCLUDED' }} else {{ 'NOT_EXCLUDED' }}"
+        )];
+
+        let stdout = match crate::infra::script::run_powershell_capture(&script) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("Defender exclusion check could not run: {e}");
+                return Ok(None);
+            }
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        Ok(stdout == "TRUE")
+        Ok(exclusion_verdict(&stdout))
     }
 
     #[cfg(not(windows))]
     {
         let _ = path;
-        Ok(true)
+        Ok(None)
     }
 }
 
-pub fn is_windows_defender_running() -> Result<bool> {
+/// Read the exclusion answer, treating anything unexpected as "unknown".
+///
+/// Pure so the distinction that matters can be tested without touching Defender: an
+/// unrecognised answer must never be read as "excluded".
+pub(crate) fn exclusion_verdict(stdout: &str) -> Option<bool> {
+    match stdout.trim() {
+        "EXCLUDED" => Some(true),
+        "NOT_EXCLUDED" => Some(false),
+        other => {
+            tracing::debug!("Unexpected Defender exclusion output: {other:?}");
+            None
+        }
+    }
+}
+
+/// Is the Defender service running?
+///
+/// `None` means the question could not be answered. It used to return `false` on any
+/// failure, and `checkup` treats "not running" as "nothing to worry about" — so a machine
+/// where PowerShell could not be spawned reported a clean bill of health for a check that
+/// never ran. Both directions of that lie are now unavailable.
+pub fn is_windows_defender_running() -> Result<Option<bool>> {
     #[cfg(windows)]
     {
-        let output = match std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "try { (Get-Service -Name WinDefend -ErrorAction SilentlyContinue).Status -eq 'Running' } catch { $false }",
-            ])
-            .output()
-        {
-            Ok(o) => o,
-            Err(_) => return Ok(false),
+        let script =
+            vec!["(Get-Service -Name WinDefend -ErrorAction SilentlyContinue).Status".to_owned()];
+
+        let stdout = match crate::infra::script::run_powershell_capture(&script) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("Defender service query could not run: {e}");
+                return Ok(None);
+            }
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        Ok(stdout == "True")
+        Ok(service_running_verdict(&stdout))
     }
 
     #[cfg(not(windows))]
     {
-        Ok(false)
+        Ok(None)
+    }
+}
+
+/// Read the service-status answer, treating anything unexpected as "unknown".
+pub(crate) fn service_running_verdict(stdout: &str) -> Option<bool> {
+    match stdout.trim() {
+        "Running" => Some(true),
+        "Stopped" | "Disabled" | "StartPending" | "StopPending" | "Paused" => Some(false),
+        "" => {
+            tracing::debug!("Defender service query returned nothing");
+            None
+        }
+        other => {
+            tracing::debug!("Unexpected Defender service status: {other:?}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod defender_tests {
+    use super::*;
+
+    /// The bug this pins: an unrecognised answer used to be read as "excluded", so
+    /// `checkup` printed OK for a check that never ran. Anything unrecognised must be
+    /// "unknown", never a verdict.
+    #[test]
+    fn exclusion_verdict_reads_the_two_real_answers() {
+        assert_eq!(exclusion_verdict("EXCLUDED"), Some(true));
+        assert_eq!(exclusion_verdict("NOT_EXCLUDED"), Some(false));
+        assert_eq!(exclusion_verdict("  EXCLUDED  \r\n"), Some(true));
+    }
+
+    #[test]
+    fn exclusion_verdict_treats_anything_else_as_unknown() {
+        for junk in ["", "  ", "ERROR", "True", "excluded", "EXCLUDED extra"] {
+            assert_eq!(
+                exclusion_verdict(junk),
+                None,
+                "{junk:?} must not be read as excluded"
+            );
+        }
+    }
+
+    /// Same rule for the service query. The old code returned `false` when PowerShell
+    /// could not be spawned, which `checkup` read as "Defender not running, nothing to
+    /// report" — a green result for a check that did not happen.
+    #[test]
+    fn service_verdict_reads_the_two_real_answers() {
+        assert_eq!(service_running_verdict("Running"), Some(true));
+        assert_eq!(service_running_verdict("Stopped"), Some(false));
+        assert_eq!(service_running_verdict("Disabled"), Some(false));
+    }
+
+    #[test]
+    fn service_verdict_treats_anything_else_as_unknown() {
+        // Empty is what a failed cmdlet prints, so it must not become "not running".
+        for junk in ["", "   ", "NoService", "true", "Running extra"] {
+            assert_eq!(
+                service_running_verdict(junk),
+                None,
+                "{junk:?} must not be read as a verdict"
+            );
+        }
+    }
+
+    /// The two are separate questions and must not be inferred from one another: a running
+    /// Defender says nothing about whether the path is excluded.
+    #[test]
+    fn the_two_answers_are_independent() {
+        assert_eq!(
+            (
+                service_running_verdict("Running"),
+                exclusion_verdict("NOT_EXCLUDED")
+            ),
+            (Some(true), Some(false))
+        );
+        assert_eq!(
+            (
+                service_running_verdict("Stopped"),
+                exclusion_verdict("EXCLUDED")
+            ),
+            (Some(false), Some(true))
+        );
     }
 }

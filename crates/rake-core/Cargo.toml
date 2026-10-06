@@ -30,7 +30,7 @@ md5 = { package = "md-5", version = "0.10" }
 hex = "0.4"
 indicatif = "0.17"
 crossterm = "0.28"
-git2 = "0.19"
+git2 = "0.20"
 tempfile = "3"
 
 [dev-dependencies]

@@ -64,8 +64,20 @@ pub fn execute(args: Args, _session: &Session) -> Result<()> {
     }
 }
 
+/// Print anything the file said we could not use.
+///
+/// `set` and `reset` rewrite the document, so a correction made here would otherwise
+/// quietly replace a value the user had typed — they would lose it without being told.
+fn report_problems(loaded: &settings::Loaded) {
+    for warning in loaded.warnings() {
+        eprintln!("warning: {warning}");
+    }
+}
+
 fn list() -> Result<()> {
-    let current = settings::load()?;
+    let loaded = settings::load()?;
+    report_problems(&loaded);
+    let current = &loaded.settings;
 
     let mut table = Table::new();
     table.load_preset(NOTHING);
@@ -115,8 +127,9 @@ fn list() -> Result<()> {
 }
 
 fn get(name: &str) -> Result<()> {
-    let current = settings::load()?;
-    match current.get(name) {
+    let loaded = settings::load()?;
+    report_problems(&loaded);
+    match loaded.settings.get(name) {
         Some(value) => {
             println!("{name} = {value}");
             Ok(())
@@ -130,7 +143,9 @@ fn get(name: &str) -> Result<()> {
 }
 
 fn set(name: &str, value: &str) -> Result<()> {
-    let mut current = settings::load()?;
+    let loaded = settings::load()?;
+    report_problems(&loaded);
+    let mut current = loaded.settings;
     // A bad value must not create the file, so parse before saving.
     current
         .set(name, value)
@@ -145,7 +160,9 @@ fn set(name: &str, value: &str) -> Result<()> {
 }
 
 fn reset(name: &str) -> Result<()> {
-    let mut current = settings::load()?;
+    let loaded = settings::load()?;
+    report_problems(&loaded);
+    let mut current = loaded.settings;
     let previous = current.get(name);
     current
         .reset(name)
@@ -186,11 +203,22 @@ fn edit() -> Result<()> {
     }
 
     // Validate what they wrote: a typo saved into the file should be reported here rather
-    // than at some later command that silently used a different value.
+    // than at some later command that quietly used a different value.
     match settings::load() {
-        Ok(_) => {
-            println!("Settings saved to {}", path.display());
-            Ok(())
+        Ok(loaded) => {
+            report_problems(&loaded);
+            if loaded.problems.is_empty() {
+                println!("Settings saved to {}", path.display());
+                Ok(())
+            } else {
+                // The file is valid JSON and has been accepted; entries in it are not
+                // usable, so the defaults apply until they are corrected.
+                println!(
+                    "Settings saved to {}, but some entries were not usable and defaults apply.",
+                    path.display()
+                );
+                std::process::exit(1);
+            }
         }
         Err(e) => {
             println!("{} is not valid: {e}", path.display());

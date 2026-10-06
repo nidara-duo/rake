@@ -89,7 +89,14 @@ fn should_report_offline_note(mode: CheckBuckets, has_buckets: bool, quiet: bool
 }
 
 pub async fn execute(args: Args, session: &Session) -> Result<()> {
-    let settings = rake_core::settings::load()?;
+    let loaded = rake_core::settings::load()?;
+    // A silently substituted default is indistinguishable from "my setting did nothing", so
+    // an unreadable entry is named on stderr. On stdout it would be noise on a command
+    // people run often.
+    for warning in loaded.warnings() {
+        eprintln!("warning: {warning}");
+    }
+    let settings = &loaded.settings;
 
     let mode =
         resolve_mode(&args, settings.status.offline_by_default).map_err(|e| anyhow::anyhow!(e))?;

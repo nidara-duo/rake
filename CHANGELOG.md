@@ -48,6 +48,13 @@ and below 0.1.4.
 - `rake status` flags now resolve as flag → setting → built-in default, so an
   explicit flag always overrides the file. `-l -C` together is now reported as
   contradictory rather than silently resolved.
+- An unreadable entry in the settings file no longer costs you the whole file. The
+  document is read key by key: the broken entry falls back to the built-in default,
+  the readable ones still apply, and each substitution is reported — on stderr for
+  every command, since a quietly replaced default looks exactly like a preference
+  that did nothing. A file that is not valid JSON costs every setting and is
+  reported with its line and column. `rake settings edit` validates what you saved
+  and exits non-zero if part of it is unusable.
 - `rake status --quiet` (`-q`) suppresses informational notes. Warnings and
   errors are unaffected, so an out-of-date or uncheckable bucket is still
   reported.

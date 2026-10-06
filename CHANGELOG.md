@@ -7,11 +7,11 @@ Each release section lists the user-visible effect, not the commits that
 produced it. Anything that changes behaviour, output, or the on-disk layout of a
 Scoop root belongs here.
 
-## [0.1.4-alpha.2]
+## [0.1.4-alpha.3]
 
-A development build. As with 0.1.4-alpha.1, `install <app>` and `update <app>`
-are still open; this release does not claim otherwise. It sorts above 0.1.4-alpha.1
-and below 0.1.4.
+A development build. As with 0.1.4-alpha.1 and 0.1.4-alpha.2, `install <app>`
+and `update <app>` are still open; this release does not claim otherwise. It
+sorts above 0.1.4-alpha.2 and below 0.1.4.
 
 ### Changed
 
@@ -35,6 +35,14 @@ and below 0.1.4.
 
 ### Added
 
+- `rake self update --pre-release` (also on `rake self install`) takes the newest
+  pre-release when one is newer than the newest finished release, and nothing else.
+  A tag carrying a `-` counts as a pre-release, and so does one GitHub marks as
+  such — either signal is enough, because the two can disagree and the version is
+  what the ordering is actually computed from. `1.0.0+linux` is not a pre-release:
+  build metadata does not make one.
+- `rake self update` names the version it installs, and says which pre-release is
+  being held back rather than reporting a flat "already up to date".
 - `rake settings` — get, set and reset user preferences, stored in
   `~/.config/rake/settings.json`. Deliberately a separate file from Scoop's
   `config.json`, whose `set_config` rewrites the whole document and would drop
@@ -58,13 +66,15 @@ and below 0.1.4.
 - `rake status --quiet` (`-q`) suppresses informational notes. Warnings and
   errors are unaffected, so an out-of-date or uncheckable bucket is still
   reported.
-- 211 new tests, most of them covering behaviour that had none: manifest parsing and
-  architecture fallback, the install-record format on disk, persist data safety,
-  archive extraction guards, `cleanup`, `uninstall`, the PowerShell quoting
-  rules, settings loading, bucket classification, HTTP downloads and `checkup`.
 
 ### Fixed
 
+- `rake self update` no longer downgrades. It asked GitHub for the newest *finished*
+  release, so anyone who had installed a pre-release was silently moved back to the
+  previous version on their next update — a pre-release is newer than anything that
+  endpoint will ever return. It now takes the maximum by version across the
+  published releases and refuses to install anything older than what is running.
+  A finished release supersedes the pre-release it followed, as usual.
 - A download that returned an HTTP error no longer wrote the error page into the cache
   under the archive's name and reported success. A dead mirror is routine, and the
   corruption used to surface much later as a broken archive.
@@ -131,9 +141,20 @@ and below 0.1.4.
 
 ### Internal
 
+- 230 new tests, most of them covering behaviour that had none: manifest parsing and
+  architecture fallback, the install-record format on disk, persist data safety,
+  archive extraction guards, `cleanup`, `uninstall`, the PowerShell quoting
+  rules, settings loading, bucket classification, release selection, HTTP
+  downloads and `checkup`.
 - `validate_relative_path` is now the single place that rejects a manifest-supplied
   path which could escape its directory. `bin`, `persist`, shortcuts and
   `env_add_path` all go through it; three divergent copies of the check existed.
+  `rake bucket add`/`remove` go through it too.
+- Each `checkup` verdict was split from the system probe that feeds it, so severity,
+  wording and the presence of advice are testable without touching the machine.
+- Release selection for `rake self` is a pure function over the published list. It
+  takes the maximum by version rather than trusting the API's order, which says
+  nothing about version order once a release is re-cut.
 - Test sessions record environment writes instead of performing them, so tests
   cannot modify `HKCU\Environment`.
 

@@ -22,17 +22,224 @@ pub struct UpdateSpec {
     pub downloaded: Vec<DownloadedFile>,
 }
 
-pub async fn bucket_update(session: &Session) -> Result<()> {
+#[cfg(test)]
+mod bucket_sync_tests {
+    use super::*;
+    use crate::bucket::Bucket;
+    use std::path::Path;
+
+    /// Build a bucket rooted at `<root>/buckets/<name>` without touching the network.
+    fn bucket_at(root: &Path, name: &str, git: bool) -> Bucket {
+        let path = root.join("buckets").join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        if git {
+            std::fs::create_dir_all(path.join(".git")).unwrap();
+        }
+        Bucket::from(&path).unwrap()
+    }
+
+    fn held_bucket(root: &Path, name: &str) -> Bucket {
+        let b = bucket_at(root, name, true);
+        // The marker is `.hold`; `hold` without the dot does nothing, which this helper
+        // found out the hard way.
+        std::fs::write(b.path().join(".hold"), b"").unwrap();
+        Bucket::from(b.path()).unwrap()
+    }
+
+    /// A bucket with a repository is the only thing worth fetching.
+    #[test]
+    fn a_real_bucket_is_not_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = bucket_at(tmp.path(), "main", true);
+        assert_eq!(skip_reason(&b), None);
+    }
+
+    /// A held bucket used to be skipped with no message at all, so `rake update` reported
+    /// success over a tree it had deliberately left stale.
+    #[test]
+    fn a_held_bucket_is_reported_as_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = held_bucket(tmp.path(), "main");
+        assert!(b.is_held(), "premise: the bucket is held");
+        assert_eq!(skip_reason(&b), Some(BucketSyncOutcome::Held));
+    }
+
+    /// A directory in `buckets/` that is not a repository was also skipped silently.
+    #[test]
+    fn a_directory_without_git_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = bucket_at(tmp.path(), "fake", false);
+        assert_eq!(skip_reason(&b), Some(BucketSyncOutcome::NotARepository));
+    }
+
+    /// A worktree or submodule has `.git` as a *file*. Skipping those would silently
+    /// exclude a legitimate layout.
+    #[test]
+    fn a_git_file_counts_as_a_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = bucket_at(tmp.path(), "worktree", false);
+        std::fs::write(b.path().join(".git"), "gitdir: ../elsewhere").unwrap();
+        assert_eq!(
+            skip_reason(&b),
+            None,
+            ".git as a file is how a worktree records its repository"
+        );
+    }
+
+    fn report(entries: &[(&str, BucketSyncOutcome)]) -> BucketSyncReport {
+        let mut r = BucketSyncReport::default();
+        for (name, outcome) in entries {
+            r.push(*name, outcome.clone());
+        }
+        r
+    }
+
+    #[test]
+    fn counts_split_the_outcomes() {
+        let r = report(&[
+            ("a", BucketSyncOutcome::Updated),
+            ("b", BucketSyncOutcome::Updated),
+            ("c", BucketSyncOutcome::Held),
+            ("d", BucketSyncOutcome::NotARepository),
+            ("e", BucketSyncOutcome::Failed("no such host".into())),
+        ]);
+        assert_eq!(r.updated(), 2);
+        assert_eq!(r.skipped(), 2);
+        assert_eq!(r.failed(), 1);
+        assert!(!r.all_succeeded());
+    }
+
+    /// The line the old code printed unconditionally.
+    #[test]
+    fn a_single_failure_makes_the_run_unsuccessful() {
+        let r = report(&[
+            ("a", BucketSyncOutcome::Updated),
+            ("b", BucketSyncOutcome::Failed("x".into())),
+        ]);
+        assert!(!r.all_succeeded());
+    }
+
+    #[test]
+    fn skips_alone_are_not_a_failure() {
+        let r = report(&[
+            ("a", BucketSyncOutcome::Held),
+            ("b", BucketSyncOutcome::NotARepository),
+        ]);
+        assert!(r.all_succeeded(), "nothing went wrong, so nothing failed");
+        assert_eq!(r.skipped(), 2);
+    }
+
+    /// No buckets at all is fine — there was nothing to be wrong about. This is the case
+    /// the CLI renders as "Nothing was updated".
+    #[test]
+    fn an_empty_report_succeeds() {
+        let r = BucketSyncReport::default();
+        assert!(r.all_succeeded());
+        assert_eq!(r.updated(), 0);
+    }
+
+    /// `is_held` reads a file whose absence means not held, so the classification must not
+    /// depend on anything else being present.
+    #[test]
+    fn a_fresh_bucket_is_not_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = bucket_at(tmp.path(), "main", true);
+        assert!(!b.is_held());
+    }
+}
+
+/// What happened to one bucket during `rake update`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BucketSyncOutcome {
+    /// Fetched and fast-forwarded.
+    Updated,
+    /// Held on purpose, so deliberately left stale.
+    Held,
+    /// Present in the buckets directory but not a git repository.
+    NotARepository,
+    /// The fetch failed; the reason is libgit2's or git's.
+    Failed(String),
+}
+
+impl BucketSyncOutcome {
+    pub fn is_failure(&self) -> bool {
+        matches!(self, BucketSyncOutcome::Failed(_))
+    }
+
+    pub fn is_skip(&self) -> bool {
+        matches!(
+            self,
+            BucketSyncOutcome::Held | BucketSyncOutcome::NotARepository
+        )
+    }
+}
+
+/// One line per bucket, in the order they were considered.
+///
+/// Returned rather than only pushed as progress events because those are rendered by
+/// `indicatif`, which hides itself entirely when the output is not a terminal. Piping or
+/// redirecting `rake update` used to print nothing at all about what happened — no bucket
+/// name, no failure — and then "Everything is up to date!" regardless.
+#[derive(Debug, Clone, Default)]
+pub struct BucketSyncReport {
+    pub outcomes: Vec<(String, BucketSyncOutcome)>,
+}
+
+impl BucketSyncReport {
+    pub fn push(&mut self, name: impl Into<String>, outcome: BucketSyncOutcome) {
+        self.outcomes.push((name.into(), outcome));
+    }
+
+    pub fn failed(&self) -> usize {
+        self.count(BucketSyncOutcome::is_failure)
+    }
+
+    pub fn skipped(&self) -> usize {
+        self.count(BucketSyncOutcome::is_skip)
+    }
+
+    pub fn updated(&self) -> usize {
+        self.count(|o| *o == BucketSyncOutcome::Updated)
+    }
+
+    fn count(&self, predicate: impl Fn(&BucketSyncOutcome) -> bool) -> usize {
+        self.outcomes.iter().filter(|(_, o)| predicate(o)).count()
+    }
+
+    /// True when nothing failed. A report with no buckets at all counts as fine — there
+    /// was nothing to be wrong.
+    pub fn all_succeeded(&self) -> bool {
+        self.failed() == 0
+    }
+}
+
+/// Why this bucket will not be fetched, decided before any I/O.
+///
+/// Pure apart from the `.git` check, which is a `stat`, so it can be tested against a
+/// temporary directory with no network and no git binary. Held buckets and
+/// non-repositories used to be skipped with no message at all — the command reported
+/// success over a tree it had deliberately left stale.
+fn skip_reason(bucket: &crate::bucket::Bucket) -> Option<BucketSyncOutcome> {
+    if bucket.is_held() {
+        return Some(BucketSyncOutcome::Held);
+    }
+    // `.git` is a directory normally and a *file* in a worktree or submodule, both of
+    // which `exists` covers.
+    if !bucket.path().join(".git").exists() {
+        return Some(BucketSyncOutcome::NotARepository);
+    }
+    None
+}
+
+pub async fn bucket_update(session: &Session) -> Result<BucketSyncReport> {
     let buckets = bucket::bucket_list(session)?;
     let git = crate::infra::git_libgit2::Git::new();
     let tx = session.event_bus().core_sender();
+    let mut report = BucketSyncReport::default();
 
-    for bucket in buckets {
-        if bucket.is_held() {
-            continue;
-        }
-
-        if !bucket.path().join(".git").exists() {
+    for bucket in &buckets {
+        if let Some(reason) = skip_reason(bucket) {
+            report.push(bucket.name(), reason);
             continue;
         }
 
@@ -41,25 +248,29 @@ pub async fn bucket_update(session: &Session) -> Result<()> {
             state: BucketState::Started,
         });
 
-        match git.pull(bucket.path()).await {
+        let outcome = match git.pull(bucket.path()).await {
             Ok(_) => {
                 let _ = tx.try_send(Event::BucketSyncProgress {
                     name: bucket.name().to_owned(),
                     state: BucketState::Succeeded,
                 });
+                BucketSyncOutcome::Updated
             }
             Err(e) => {
                 let _ = tx.try_send(Event::BucketSyncProgress {
                     name: bucket.name().to_owned(),
                     state: BucketState::Failed(e.to_string()),
                 });
+                BucketSyncOutcome::Failed(e.to_string())
             }
-        }
+        };
+
+        report.push(bucket.name(), outcome);
     }
 
     let _ = tx.try_send(Event::BucketSyncDone);
 
-    Ok(())
+    Ok(report)
 }
 
 pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<Vec<Package>> {

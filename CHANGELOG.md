@@ -65,6 +65,20 @@ and below 0.1.4.
 
 ### Fixed
 
+- `rake update` no longer prints "Everything is up to date!" when it just failed. It
+  did so unconditionally, after the progress display had already shown the failures.
+- `rake update` reports what happened to each bucket as plain lines. The results were
+  delivered only through the progress display, which hides itself entirely when the
+  output is not a terminal — so redirecting the command or piping it to a file produced
+  no bucket names and no failures at all.
+- Buckets that `rake update` declines to fetch are now named. A held bucket or a
+  directory that is not a git repository used to be skipped with no message, so the
+  command reported success over a tree it had deliberately left stale. A held bucket
+  also says how to release it.
+- `rake update` exits non-zero when a bucket fails, so a script running it notices.
+
+### Fixed
+
 - `rake cache rm` no longer reports files it failed to delete. The count was taken
   before anything was removed, so a cache file held open by another process was still
   announced as removed.

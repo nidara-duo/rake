@@ -542,10 +542,8 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
 /// Bucket-sync only mode: update all buckets with spinner UI.
 async fn bucket_only(session: &Session, quiet: bool) -> Result<()> {
     let all_buckets = rake_core::operations::bucket::bucket_list(session)?;
-    let buckets_to_update: Vec<_> = all_buckets.into_iter().filter(|b| !b.is_held()).collect();
-    let count = buckets_to_update.len();
 
-    if count == 0 {
+    if all_buckets.is_empty() {
         println!("No buckets to update.");
         return Ok(());
     }
@@ -555,6 +553,7 @@ async fn bucket_only(session: &Session, quiet: bool) -> Result<()> {
     let ui_handle = spawn_bucket_ui(session, quiet, done);
 
     if !quiet {
+        let count = all_buckets.len();
         if count == 1 {
             println!("Updating bucket");
         } else {
@@ -562,13 +561,58 @@ async fn bucket_only(session: &Session, quiet: bool) -> Result<()> {
         }
     }
 
-    update::bucket_update(session).await?;
+    let report = update::bucket_update(session).await?;
 
     drop(_guard);
     let _ = ui_handle.join();
 
+    // Printed as plain lines rather than left to the progress display, because indicatif
+    // hides itself when the output is not a terminal — so redirected or piped into a file
+    // this used to show nothing at all about what happened to any bucket.
+    for (name, outcome) in &report.outcomes {
+        match outcome {
+            update::BucketSyncOutcome::Updated => {
+                if !quiet {
+                    println!(" {} {}", style("✓").green(), name);
+                }
+            }
+            update::BucketSyncOutcome::Held => {
+                println!(
+                    " {} {} is held — not updated (use 'rake bucket unhold {}')",
+                    style("!").yellow(),
+                    name,
+                    name
+                );
+            }
+            update::BucketSyncOutcome::NotARepository => {
+                println!(
+                    " {} {} is not a git repository — not updated",
+                    style("!").yellow(),
+                    name
+                );
+            }
+            update::BucketSyncOutcome::Failed(reason) => {
+                println!(" {} {} ({})", style("✗").red(), name, reason);
+            }
+        }
+    }
+
+    if report.failed() > 0 {
+        // Non-zero, so a script running `rake update` notices. The per-bucket reasons are
+        // already printed above rather than folded into this message.
+        return Err(anyhow::anyhow!(
+            "{} of {} buckets failed to update",
+            report.failed(),
+            report.outcomes.len()
+        ));
+    }
+
     if !quiet {
-        println!("Everything is up to date!");
+        if report.updated() == 0 && report.skipped() > 0 {
+            println!("Nothing was updated: every bucket is held or not a repository.");
+        } else {
+            println!("Everything is up to date!");
+        }
     }
 
     Ok(())

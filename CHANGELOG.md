@@ -7,11 +7,11 @@ Each release section lists the user-visible effect, not the commits that
 produced it. Anything that changes behaviour, output, or the on-disk layout of a
 Scoop root belongs here.
 
-## [0.1.4-alpha.3]
+## [0.1.4-alpha.2]
 
-A development build. As with 0.1.4-alpha.1 and 0.1.4-alpha.2, `install <app>`
-and `update <app>` are still open; this release does not claim otherwise. It
-sorts above 0.1.4-alpha.2 and below 0.1.4.
+A development build. As with 0.1.4-alpha.1, `install <app>` and `update <app>`
+are still open; this release does not claim otherwise. It sorts above 0.1.4-alpha.1
+and below 0.1.4.
 
 ### Changed
 
@@ -43,6 +43,14 @@ sorts above 0.1.4-alpha.2 and below 0.1.4.
   build metadata does not make one.
 - `rake self update` names the version it installs, and says which pre-release is
   being held back rather than reporting a flat "already up to date".
+- `scripts/bootstrap.ps1` takes `-Prerelease` and `-Version`, so the very first
+  install can choose which release it takes. It had no way to: the endpoint it
+  used never returns pre-releases. A dash in the tag is treated as the signal,
+  rather than GitHub's `prerelease` flag, because that flag is written once when
+  the release is created and `v0.1.4-alpha.1` predates the workflow setting it.
+- Dot-sourcing `bootstrap.ps1` now only defines its functions. Installing happened
+  as a side effect, so anything that loaded the script for its helpers installed
+  Rake as well.
 - `rake settings` — get, set and reset user preferences, stored in
   `~/.config/rake/settings.json`. Deliberately a separate file from Scoop's
   `config.json`, whose `set_config` rewrites the whole document and would drop
@@ -69,6 +77,13 @@ sorts above 0.1.4-alpha.2 and below 0.1.4.
 
 ### Fixed
 
+- The bootstrap no longer closes the caller's terminal. The documented one-liner ran
+  the script through `powershell -Command`, and inside that scope five `exit 1` calls
+  ended the user's shell instead of printing why — a refused install, or a checksum
+  mismatch, took the window down with it and printed nothing. Those exits are now
+  exceptions that reach the caller; `powershell -Command` still returns 1, so
+  `$LASTEXITCODE` checks keep working. The one-liner also no longer leaks eight
+  helper functions and a `$Source` variable into the session.
 - `rake self update` no longer downgrades. It asked GitHub for the newest *finished*
   release, so anyone who had installed a pre-release was silently moved back to the
   previous version on their next update — a pre-release is newer than anything that
@@ -155,6 +170,10 @@ sorts above 0.1.4-alpha.2 and below 0.1.4.
 - Release selection for `rake self` is a pure function over the published list. It
   takes the maximum by version rather than trusting the API's order, which says
   nothing about version order once a release is re-cut.
+- The release workflow compares the tag against `crates/rake-cli/Cargo.toml` — the
+  crate that actually produces `rake.exe`. It used to read the workspace root,
+  where the only version on offer was a `[workspace] version` key that Cargo does
+  not read at all. Clippy is now clean with no exceptions.
 - Test sessions record environment writes instead of performing them, so tests
   cannot modify `HKCU\Environment`.
 

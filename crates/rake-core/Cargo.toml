@@ -1,6 +1,6 @@
 [package]
 name = "rake-core"
-version = "0.1.4-alpha.2"
+version = "0.1.4-alpha.3"
 edition = "2024"
 description = "Rake engine — orchestration, infrastructure traits, operations"
 

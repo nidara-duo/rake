@@ -35,6 +35,19 @@ and below 0.1.4.
 
 ### Added
 
+- `rake settings` — get, set and reset user preferences, stored in
+  `~/.config/rake/settings.json`. Deliberately a separate file from Scoop's
+  `config.json`, whose `set_config` rewrites the whole document and would drop
+  anything stored there. `rake settings` lists every setting with its value and
+  default, marking the ones you changed; `settings edit` opens the file in
+  `$EDITOR` and validates what you wrote.
+  - `status.offline_by_default` (default `true`) — run `status` without touching
+    the network unless asked
+  - `status.hide_offline_note` (default `false`) — suppress the note explaining
+    that the bucket verdict came from the last fetch, without typing `-q`
+- `rake status` flags now resolve as flag → setting → built-in default, so an
+  explicit flag always overrides the file. `-l -C` together is now reported as
+  contradictory rather than silently resolved.
 - `rake status --quiet` (`-q`) suppresses informational notes. Warnings and
   errors are unaffected, so an out-of-date or uncheckable bucket is still
   reported.

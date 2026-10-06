@@ -20,6 +20,7 @@ mod list;
 mod reset;
 mod search;
 mod self_;
+mod settings;
 mod shim;
 mod status;
 mod unhold;
@@ -79,6 +80,8 @@ pub enum Command {
     Reset(reset::Args),
     /// Search available packages
     Search(search::Args),
+    /// Get, set or reset user preferences
+    Settings(settings::Args),
     /// Manage Rake itself (install, update, uninstall)
     #[clap(name = "self")]
     Self_(self_::Args),
@@ -119,6 +122,7 @@ pub async fn start() -> Result<()> {
         Command::List(args) => list::execute(args, &session)?,
         Command::Reset(args) => reset::execute(args, &session)?,
         Command::Search(args) => search::execute(args, &session)?,
+        Command::Settings(args) => settings::execute(args, &session)?,
         Command::Self_(args) => self_::execute(args, &session).await?,
         Command::Shim(args) => shim::execute(args, &session)?,
         Command::Status(args) => status::execute(args, &session).await?,

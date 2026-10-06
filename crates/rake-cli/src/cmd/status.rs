@@ -8,22 +8,37 @@ use rake_core::session::Session;
 
 #[derive(Debug, Parser)]
 pub struct Args {
-    /// Stay offline: compare against each bucket's last fetched state (default)
-    #[arg(short = 'l', long)]
-    pub local: bool,
+    /// Stay offline: compare against each bucket's last fetched state
+    ///
+    /// `Option<bool>` with `num_args = 0..=1` and a missing value of `true`, rather than
+    /// a plain `bool`: an absent flag has to be distinguishable from `false`, or a user
+    /// who set `status.offline_by_default` to `false` could not ask for one offline run.
+    ///
+    /// Two other spellings were tried and are wrong. A plain `bool` cannot be told from
+    /// `false`. `action = SetTrue` on an `Option<bool>` yields `Some(false)` when the flag
+    /// is absent, which silently discards every settings value because `unwrap_or` never
+    /// reaches the default.
+    #[arg(
+        short = 'l',
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = false
+    )]
+    pub local: Option<bool>,
 
     /// Go online: fetch every bucket first, so freshness is checked against
     /// upstream and the fetch is reused by `rake update`
-    #[arg(short = 'C', long = "check-buckets")]
-    pub check_buckets: bool,
+    #[arg(short = 'C', long = "check-buckets", num_args = 0..=1, default_missing_value = "true")]
+    pub check_buckets: Option<bool>,
 
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
 
     /// Suppress informational notes, keeping warnings and errors
-    #[arg(short, long)]
-    pub quiet: bool,
+    #[arg(short, long, num_args = 0..=1, default_missing_value = "true")]
+    pub quiet: Option<bool>,
 }
 
 /// Column headings.
@@ -34,6 +49,34 @@ pub struct Args {
 /// Scoop word-for-word that an earlier release did — the values themselves are still
 /// Scoop-compatible.
 const HEADERS: [&str; 5] = ["Name", "Installed", "Latest", "Missing Deps", "Info"];
+
+/// Resolve which mode to run in: explicit flag, then the setting, then the built-in
+/// default.
+///
+/// The flags are `Option<bool>` rather than `bool` precisely so that "not given" is
+/// distinguishable from "given as false". Without that, a user who set
+/// `status.offline_by_default` to `false` could not ask for one offline run, because the
+/// absent flag would be indistinguishable from an explicit `false`.
+///
+/// `-l` beats `-C` when both are given, which is what the previous single expression
+/// (`check_buckets && !local`) did, and `-C` is rejected outright alongside it rather
+/// than silently ignored — a user asking for both is confused otherwise.
+fn resolve_mode(args: &Args, offline_by_default: bool) -> Result<CheckBuckets, String> {
+    match (args.local, args.check_buckets) {
+        (Some(true), Some(true)) => {
+            Err("--local and --check-buckets ask for opposite things".to_owned())
+        }
+        (Some(true), _) => Ok(CheckBuckets::Local),
+        (_, Some(true)) => Ok(CheckBuckets::Fetch),
+        _ if offline_by_default => Ok(CheckBuckets::Local),
+        _ => Ok(CheckBuckets::Fetch),
+    }
+}
+
+/// Resolve `--quiet`: an explicit flag wins over `status.hide_offline_note`.
+fn resolve_quiet(args: &Args, hide_offline_note: bool) -> bool {
+    args.quiet.unwrap_or(hide_offline_note)
+}
 
 /// Whether to print the note explaining that the bucket verdict came from the last
 /// fetch rather than from upstream.
@@ -46,15 +89,11 @@ fn should_report_offline_note(mode: CheckBuckets, has_buckets: bool, quiet: bool
 }
 
 pub async fn execute(args: Args, session: &Session) -> Result<()> {
-    // Offline is the default: the status of already-installed packages is
-    // fully answerable from disk, and asking every bucket's remote about it
-    // turns a 40 ms command into a multi-second one. Scoop reaches for the
-    // network unconditionally (it fetches), which is where its 6 s comes from.
-    let mode = if args.check_buckets && !args.local {
-        CheckBuckets::Fetch
-    } else {
-        CheckBuckets::Local
-    };
+    let settings = rake_core::settings::load()?;
+
+    let mode =
+        resolve_mode(&args, settings.status.offline_by_default).map_err(|e| anyhow::anyhow!(e))?;
+    let quiet = resolve_quiet(&args, settings.status.hide_offline_note);
 
     let report = rake_core::operations::status::collect_status(session, mode).await?;
 
@@ -84,7 +123,7 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
 
     // Say plainly that the bucket verdict was not re-verified online, otherwise
     // a stale-but-quiet bucket looks identical to a genuinely current one.
-    if should_report_offline_note(mode, crate::util::has_buckets(session), args.quiet) {
+    if should_report_offline_note(mode, crate::util::has_buckets(session), quiet) {
         println!(
             "{} Bucket state is from the last {} — add --check-buckets to fetch and verify online.",
             style("i").dark_grey(),
@@ -209,6 +248,96 @@ fn build_flags_cell(flags: &[StatusInfoFlag]) -> Cell {
 mod tests {
     use super::*;
     use rake_core::operations::status::StatusEntry;
+
+    fn args(local: Option<bool>, check_buckets: Option<bool>, quiet: Option<bool>) -> Args {
+        Args {
+            local,
+            check_buckets,
+            json: false,
+            quiet,
+        }
+    }
+
+    /// With no flags and the shipped default, the command must not touch the network —
+    /// this is the behaviour that took ~40 ms against Scoop's 5.9 s.
+    #[test]
+    fn offline_by_default_when_nothing_is_given() {
+        let mode = resolve_mode(&args(None, None, None), true).unwrap();
+        assert_eq!(mode, CheckBuckets::Local);
+    }
+
+    /// The distinction the whole settings mechanism rests on, checked through the real
+    /// argument parser rather than by constructing `Args` by hand: an absent flag must be
+    /// `None`, not `Some(false)`.
+    ///
+    /// It was `Some(false)` at first — `SetTrue` on an `Option<bool>` — which silently
+    /// discarded every settings value, since `unwrap_or` never reached the default. The
+    /// flags looked like they were reading the settings and simply ignored them.
+    #[test]
+    fn absent_flags_parse_as_none_not_some_false() {
+        let a = <Args as clap::Parser>::parse_from(["status"]);
+        assert_eq!(a.local, None, "-l absent must be None");
+        assert_eq!(a.check_buckets, None, "-C absent must be None");
+        assert_eq!(a.quiet, None, "-q absent must be None");
+    }
+
+    /// And a present flag must be `Some(true)` while still being usable on its own.
+    #[test]
+    fn present_flags_parse_as_some_true_without_a_value() {
+        let a = <Args as clap::Parser>::parse_from(["status", "-l", "-C", "-q"]);
+        assert_eq!(a.local, Some(true));
+        assert_eq!(a.check_buckets, Some(true));
+        assert_eq!(a.quiet, Some(true));
+
+        let long =
+            <Args as clap::Parser>::parse_from(["status", "--local", "--check-buckets", "--quiet"]);
+        assert_eq!(long.quiet, Some(true));
+    }
+
+    /// An explicit flag always beats the setting. Without this a user could not make one
+    /// offline run against their own preference.
+    #[test]
+    fn explicit_flag_beats_the_setting() {
+        // Setting says online, flag says offline.
+        let mode = resolve_mode(&args(Some(true), None, None), false).unwrap();
+        assert_eq!(mode, CheckBuckets::Local);
+
+        // Setting says offline, flag says online.
+        let mode = resolve_mode(&args(None, Some(true), None), true).unwrap();
+        assert_eq!(mode, CheckBuckets::Fetch);
+    }
+
+    /// The setting governs only when no flag was given, in both directions.
+    #[test]
+    fn setting_applies_when_no_flag_is_given() {
+        assert_eq!(
+            resolve_mode(&args(None, None, None), false).unwrap(),
+            CheckBuckets::Fetch
+        );
+        assert_eq!(
+            resolve_mode(&args(None, None, None), true).unwrap(),
+            CheckBuckets::Local
+        );
+    }
+
+    /// `-l -C` is contradictory. It used to be silently resolved to offline; saying so is
+    /// more useful than picking one.
+    #[test]
+    fn contradictory_flags_are_refused() {
+        assert!(resolve_mode(&args(Some(true), Some(true), None), true).is_err());
+    }
+
+    #[test]
+    fn quiet_flag_beats_the_setting() {
+        // Setting hides the note, but the flag cannot be used to un-hide it — there is no
+        // --no-quiet — so both agree on hiding.
+        assert!(resolve_quiet(&args(None, None, Some(true)), false));
+        assert!(resolve_quiet(&args(None, None, Some(true)), true));
+        // The setting alone hides it.
+        assert!(resolve_quiet(&args(None, None, None), true));
+        // And by default it shows.
+        assert!(!resolve_quiet(&args(None, None, None), false));
+    }
 
     /// The headings were shortened from Scoop's wording on purpose, which is exactly the
     /// kind of change that gets "fixed" back by someone who assumes it was an accident.

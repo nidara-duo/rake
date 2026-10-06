@@ -5,6 +5,7 @@ pub mod event;
 pub mod infra;
 pub mod operations;
 pub mod session;
+pub mod settings;
 
 pub use error::{Error, Result};
 pub use session::Session;

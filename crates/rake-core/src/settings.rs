@@ -136,20 +136,31 @@ pub fn load_from(path: &Path) -> Result<Loaded> {
     // A section that is present but is not an object makes every key inside it
     // unreachable. Falling back silently would hide the user's edit entirely, so it is
     // reported once for the section rather than once per key.
-    for section in ["status"] {
-        if let Some(value) = document.get(section)
-            && !value.is_object()
-        {
-            problems.push(SettingProblem {
-                key: Some(section.to_owned()),
-                found: render(value),
-                used: "all status defaults".to_owned(),
-                detail: None,
-            });
-        }
-    }
+    problems.extend(check_section(&document, "status"));
 
     Ok(Loaded { settings, problems })
+}
+
+/// Report a section that is present but is not an object.
+///
+/// Split out rather than written as a loop over a one-element list. The loop version
+/// read as "more sections coming" without saying which, and Clippy's `single_element_loop`
+/// is right to object: it was a placeholder standing in for a decision that had not been
+/// made yet. Adding a section is now a second `extend` line, and the wording of the
+/// fallback is derived from the name instead of being repeated per section — which is how
+/// a copy-pasted `used` string would have ended up naming the wrong section.
+fn check_section(document: &serde_json::Value, section: &str) -> Option<SettingProblem> {
+    let value = document.get(section)?;
+    if value.is_object() {
+        return None;
+    }
+
+    Some(SettingProblem {
+        key: Some(section.to_owned()),
+        found: render(value),
+        used: format!("all {section} defaults"),
+        detail: None,
+    })
 }
 
 /// Fetch a dotted path out of a parsed document, returning `None` when absent.
@@ -301,6 +312,43 @@ mod tests {
         assert_eq!(loaded.settings, Settings::default());
         assert_eq!(loaded.problems.len(), 1, "got {:?}", loaded.problems);
         assert_eq!(loaded.problems[0].key.as_deref(), Some("status"));
+        // The fallback wording names the section it came from. It used to be a literal
+        // repeated per section, so a copy-paste into a second check would have named the
+        // wrong one and nothing here would have said so.
+        assert_eq!(loaded.problems[0].used, "all status defaults");
+        // `render` unquotes strings on purpose, so what the user wrote is what is echoed.
+        assert_eq!(loaded.problems[0].found, "true");
+    }
+
+    /// The section check is a function over any section name, so the wording follows the
+    /// name rather than being hardcoded. Called directly, because driving it through a
+    /// document would only ever exercise the one section that exists today.
+    #[test]
+    fn the_fallback_wording_follows_the_section_name() {
+        let document: serde_json::Value = serde_json::from_str(r#"{"future":7}"#).unwrap();
+        let problem = check_section(&document, "future").expect("a bare number is not an object");
+        assert_eq!(problem.key.as_deref(), Some("future"));
+        assert_eq!(problem.used, "all future defaults");
+        assert_eq!(problem.found, "7");
+    }
+
+    /// A section that is a proper object is fine, and an absent one is not a problem.
+    #[test]
+    fn a_well_formed_or_absent_section_is_not_reported() {
+        let document: serde_json::Value =
+            serde_json::from_str(r#"{"status":{"hide_offline_note":true}}"#).unwrap();
+        assert!(check_section(&document, "status").is_none());
+        assert!(check_section(&document, "nothing_here").is_none());
+    }
+
+    /// An array is not an object either, and the message has to say what it actually found
+    /// rather than guess.
+    #[test]
+    fn an_array_section_is_reported_too() {
+        let loaded = load_text(r#"{"status":["hide_offline_note"]}"#);
+        assert_eq!(loaded.problems.len(), 1, "got {:?}", loaded.problems);
+        assert_eq!(loaded.problems[0].key.as_deref(), Some("status"));
+        assert_eq!(loaded.settings, Settings::default());
     }
 
     /// A key that is simply absent is not a problem — that is the normal state of a partial

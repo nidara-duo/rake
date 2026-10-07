@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -33,6 +34,9 @@ pub struct Args {
     /// Suppress progress output
     #[arg(short, long)]
     pub quiet: bool,
+    /// List every bucket and its outcome as text, with no progress display
+    #[arg(short, long)]
+    pub verbose: bool,
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
@@ -247,11 +251,39 @@ fn spawn_update_ui(
     })
 }
 
-fn spawn_bucket_ui(
-    session: &Session,
-    quiet: bool,
-    done: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
+/// Whether a progress display can draw at all.
+///
+/// Decided from stderr before any thread starts, because that is where the display writes.
+/// `MultiProgress::is_hidden()` is not a usable substitute: it reported "visible" for a
+/// run whose output was redirected to a file and where the display then drew nothing at
+/// all, which cost the user every bucket name in the summary.
+///
+/// Tying it to stderr rather than stdout is deliberate. Piping stdout while watching the
+/// console — `rake update | tee log` — still shows the spinner, and the summary stays
+/// quiet to match. Redirecting both hides the display, so the summary prints everything.
+fn display_can_draw() -> bool {
+    std::io::stderr().is_terminal()
+}
+
+/// Whether a progress display should run at all.
+///
+/// Split from [`display_can_draw`] so the decision is testable. There is no terminal to
+/// borrow here, and this is the half that decides whether the user loses information.
+fn should_draw(mode: BucketReport, stderr_is_terminal: bool) -> bool {
+    mode.wants_progress() && stderr_is_terminal
+}
+
+/// Draw the bucket-sync progress.
+///
+/// There is no mode parameter on purpose: the caller decides whether a display runs at
+/// all, and a parameter that could only ever be `Default` would invite a later caller to
+/// switch on a spinner in verbose mode without meaning to.
+///
+/// Two events can arrive together: one taken from the queue with a timeout, then
+/// whatever else is already queued. Both go through one handler. The two copies this
+/// replaced had already drifted — one wrote `✗ name` and the other `✗  name` — which is
+/// the usual way duplicated code announces that it should not have been duplicated.
+fn spawn_bucket_ui(session: &Session, done: Arc<AtomicBool>) -> thread::JoinHandle<()> {
     let rx = session.event_bus().core_receiver();
 
     thread::spawn(move || {
@@ -263,77 +295,47 @@ fn spawn_bucket_ui(
 
         let mut spinners: HashMap<String, ProgressBar> = HashMap::new();
 
-        while !done.load(Ordering::Acquire) {
-            if let Ok(event) = rx.recv_timeout(Duration::from_millis(50)) {
-                match event {
-                    Event::BucketSyncProgress { name, state } => {
-                        if quiet {
-                            continue;
+        // Returns true when the stream is over, so the caller can stop early instead of
+        // waiting for the done flag.
+        let mut handle = |event: &Event| -> bool {
+            match event {
+                Event::BucketSyncDone => true,
+                Event::BucketSyncProgress { name, state } => {
+                    match state {
+                        BucketState::Started => {
+                            let pb = mp.add(ProgressBar::new_spinner());
+                            pb.set_style(spinner_style.clone());
+                            pb.set_message(name.to_string());
+                            pb.enable_steady_tick(Duration::from_millis(80));
+                            spinners.insert(name.clone(), pb);
                         }
-
-                        match state {
-                            BucketState::Started => {
-                                let pb = mp.add(ProgressBar::new_spinner());
-                                pb.set_style(spinner_style.clone());
-                                pb.set_message(name.to_string());
-                                pb.enable_steady_tick(Duration::from_millis(80));
-                                spinners.insert(name, pb);
+                        BucketState::Succeeded => {
+                            if let Some(pb) = spinners.remove(name) {
+                                pb.set_style(ProgressStyle::with_template("{msg}").unwrap());
+                                pb.finish_with_message(format!("{} {}", "✓".green(), name));
                             }
-                            BucketState::Succeeded => {
-                                if let Some(pb) = spinners.remove(&name) {
-                                    pb.set_style(ProgressStyle::with_template("{msg}").unwrap());
-                                    pb.finish_with_message(format!("{} {}", "✓".green(), name));
-                                }
-                            }
-                            BucketState::Failed(msg) => {
-                                if let Some(pb) = spinners.remove(&name) {
-                                    pb.set_style(ProgressStyle::with_template("{msg}").unwrap());
-                                    pb.finish_with_message(format!(
-                                        "{} {} ({})",
-                                        "✗".red(),
-                                        name,
-                                        msg
-                                    ));
-                                }
+                        }
+                        BucketState::Failed(msg) => {
+                            if let Some(pb) = spinners.remove(name) {
+                                pb.set_style(ProgressStyle::with_template("{msg}").unwrap());
+                                pb.finish_with_message(format!("{} {} ({})", "✗".red(), name, msg));
                             }
                         }
                     }
-                    Event::BucketSyncDone => break,
-                    _ => {}
+                    false
                 }
+                _ => false,
+            }
+        };
 
-                while let Ok(event) = rx.try_recv() {
-                    if let Event::BucketSyncProgress { name, state } = event {
-                        if quiet {
-                            continue;
-                        }
-
-                        match state {
-                            BucketState::Started => {
-                                let pb = mp.add(ProgressBar::new_spinner());
-                                pb.set_style(spinner_style.clone());
-                                pb.set_message(name.to_string());
-                                pb.enable_steady_tick(Duration::from_millis(80));
-                                spinners.insert(name, pb);
-                            }
-                            BucketState::Succeeded => {
-                                if let Some(pb) = spinners.remove(&name) {
-                                    pb.set_style(ProgressStyle::with_template("{msg}").unwrap());
-                                    pb.finish_with_message(format!("{} {}", "✓".green(), name));
-                                }
-                            }
-                            BucketState::Failed(msg) => {
-                                if let Some(pb) = spinners.remove(&name) {
-                                    pb.set_style(ProgressStyle::with_template("{msg}").unwrap());
-                                    pb.finish_with_message(format!(
-                                        "{}  {} ({})",
-                                        "✗".red(),
-                                        name,
-                                        msg
-                                    ));
-                                }
-                            }
-                        }
+        let mut stop = false;
+        while !stop && !done.load(Ordering::Acquire) {
+            if let Ok(event) = rx.recv_timeout(Duration::from_millis(50)) {
+                stop = handle(&event);
+                while !stop {
+                    match rx.try_recv() {
+                        Ok(event) => stop = handle(&event),
+                        Err(_) => break,
                     }
                 }
             }
@@ -343,6 +345,46 @@ fn spawn_bucket_ui(
             pb.finish_and_clear();
         }
     })
+}
+
+/// How much of a bucket sync to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BucketReport {
+    /// Progress display while syncing, then a line for anything it could not show.
+    Default,
+    /// A line per bucket, always, and no progress display.
+    Verbose,
+    /// Nothing informational.
+    Quiet,
+}
+
+impl BucketReport {
+    fn from_flags(verbose: bool, quiet: bool) -> Self {
+        match (verbose, quiet) {
+            (true, true) => Self::Quiet,
+            (true, false) => Self::Verbose,
+            (false, true) => Self::Quiet,
+            (false, false) => Self::Default,
+        }
+    }
+
+    fn wants_progress(self) -> bool {
+        self == Self::Default
+    }
+}
+
+/// Whether an outcome still needs a line of its own after the progress display has run.
+///
+/// The invariant that was broken: the display leaves `✓ extras` behind as a permanent
+/// line, and the summary then printed the same thing again. So an outcome the display
+/// already drew must not be repeated, while one it never drew must not be dropped —
+/// held buckets and non-repositories are not progress events at all, and piped output has
+/// no display to draw anything.
+fn needs_report(outcome: &update::BucketSyncOutcome, display_drew: bool) -> bool {
+    match outcome {
+        update::BucketSyncOutcome::Updated | update::BucketSyncOutcome::Failed(_) => !display_drew,
+        update::BucketSyncOutcome::Held | update::BucketSyncOutcome::NotARepository => true,
+    }
 }
 
 /// Update installed packages to latest versions
@@ -356,7 +398,8 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
     };
 
     if effective_names.is_empty() && !has_wildcard {
-        return bucket_only(session, args.quiet).await;
+        let mode = BucketReport::from_flags(args.verbose, args.quiet);
+        return bucket_only(session, mode).await;
     }
     if effective_names.is_empty() {
         println!("No installed packages to update.");
@@ -539,8 +582,8 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
     }
 }
 
-/// Bucket-sync only mode: update all buckets with spinner UI.
-async fn bucket_only(session: &Session, quiet: bool) -> Result<()> {
+/// Bucket-sync only mode: update all buckets.
+async fn bucket_only(session: &Session, mode: BucketReport) -> Result<()> {
     let all_buckets = rake_core::operations::bucket::bucket_list(session)?;
 
     if all_buckets.is_empty() {
@@ -548,9 +591,16 @@ async fn bucket_only(session: &Session, quiet: bool) -> Result<()> {
         return Ok(());
     }
 
-    let done = Arc::new(AtomicBool::new(false));
-    let _guard = DoneFlag::new(done.clone());
-    let ui_handle = spawn_bucket_ui(session, quiet, done);
+    let quiet = mode == BucketReport::Quiet;
+
+    // No thread at all when nobody can see it: verbose output is text from start to
+    // finish, and a display with no terminal is a thread waiting on a channel for nothing.
+    let show_display = should_draw(mode, display_can_draw());
+    let ui = show_display.then(|| {
+        let done = Arc::new(AtomicBool::new(false));
+        let guard = DoneFlag::new(done.clone());
+        (spawn_bucket_ui(session, done), guard)
+    });
 
     if !quiet {
         let count = all_buckets.len();
@@ -563,22 +613,33 @@ async fn bucket_only(session: &Session, quiet: bool) -> Result<()> {
 
     let report = update::bucket_update(session).await?;
 
-    drop(_guard);
-    let _ = ui_handle.join();
+    let display_drew = match ui {
+        Some((handle, guard)) => {
+            drop(guard);
+            // The outcome of the join does not matter: the display was started because a
+            // terminal was there to receive it, so it drew. Only the `None` arm can mean
+            // "nothing was shown", and that is decided before any thread runs.
+            let _ = handle.join();
+            true
+        }
+        None => false,
+    };
 
-    // Printed as plain lines rather than left to the progress display, because indicatif
-    // hides itself when the output is not a terminal — so redirected or piped into a file
-    // this used to show nothing at all about what happened to any bucket.
+    // Each outcome is printed exactly once, by whichever channel is actually visible.
     for (name, outcome) in &report.outcomes {
+        if !needs_report(outcome, display_drew) {
+            continue;
+        }
+
         match outcome {
             update::BucketSyncOutcome::Updated => {
                 if !quiet {
-                    println!(" {} {}", style("✓").green(), name);
+                    println!("{} {}", style("✓").green(), name);
                 }
             }
             update::BucketSyncOutcome::Held => {
                 println!(
-                    " {} {} is held — not updated (use 'rake bucket unhold {}')",
+                    "{} {} is held — not updated (use 'rake bucket unhold {}')",
                     style("!").yellow(),
                     name,
                     name
@@ -586,13 +647,13 @@ async fn bucket_only(session: &Session, quiet: bool) -> Result<()> {
             }
             update::BucketSyncOutcome::NotARepository => {
                 println!(
-                    " {} {} is not a git repository — not updated",
+                    "{} {} is not a git repository — not updated",
                     style("!").yellow(),
                     name
                 );
             }
             update::BucketSyncOutcome::Failed(reason) => {
-                println!(" {} {} ({})", style("✗").red(), name, reason);
+                println!("{} {} ({})", style("✗").red(), name, reason);
             }
         }
     }
@@ -616,4 +677,104 @@ async fn bucket_only(session: &Session, quiet: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rake_core::operations::update::BucketSyncOutcome as Outcome;
+
+    /// The bug: the display leaves `✓ extras` on screen and the summary printed it again.
+    #[test]
+    fn an_outcome_the_display_drew_is_not_reported_again() {
+        assert!(!needs_report(&Outcome::Updated, true));
+        assert!(!needs_report(&Outcome::Failed("boom".into()), true));
+    }
+
+    /// The other half of the same invariant: if the display drew nothing — piped output,
+    /// where indicatif suppresses itself — nothing may be dropped.
+    #[test]
+    fn an_undrawn_display_reports_everything() {
+        assert!(needs_report(&Outcome::Updated, false));
+        assert!(needs_report(&Outcome::Failed("boom".into()), false));
+    }
+
+    /// Held buckets and non-repositories are not progress events, so the display never
+    /// shows them and they must be reported whether it drew or not.
+    #[test]
+    fn outcomes_the_display_never_draws_are_always_reported() {
+        for drew in [true, false] {
+            assert!(needs_report(&Outcome::Held, drew), "held, drew={drew}");
+            assert!(
+                needs_report(&Outcome::NotARepository, drew),
+                "not-a-repo, drew={drew}"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_select_the_mode() {
+        assert_eq!(
+            BucketReport::from_flags(false, false),
+            BucketReport::Default
+        );
+        assert_eq!(BucketReport::from_flags(true, false), BucketReport::Verbose);
+        // Asking for both is contradictory, but quiet wins: the user asked for less
+        // output twice, and honouring the quieter of the two cannot add noise.
+        assert_eq!(BucketReport::from_flags(true, true), BucketReport::Quiet);
+        assert_eq!(BucketReport::from_flags(false, true), BucketReport::Quiet);
+    }
+
+    /// Only the default mode runs a progress display. Verbose is text throughout, so a
+    /// spinner would only flicker over it.
+    #[test]
+    fn only_the_default_mode_draws_progress() {
+        assert!(BucketReport::Default.wants_progress());
+        assert!(!BucketReport::Verbose.wants_progress());
+        assert!(!BucketReport::Quiet.wants_progress());
+    }
+
+    /// All four combinations, because this is the decision that decides whether the user
+    /// sees the bucket names at all.
+    #[test]
+    fn a_display_needs_both_the_default_mode_and_a_terminal() {
+        assert!(should_draw(BucketReport::Default, true));
+        // No terminal: nothing can be drawn, so the summary has to print every bucket.
+        // Assuming otherwise is what lost them in the first attempt.
+        assert!(!should_draw(BucketReport::Default, false));
+        assert!(!should_draw(BucketReport::Verbose, true));
+        assert!(!should_draw(BucketReport::Quiet, true));
+        assert!(!should_draw(BucketReport::Quiet, false));
+    }
+
+    /// The two properties that must hold together, whichever way the display is decided:
+    /// every outcome is named exactly once.
+    #[test]
+    fn each_outcome_is_named_exactly_once_in_every_configuration() {
+        let outcomes = [
+            Outcome::Updated,
+            Outcome::Failed("boom".into()),
+            Outcome::Held,
+            Outcome::NotARepository,
+        ];
+
+        for mode in [
+            BucketReport::Default,
+            BucketReport::Verbose,
+            BucketReport::Quiet,
+        ] {
+            for terminal in [true, false] {
+                let drew = should_draw(mode, terminal);
+                for outcome in &outcomes {
+                    let shown_by_display =
+                        drew && matches!(outcome, Outcome::Updated | Outcome::Failed(_));
+                    let shown_by_summary = needs_report(outcome, drew);
+                    assert!(
+                        shown_by_display ^ shown_by_summary,
+                        "{mode:?} terminal={terminal} {outcome:?}: printed twice or not at all"
+                    );
+                }
+            }
+        }
+    }
 }

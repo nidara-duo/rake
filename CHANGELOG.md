@@ -43,6 +43,9 @@ and below 0.1.4.
   build metadata does not make one.
 - `rake self update` names the version it installs, and says which pre-release is
   being held back rather than reporting a flat "already up to date".
+- `rake update -v` (`--verbose`) lists every bucket and its outcome as text, with no
+  progress display. Combined with the duplicate fix below, `rake update` with no
+  arguments now names each bucket exactly once.
 - `scripts/bootstrap.ps1` takes `-Prerelease` and `-Version`, so the very first
   install can choose which release it takes. It had no way to: the endpoint it
   used never returns pre-releases. A dash in the tag is treated as the signal,
@@ -77,6 +80,12 @@ and below 0.1.4.
 
 ### Fixed
 
+- `rake update` no longer prints every bucket twice. The progress display draws
+  `✓ extras` as a permanent line while syncing, and the summary then printed the same
+  thing again — so a clean run listed all three buckets six times instead of three. An
+  outcome the display already showed is no longer repeated, and one it never showed
+  (a held bucket, a directory that is not a repository) is still named, as is every
+  outcome when the output is not a terminal and the display draws nothing.
 - The bootstrap no longer closes the caller's terminal. The documented one-liner ran
   the script through `powershell -Command`, and inside that scope five `exit 1` calls
   ended the user's shell instead of printing why — a refused install, or a checksum

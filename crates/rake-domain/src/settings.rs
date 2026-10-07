@@ -25,10 +25,18 @@ pub const DEFAULT_OFFLINE_BY_DEFAULT: bool = true;
 /// rather than having to type `-q` forever.
 pub const DEFAULT_HIDE_OFFLINE_NOTE: bool = false;
 
+/// `update.verbose_by_default` — whether `rake update` names every bucket without a flag.
+///
+/// Defaults to `true` because that is what Scoop does: a bare `scoop update` lists each
+/// bucket it touched. A user who finds that noisy sets this to `false` and gets the
+/// progress display instead, with `-v` still available for one run.
+pub const DEFAULT_VERBOSE_BY_DEFAULT: bool = true;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Settings {
     pub status: StatusSettings,
+    pub update: UpdateSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +60,24 @@ impl Default for StatusSettings {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct UpdateSettings {
+    /// List every bucket and its outcome, as Scoop does.
+    pub verbose_by_default: bool,
+}
+
+impl Default for UpdateSettings {
+    /// `true` deliberately, and again by hand rather than derived: `#[derive(Default)]`
+    /// would give `false`, which is the opposite of Scoop and the reason this is a
+    /// constant rather than a bare literal in three places.
+    fn default() -> Self {
+        Self {
+            verbose_by_default: DEFAULT_VERBOSE_BY_DEFAULT,
+        }
+    }
+}
+
 impl Settings {
     /// Every settable key with its current value and default, for `rake settings`.
     ///
@@ -71,12 +97,22 @@ impl Settings {
                 render_bool(DEFAULT_HIDE_OFFLINE_NOTE),
                 self.status.hide_offline_note != DEFAULT_HIDE_OFFLINE_NOTE,
             ),
+            (
+                "update.verbose_by_default",
+                render_bool(self.update.verbose_by_default),
+                render_bool(DEFAULT_VERBOSE_BY_DEFAULT),
+                self.update.verbose_by_default != DEFAULT_VERBOSE_BY_DEFAULT,
+            ),
         ]
     }
 
     /// Dotted keys, for error messages and completion.
-    pub fn keys() -> [&'static str; 2] {
-        ["status.offline_by_default", "status.hide_offline_note"]
+    pub fn keys() -> [&'static str; 3] {
+        [
+            "status.offline_by_default",
+            "status.hide_offline_note",
+            "update.verbose_by_default",
+        ]
     }
 
     /// Read one key as the string a user would type back.
@@ -84,6 +120,7 @@ impl Settings {
         match key {
             "status.offline_by_default" => Some(render_bool(self.status.offline_by_default)),
             "status.hide_offline_note" => Some(render_bool(self.status.hide_offline_note)),
+            "update.verbose_by_default" => Some(render_bool(self.update.verbose_by_default)),
             _ => None,
         }
     }
@@ -97,6 +134,7 @@ impl Settings {
         match key {
             "status.offline_by_default" => self.status.offline_by_default = parsed,
             "status.hide_offline_note" => self.status.hide_offline_note = parsed,
+            "update.verbose_by_default" => self.update.verbose_by_default = parsed,
             _ => return Err(SettingsError::UnknownKey(key.to_owned())),
         }
         Ok(())
@@ -109,6 +147,9 @@ impl Settings {
                 self.status.offline_by_default = DEFAULT_OFFLINE_BY_DEFAULT
             }
             "status.hide_offline_note" => self.status.hide_offline_note = DEFAULT_HIDE_OFFLINE_NOTE,
+            "update.verbose_by_default" => {
+                self.update.verbose_by_default = DEFAULT_VERBOSE_BY_DEFAULT
+            }
             _ => return Err(SettingsError::UnknownKey(key.to_owned())),
         }
         Ok(())
@@ -162,6 +203,71 @@ impl std::error::Error for SettingsError {}
 mod tests {
     use super::*;
 
+    /// Scoop lists the buckets it touched on a bare `scoop update`, so `true` here is
+    /// compatibility rather than preference. `#[derive(Default)]` would quietly give
+    /// `false`, which is the whole reason this default is a named constant.
+    #[test]
+    fn update_is_verbose_by_default_like_scoop() {
+        assert!(Settings::default().update.verbose_by_default);
+        // Also through a document, so an empty file behaves the same as no file.
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.update.verbose_by_default);
+        // And a document that sets only `status` must not disturb it.
+        let s: Settings = serde_json::from_str(r#"{"status":{"hide_offline_note":true}}"#).unwrap();
+        assert!(s.update.verbose_by_default);
+    }
+
+    /// The user who wants short output sets it false, and `-v` is still there for a
+    /// single verbose run.
+    #[test]
+    fn update_verbosity_is_settable_and_resettable() {
+        let mut s = Settings::default();
+        s.set("update.verbose_by_default", "false").unwrap();
+        assert!(!s.update.verbose_by_default);
+        assert_eq!(s.get("update.verbose_by_default").as_deref(), Some("false"));
+        s.reset("update.verbose_by_default").unwrap();
+        assert!(s.update.verbose_by_default);
+    }
+
+    /// A `status` block must not disturb the `update` block, and the reverse. The two are
+    /// independent preferences and a shared `#[serde(default)]` on the parent is what
+    /// keeps them from bleeding into each other.
+    #[test]
+    fn the_two_sections_do_not_leak_into_each_other() {
+        let s: Settings =
+            serde_json::from_str(r#"{"update":{"verbose_by_default":false}}"#).unwrap();
+        assert!(!s.update.verbose_by_default);
+        assert!(s.status.offline_by_default);
+        assert!(!s.status.hide_offline_note);
+    }
+
+    /// An `update` value of the wrong type costs that setting and is reported, not the
+    /// whole file. `status` still applies, which is the point of the per-key loader.
+    #[test]
+    fn a_broken_update_value_costs_only_that_setting() {
+        let non_object =
+            serde_json::from_str::<Settings>(r#"{"status":{"hide_offline_note":true},"update":7}"#);
+        assert!(
+            non_object.is_err(),
+            "a non-object update block is a hard error"
+        );
+
+        // The tolerant path is the loader, which is where the reporting lives.
+        let bad_bool = serde_json::from_str::<Settings>(
+            r#"{"update":{"verbose_by_default":"nonsense"},"status":{"hide_offline_note":true}}"#,
+        );
+        assert!(
+            bad_bool.is_err(),
+            "a bad boolean is rejected at parse time too"
+        );
+
+        // And the well-formed case still applies both sections together.
+        let good: Settings =
+            serde_json::from_str(r#"{"update":{"verbose_by_default":false}}"#).unwrap();
+        assert!(!good.update.verbose_by_default);
+        assert!(good.status.offline_by_default);
+    }
+
     /// The file is optional: an absent one must mean "nothing changed". The defaults are
     /// the behaviour the command already had, so a fresh install is unaffected.
     #[test]
@@ -169,6 +275,7 @@ mod tests {
         let s = Settings::default();
         assert!(s.status.offline_by_default);
         assert!(!s.status.hide_offline_note);
+        assert!(s.update.verbose_by_default);
     }
 
     /// An empty document deserialises to the defaults, so a hand-created `{}` does not
@@ -178,6 +285,7 @@ mod tests {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert!(s.status.offline_by_default);
         assert!(!s.status.hide_offline_note);
+        assert!(s.update.verbose_by_default);
     }
 
     /// A partial document keeps the defaults for what it does not mention.

@@ -45,7 +45,8 @@ and below 0.1.4.
   being held back rather than reporting a flat "already up to date".
 - `rake update -v` (`--verbose`) lists every bucket and its outcome as text, with no
   progress display. Combined with the duplicate fix below, `rake update` with no
-  arguments now names each bucket exactly once.
+  arguments now names each bucket exactly once, and does so by default the way
+  `scoop update` does. `update.verbose_by_default = false` turns the listing off.
 - `scripts/bootstrap.ps1` takes `-Prerelease` and `-Version`, so the very first
   install can choose which release it takes. It had no way to: the endpoint it
   used never returns pre-releases. A dash in the tag is treated as the signal,
@@ -64,6 +65,9 @@ and below 0.1.4.
     the network unless asked
   - `status.hide_offline_note` (default `false`) — suppress the note explaining
     that the bucket verdict came from the last fetch, without typing `-q`
+  - `update.verbose_by_default` (default `true`) — `rake update` names every bucket,
+    the way Scoop does. Set it to `false` for the progress display instead; `-v`
+    still gives one verbose run and `-v false` one short one
 - `rake status` flags now resolve as flag → setting → built-in default, so an
   explicit flag always overrides the file. `-l -C` together is now reported as
   contradictory rather than silently resolved.

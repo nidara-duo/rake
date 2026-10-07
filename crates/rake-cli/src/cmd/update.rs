@@ -35,8 +35,21 @@ pub struct Args {
     #[arg(short, long)]
     pub quiet: bool,
     /// List every bucket and its outcome as text, with no progress display
-    #[arg(short, long)]
-    pub verbose: bool,
+    //
+    // `Option<bool>` rather than `bool` for the same reason as `status --quiet`: "not
+    // given" has to be distinguishable from "given as false", or a user who set
+    // `update.verbose_by_default` to `false` could not ask for one verbose run. The
+    // `num_args`/`default_missing_value` pair is what makes a bare `-v` mean true; with
+    // `SetTrue` it would hand back `Some(false)` when absent and quietly invert the
+    // setting.
+    #[arg(
+        short,
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
+    pub verbose: Option<bool>,
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
@@ -373,6 +386,14 @@ impl BucketReport {
     }
 }
 
+/// Resolve `--verbose`: an explicit flag wins over `update.verbose_by_default`.
+///
+/// Same shape as `resolve_quiet` in `status`, and for the same reason: the flag has to be
+/// able to say both "yes, be verbose" and "no, not this time", which `bool` cannot do.
+fn resolve_verbose(flag: Option<bool>, verbose_by_default: bool) -> bool {
+    flag.unwrap_or(verbose_by_default)
+}
+
 /// Whether an outcome still needs a line of its own after the progress display has run.
 ///
 /// The invariant that was broken: the display leaves `✓ extras` behind as a permanent
@@ -398,7 +419,15 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
     };
 
     if effective_names.is_empty() && !has_wildcard {
-        let mode = BucketReport::from_flags(args.verbose, args.quiet);
+        let loaded = rake_core::settings::load()?;
+        // Reported on stderr, as in `status`: a silently substituted default looks
+        // exactly like a preference that did nothing, and `update` prints to stdout.
+        for warning in loaded.warnings() {
+            eprintln!("warning: {warning}");
+        }
+
+        let verbose = resolve_verbose(args.verbose, loaded.settings.update.verbose_by_default);
+        let mode = BucketReport::from_flags(verbose, args.quiet);
         return bucket_only(session, mode).await;
     }
     if effective_names.is_empty() {
@@ -683,6 +712,76 @@ async fn bucket_only(session: &Session, mode: BucketReport) -> Result<()> {
 mod tests {
     use super::*;
     use rake_core::operations::update::BucketSyncOutcome as Outcome;
+
+    /// The chain, flag → setting → built-in default, stated as the three cases that
+    /// matter to a user. The built-in default is `true` because Scoop lists the buckets.
+    #[test]
+    fn verbose_follows_flag_then_setting_then_default() {
+        // No flag, default setting: verbose, like scoop.
+        assert!(resolve_verbose(None, true));
+        // No flag, user turned it off.
+        assert!(!resolve_verbose(None, false));
+        // Flag on, user turned it off — one verbose run without changing the setting.
+        assert!(resolve_verbose(Some(true), false));
+        // Flag off, user turned it on — one short run without changing the setting.
+        assert!(!resolve_verbose(Some(false), true));
+    }
+
+    /// `-v` with no value means "yes", and `--verbose false` means "no". Without the
+    /// `num_args`/`default_missing_value` pair clap would demand an argument for the
+    /// flag, or hand back `Some(false)` and quietly override the setting the wrong way.
+    #[test]
+    fn the_flag_can_be_written_both_ways() {
+        let args = Args::try_parse_from(["rake", "update", "-v"]).unwrap();
+        assert_eq!(args.verbose, Some(true), "-v alone must mean true");
+
+        let args = Args::try_parse_from(["rake", "update", "--verbose"]).unwrap();
+        assert_eq!(args.verbose, Some(true), "--verbose alone must mean true");
+
+        let args = Args::try_parse_from(["rake", "update", "-v", "false"]).unwrap();
+        assert_eq!(
+            args.verbose,
+            Some(false),
+            "an explicit value must be honoured"
+        );
+
+        let args = Args::try_parse_from(["rake", "update"]).unwrap();
+        assert_eq!(args.verbose, None, "absent must stay absent");
+    }
+
+    /// Turning the setting off gives the short form; the flag still reaches it.
+    #[test]
+    fn the_setting_selects_short_output_and_the_flag_still_overrides() {
+        let setting_off = rake_domain::settings::Settings::default();
+        let mut setting_off = setting_off;
+        setting_off
+            .set("update.verbose_by_default", "false")
+            .unwrap();
+
+        let mode = BucketReport::from_flags(
+            resolve_verbose(None, setting_off.update.verbose_by_default),
+            false,
+        );
+        assert_eq!(
+            mode,
+            BucketReport::Default,
+            "the short form has a progress display"
+        );
+
+        let forced = BucketReport::from_flags(
+            resolve_verbose(Some(true), setting_off.update.verbose_by_default),
+            false,
+        );
+        assert_eq!(forced, BucketReport::Verbose);
+    }
+
+    /// Quiet still wins over verbose, whichever asked for it — the user asked for less
+    /// output twice, and honouring the quieter cannot add noise.
+    #[test]
+    fn quiet_wins_over_verbose_in_either_order() {
+        assert_eq!(BucketReport::from_flags(true, true), BucketReport::Quiet);
+        assert_eq!(BucketReport::from_flags(false, true), BucketReport::Quiet);
+    }
 
     /// The bug: the display leaves `✓ extras` on screen and the summary printed it again.
     #[test]

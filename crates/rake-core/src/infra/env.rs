@@ -170,12 +170,12 @@ fn broadcast_env_change() {
     }
 }
 
-/// Read the persisted user PATH together with its registry type.
+/// Read a persisted user environment variable together with its registry type.
 ///
 /// The type is returned so it can be written back unchanged: `REG_EXPAND_SZ` holds
 /// values like `%USERPROFILE%\bin`, and rewriting it as `REG_SZ` would leave those
 /// entries unexpanded.
-fn read_user_path_raw() -> Result<Option<(String, u32)>> {
+fn read_user_value_raw(name: &str) -> Result<Option<(String, u32)>> {
     use windows_sys::Win32::System::Registry::{KEY_QUERY_VALUE, RegQueryValueExW};
 
     unsafe {
@@ -183,7 +183,7 @@ fn read_user_path_raw() -> Result<Option<(String, u32)>> {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let value_name: Vec<u16> = "PATH".encode_utf16().chain(std::iter::once(0)).collect();
+        let value_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut hkey: HKEY = std::ptr::null_mut();
         if RegOpenKeyExW(
@@ -237,8 +237,8 @@ fn read_user_path_raw() -> Result<Option<(String, u32)>> {
     }
 }
 
-/// Write the persisted user PATH, preserving the registry type it had.
-fn write_user_path_raw(value: &str, kind: u32) -> Result<()> {
+/// Write a persisted user environment variable, preserving the registry type it had.
+fn write_user_value_raw(name: &str, value: &str, kind: u32) -> Result<()> {
     use windows_sys::Win32::System::Registry::{KEY_SET_VALUE, REG_EXPAND_SZ, RegSetValueExW};
 
     // An absent or non-string value would give us nothing to preserve; REG_EXPAND_SZ
@@ -254,7 +254,7 @@ fn write_user_path_raw(value: &str, kind: u32) -> Result<()> {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let value_name: Vec<u16> = "PATH".encode_utf16().chain(std::iter::once(0)).collect();
+        let value_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         let value_wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut hkey: HKEY = std::ptr::null_mut();
@@ -282,14 +282,24 @@ fn write_user_path_raw(value: &str, kind: u32) -> Result<()> {
         RegCloseKey(hkey);
 
         if result != 0 {
-            return Err(Error::Custom(
-                "Failed to write HKCU\\Environment\\PATH".to_string(),
-            ));
+            return Err(Error::Custom(format!(
+                "Failed to write HKCU\\Environment\\{name}"
+            )));
         }
     }
 
     broadcast_env_change();
     Ok(())
+}
+
+/// Read a persisted user environment variable.
+///
+/// Returns `None` when the value does not exist. `REG_EXPAND_SZ` values come
+/// back **unexpanded**, which is what Scoop's `Get-EnvVar` asks for
+/// (`DoNotExpandEnvironmentNames`) and what lets a read-modify-write keep them
+/// intact.
+pub fn read_user_env(name: &str) -> Result<Option<String>> {
+    Ok(read_user_value_raw(name)?.map(|(value, _)| value))
 }
 
 /// Split a PATH value into entries.
@@ -326,7 +336,7 @@ fn same_entry(a: &str, b: &str) -> bool {
 /// claiming success on a no-op.
 pub fn add_user_path(dir: &std::path::Path) -> Result<bool> {
     let dir = dir.to_string_lossy().to_string();
-    let (current, kind) = read_user_path_raw()?.unwrap_or_default();
+    let (current, kind) = read_user_value_raw("PATH")?.unwrap_or_default();
 
     let mut entries = split_path(&current);
     if entries.iter().any(|e| same_entry(e, &dir)) {
@@ -334,7 +344,7 @@ pub fn add_user_path(dir: &std::path::Path) -> Result<bool> {
     }
     entries.push(dir);
 
-    write_user_path_raw(&entries.join(";"), kind)?;
+    write_user_value_raw("PATH", &entries.join(";"), kind)?;
     Ok(true)
 }
 
@@ -343,7 +353,7 @@ pub fn add_user_path(dir: &std::path::Path) -> Result<bool> {
 /// Returns whether the value changed.
 pub fn remove_user_path(dir: &std::path::Path) -> Result<bool> {
     let dir = dir.to_string_lossy().to_string();
-    let Some((current, kind)) = read_user_path_raw()? else {
+    let Some((current, kind)) = read_user_value_raw("PATH")? else {
         return Ok(false);
     };
 
@@ -358,7 +368,7 @@ pub fn remove_user_path(dir: &std::path::Path) -> Result<bool> {
         return Ok(false);
     }
 
-    write_user_path_raw(&kept.join(";"), kind)?;
+    write_user_value_raw("PATH", &kept.join(";"), kind)?;
     Ok(true)
 }
 

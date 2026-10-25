@@ -111,6 +111,7 @@ pub(crate) fn query_installed_inner(session: &Session) -> Result<Vec<Package>> {
                     post_uninstall: None,
                     installer: None,
                     uninstaller: None,
+                    psmodule: None,
                     cookie: None,
                     notes: None,
                     suggest: None,

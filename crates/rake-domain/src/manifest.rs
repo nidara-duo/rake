@@ -31,6 +31,12 @@ pub struct Manifest {
     pub post_uninstall: Option<OneOrMany<String>>,
     pub installer: Option<InstallerSpec>,
     pub uninstaller: Option<UninstallerSpec>,
+    /// `psmodule` — the app *is* a PowerShell module and is linked into the
+    /// `modules` directory (Scoop's `install_psmodule`, lib/psmodules.ps1:1).
+    ///
+    /// Never architecture-specific: `install_psmodule` reads `$manifest.psmodule`
+    /// directly rather than through `arch_specific`.
+    pub psmodule: Option<PsModuleSpec>,
     pub cookie: Option<HashMap<String, String>>,
     pub notes: Option<OneOrMany<String>>,
     pub suggest: Option<HashMap<String, OneOrMany<String>>>,
@@ -58,86 +64,112 @@ impl Manifest {
         })
     }
 
-    pub fn resolve_extract_dir(&self, arch: Arch) -> Option<&OneOrMany<String>> {
+    /// The one architecture lookup every field goes through.
+    ///
+    /// Scoop has a single helper for this, `arch_specific`
+    /// (assets/scoop/lib/manifest.ps1:156): if `architecture.<arch>.<prop>`
+    /// exists it wins, otherwise the top-level `<prop>` is used. Every field
+    /// that `ArchSpec` can override must be resolved through here, or a
+    /// manifest that ships a 32-bit and a 64-bit download ends up installing
+    /// the wrong one.
+    fn arch_or_top<'a, T>(
+        &'a self,
+        arch: Arch,
+        arch_value: impl FnOnce(&'a ArchSpec) -> Option<&'a T>,
+        top_level: &'a Option<T>,
+    ) -> Option<&'a T> {
         self.arch_spec(arch)
-            .and_then(|s| s.extract_dir.as_ref())
-            .or(self.extract_dir.as_ref())
+            .and_then(arch_value)
+            .or(top_level.as_ref())
+    }
+
+    /// The download URLs for `arch`, in manifest order.
+    ///
+    /// An empty architecture-specific array counts as absent: PowerShell treats
+    /// `@()` as false in `if ($val)`, so `arch_specific` falls through to the
+    /// top-level `url` rather than returning an empty list.
+    pub fn resolve_urls(&self, arch: Arch) -> Vec<String> {
+        if let Some(spec) = self.arch_spec(arch)
+            && let Some(urls) = spec.url.as_ref()
+        {
+            let resolved = urls.as_slice().to_vec();
+            if !resolved.is_empty() {
+                return resolved;
+            }
+        }
+
+        self.url
+            .as_ref()
+            .map(|urls| urls.as_slice().to_vec())
+            .unwrap_or_default()
+    }
+
+    pub fn resolve_url(&self, arch: Arch) -> Option<&OneOrMany<String>> {
+        self.arch_or_top(arch, |s| s.url.as_ref(), &self.url)
+    }
+
+    pub fn resolve_extract_dir(&self, arch: Arch) -> Option<&OneOrMany<String>> {
+        self.arch_or_top(arch, |s| s.extract_dir.as_ref(), &self.extract_dir)
+    }
+
+    pub fn resolve_extract_to(&self, arch: Arch) -> Option<&OneOrMany<String>> {
+        self.arch_or_top(arch, |s| s.extract_to.as_ref(), &self.extract_to)
     }
 
     pub fn resolve_bin(&self, arch: Arch) -> Option<&OneOrMany<OneOrMany<String>>> {
-        self.arch_spec(arch)
-            .and_then(|s| s.bin.as_ref())
-            .or(self.bin.as_ref())
+        self.arch_or_top(arch, |s| s.bin.as_ref(), &self.bin)
     }
 
     /// Resolve hashes for the given arch, returning them in URL order.
     pub fn resolve_hashes(&self, arch: Arch) -> Option<Vec<String>> {
-        let hashes = self
-            .arch_spec(arch)
-            .and_then(|s| s.hash.as_ref())
-            .or(self.hash.as_ref())?;
+        let hashes = self.arch_or_top(arch, |s| s.hash.as_ref(), &self.hash)?;
         Some(hashes.as_slice().to_vec())
     }
 
     pub fn resolve_shortcuts(&self, arch: Arch) -> Option<&Vec<Vec<String>>> {
-        self.arch_spec(arch)
-            .and_then(|s| s.shortcuts.as_ref())
-            .or(self.shortcuts.as_ref())
+        self.arch_or_top(arch, |s| s.shortcuts.as_ref(), &self.shortcuts)
     }
 
     pub fn resolve_env_add_path(&self, arch: Arch) -> Option<&OneOrMany<String>> {
-        self.arch_spec(arch)
-            .and_then(|s| s.env_add_path.as_ref())
-            .or(self.env_add_path.as_ref())
-    }
-
-    pub fn resolve_extract_to(&self, arch: Arch) -> Option<&OneOrMany<String>> {
-        self.arch_spec(arch)
-            .and_then(|s| s.extract_to.as_ref())
-            .or(self.extract_to.as_ref())
-    }
-
-    pub fn resolve_pre_install(&self, arch: Arch) -> Option<&OneOrMany<String>> {
-        self.arch_spec(arch)
-            .and_then(|s| s.pre_install.as_ref())
-            .or(self.pre_install.as_ref())
-    }
-
-    pub fn resolve_post_install(&self, arch: Arch) -> Option<&OneOrMany<String>> {
-        self.arch_spec(arch)
-            .and_then(|s| s.post_install.as_ref())
-            .or(self.post_install.as_ref())
-    }
-
-    pub fn resolve_pre_uninstall(&self, arch: Arch) -> Option<&OneOrMany<String>> {
-        self.arch_spec(arch)
-            .and_then(|s| s.pre_uninstall.as_ref())
-            .or(self.pre_uninstall.as_ref())
-    }
-
-    pub fn resolve_post_uninstall(&self, arch: Arch) -> Option<&OneOrMany<String>> {
-        self.arch_spec(arch)
-            .and_then(|s| s.post_uninstall.as_ref())
-            .or(self.post_uninstall.as_ref())
+        self.arch_or_top(arch, |s| s.env_add_path.as_ref(), &self.env_add_path)
     }
 
     pub fn resolve_env_set(
         &self,
         arch: Arch,
     ) -> Option<&std::collections::HashMap<String, String>> {
-        self.arch_spec(arch)
-            .and_then(|s| s.env_set.as_ref())
-            .or(self.env_set.as_ref())
+        self.arch_or_top(arch, |s| s.env_set.as_ref(), &self.env_set)
+    }
+
+    pub fn resolve_pre_install(&self, arch: Arch) -> Option<&OneOrMany<String>> {
+        self.arch_or_top(arch, |s| s.pre_install.as_ref(), &self.pre_install)
+    }
+
+    pub fn resolve_post_install(&self, arch: Arch) -> Option<&OneOrMany<String>> {
+        self.arch_or_top(arch, |s| s.post_install.as_ref(), &self.post_install)
+    }
+
+    pub fn resolve_pre_uninstall(&self, arch: Arch) -> Option<&OneOrMany<String>> {
+        self.arch_or_top(arch, |s| s.pre_uninstall.as_ref(), &self.pre_uninstall)
+    }
+
+    pub fn resolve_post_uninstall(&self, arch: Arch) -> Option<&OneOrMany<String>> {
+        self.arch_or_top(arch, |s| s.post_uninstall.as_ref(), &self.post_uninstall)
     }
 
     /// Resolve the `installer` block, preferring the architecture-specific one.
-    ///
-    /// Scoop reads this through `arch_specific 'installer'`, so a manifest may
-    /// override the installer hook per architecture.
     pub fn resolve_installer(&self, arch: Arch) -> Option<&InstallerSpec> {
-        self.arch_spec(arch)
-            .and_then(|s| s.installer.as_ref())
-            .or(self.installer.as_ref())
+        self.arch_or_top(arch, |s| s.installer.as_ref(), &self.installer)
+    }
+
+    /// Resolve the `uninstaller` block, preferring the architecture-specific one.
+    pub fn resolve_uninstaller(&self, arch: Arch) -> Option<&UninstallerSpec> {
+        self.arch_or_top(arch, |s| s.uninstaller.as_ref(), &self.uninstaller)
+    }
+
+    /// The `psmodule` block, if any. Not architecture-specific, like Scoop.
+    pub fn resolve_psmodule(&self) -> Option<&PsModuleSpec> {
+        self.psmodule.as_ref()
     }
 }
 
@@ -201,6 +233,14 @@ pub struct UninstallerSpec {
     pub args: Option<OneOrMany<String>>,
     pub file: Option<String>,
     pub script: Option<OneOrMany<String>>,
+}
+
+/// The `psmodule` block. Scoop aborts the install when `name` is missing, so it
+/// is optional here and validated by the install step rather than by serde —
+/// one malformed manifest must not fail to parse at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PsModuleSpec {
+    pub name: Option<String>,
 }
 
 #[cfg(test)]
@@ -392,6 +432,176 @@ mod tests {
     fn prefixed_hash_specs_parse() {
         let m = parse(r#"{"version":"1","hash":["sha512:abc","plain64hex"]}"#);
         assert_eq!(m.resolve_hashes(Arch::Amd64).unwrap().len(), 2);
+    }
+
+    /// The full `arch_specific` matrix: every field `ArchSpec` can override
+    /// must come from `architecture.<arch>` when present, and from the top-level
+    /// field otherwise. Missing one here is how a 64-bit install ends up
+    /// unpacking the 32-bit archive with the wrong `extract_dir`.
+    #[test]
+    fn every_architecture_override_resolves_and_falls_back() {
+        let m = parse(
+            r#"{
+            "version": "1",
+            "url": "https://x/top.zip",
+            "hash": "tophash",
+            "bin": "top.exe",
+            "extract_dir": "top-dir",
+            "extract_to": "top-out",
+            "env_add_path": "top-path",
+            "env_set": {"TOP": "1"},
+            "shortcuts": [["top.lnk","Top"]],
+            "pre_install": "top-pre",
+            "post_install": "top-post",
+            "pre_uninstall": "top-preun",
+            "post_uninstall": "top-postun",
+            "installer": {"file": "top-installer.exe"},
+            "uninstaller": {"file": "top-uninstaller.exe"},
+            "architecture": {"64bit": {
+                "url": "https://x/arch.zip",
+                "hash": "archhash",
+                "bin": "arch.exe",
+                "extract_dir": "arch-dir",
+                "extract_to": "arch-out",
+                "env_add_path": "arch-path",
+                "env_set": {"ARCH": "1"},
+                "shortcuts": [["arch.lnk","Arch"]],
+                "pre_install": "arch-pre",
+                "post_install": "arch-post",
+                "pre_uninstall": "arch-preun",
+                "post_uninstall": "arch-postun",
+                "installer": {"file": "arch-installer.exe"},
+                "uninstaller": {"file": "arch-uninstaller.exe"}
+            }}
+        }"#,
+        );
+
+        // 64bit: every architecture-specific value wins.
+        assert_eq!(m.resolve_urls(Arch::Amd64), ["https://x/arch.zip"]);
+        assert_eq!(m.resolve_hashes(Arch::Amd64).unwrap(), ["archhash"]);
+        assert_eq!(
+            m.resolve_bin(Arch::Amd64).unwrap().as_slice()[0].as_slice(),
+            ["arch.exe"]
+        );
+        assert_eq!(
+            m.resolve_extract_dir(Arch::Amd64).unwrap().as_slice(),
+            ["arch-dir"]
+        );
+        assert_eq!(
+            m.resolve_extract_to(Arch::Amd64).unwrap().as_slice(),
+            ["arch-out"]
+        );
+        assert_eq!(
+            m.resolve_env_add_path(Arch::Amd64).unwrap().as_slice(),
+            ["arch-path"]
+        );
+        assert_eq!(
+            m.resolve_env_set(Arch::Amd64).unwrap().get("ARCH"),
+            Some(&"1".to_owned())
+        );
+        assert_eq!(m.resolve_shortcuts(Arch::Amd64).unwrap()[0][0], "arch.lnk");
+        assert_eq!(
+            m.resolve_pre_install(Arch::Amd64).unwrap().as_slice(),
+            ["arch-pre"]
+        );
+        assert_eq!(
+            m.resolve_post_install(Arch::Amd64).unwrap().as_slice(),
+            ["arch-post"]
+        );
+        assert_eq!(
+            m.resolve_pre_uninstall(Arch::Amd64).unwrap().as_slice(),
+            ["arch-preun"]
+        );
+        assert_eq!(
+            m.resolve_post_uninstall(Arch::Amd64).unwrap().as_slice(),
+            ["arch-postun"]
+        );
+        assert_eq!(
+            m.resolve_installer(Arch::Amd64).unwrap().file.as_deref(),
+            Some("arch-installer.exe")
+        );
+        assert_eq!(
+            m.resolve_uninstaller(Arch::Amd64).unwrap().file.as_deref(),
+            Some("arch-uninstaller.exe")
+        );
+
+        // 32bit: the manifest has no 32bit block, so every field falls back.
+        assert_eq!(m.resolve_urls(Arch::Ia32), ["https://x/top.zip"]);
+        assert_eq!(m.resolve_hashes(Arch::Ia32).unwrap(), ["tophash"]);
+        assert_eq!(
+            m.resolve_bin(Arch::Ia32).unwrap().as_slice()[0].as_slice(),
+            ["top.exe"]
+        );
+        assert_eq!(
+            m.resolve_extract_dir(Arch::Ia32).unwrap().as_slice(),
+            ["top-dir"]
+        );
+        assert_eq!(
+            m.resolve_extract_to(Arch::Ia32).unwrap().as_slice(),
+            ["top-out"]
+        );
+        assert_eq!(
+            m.resolve_env_add_path(Arch::Ia32).unwrap().as_slice(),
+            ["top-path"]
+        );
+        assert_eq!(
+            m.resolve_env_set(Arch::Ia32).unwrap().get("TOP"),
+            Some(&"1".to_owned())
+        );
+        assert_eq!(m.resolve_shortcuts(Arch::Ia32).unwrap()[0][0], "top.lnk");
+        assert_eq!(
+            m.resolve_pre_install(Arch::Ia32).unwrap().as_slice(),
+            ["top-pre"]
+        );
+        assert_eq!(
+            m.resolve_post_install(Arch::Ia32).unwrap().as_slice(),
+            ["top-post"]
+        );
+        assert_eq!(
+            m.resolve_pre_uninstall(Arch::Ia32).unwrap().as_slice(),
+            ["top-preun"]
+        );
+        assert_eq!(
+            m.resolve_post_uninstall(Arch::Ia32).unwrap().as_slice(),
+            ["top-postun"]
+        );
+        assert_eq!(
+            m.resolve_installer(Arch::Ia32).unwrap().file.as_deref(),
+            Some("top-installer.exe")
+        );
+        assert_eq!(
+            m.resolve_uninstaller(Arch::Ia32).unwrap().file.as_deref(),
+            Some("top-uninstaller.exe")
+        );
+    }
+
+    /// PowerShell treats an empty array as false, so `arch_specific` falls
+    /// through to the top-level `url` when the arch block has `"url": []`.
+    #[test]
+    fn an_empty_architecture_url_falls_back_to_the_top_level() {
+        let m = parse(
+            r#"{
+            "version": "1",
+            "url": "https://x/top.zip",
+            "architecture": {"64bit": {"url": []}}
+        }"#,
+        );
+
+        assert_eq!(m.resolve_urls(Arch::Amd64), ["https://x/top.zip"]);
+    }
+
+    /// A manifest with only an architecture block still resolves its URLs.
+    #[test]
+    fn architecture_only_urls_resolve() {
+        let m = parse(
+            r#"{"version":"1","architecture":{"64bit":{"url":["https://x/a.zip","https://x/b.zip"]}}}"#,
+        );
+
+        assert_eq!(
+            m.resolve_urls(Arch::Amd64),
+            ["https://x/a.zip", "https://x/b.zip"]
+        );
+        assert!(m.resolve_urls(Arch::Ia32).is_empty());
     }
 
     #[test]

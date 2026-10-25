@@ -173,6 +173,57 @@ mod tests {
         assert!(parse(r#"[[]]"#).is_empty());
     }
 
+    /// The three shapes real manifests use, all of which must land on the same
+    /// `source → target` model.
+    ///
+    /// `"data"` is the common form (adguardhome, atac, bind); `["data","log"]`
+    /// is a *list of two separate entries* (alist), not a pair — pairing it
+    /// would persist `data` to a target called `log` and leave the real `log`
+    /// directory unpinned; and `[["source","target"]]` is the only spelling that
+    /// renames (25 manifests in main/extras).
+    #[test]
+    fn parses_a_bare_string_as_one_entry() {
+        let entries = parse(r#""data""#);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "data");
+        assert_eq!(entries[0].target, "data");
+    }
+
+    #[test]
+    fn parses_a_flat_list_as_separate_entries() {
+        let entries = parse(r#"["data","log"]"#);
+        assert_eq!(entries.len(), 2, "a flat list is not a source/target pair");
+        assert_eq!(entries[0].source, "data");
+        assert_eq!(entries[0].target, "data");
+        assert_eq!(entries[1].source, "log");
+        assert_eq!(entries[1].target, "log");
+    }
+
+    #[test]
+    fn parses_a_nested_pair_as_source_and_target() {
+        let entries = parse(r#"[["src","dst"]]"#);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source, "src");
+        assert_eq!(entries[0].target, "dst");
+    }
+
+    #[test]
+    fn parses_a_mix_of_plain_and_renamed_entries() {
+        let entries = parse(r#"["data",["settings","user-settings"],"log"]"#);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.source.as_str(), e.target.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("data", "data"),
+                ("settings", "user-settings"),
+                ("log", "log")
+            ]
+        );
+    }
+
     fn apply_one(entry: PersistEntry) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let app_dir = tmp.path().join("apps").join("demo").join("current");

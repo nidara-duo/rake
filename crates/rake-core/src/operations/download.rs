@@ -311,30 +311,9 @@ pub async fn calculate_download_size(
 }
 
 pub fn resolve_urls(pkg: &Package, arch: Arch) -> Vec<String> {
-    let manifest = &pkg.manifest;
-
-    if let Some(ref arch_map) = manifest.architecture {
-        let spec = match arch {
-            Arch::Amd64 => arch_map.amd64.as_ref(),
-            Arch::Ia32 => arch_map.ia32.as_ref(),
-            Arch::Aarch64 => arch_map.aarch64.as_ref(),
-        };
-
-        if let Some(spec) = spec
-            && let Some(ref urls) = spec.url
-        {
-            let v: Vec<String> = urls.clone().into_vec();
-            if !v.is_empty() {
-                return v;
-            }
-        }
-    }
-
-    manifest
-        .url
-        .clone()
-        .map(|u| u.into_vec())
-        .unwrap_or_default()
+    // One resolver, in the domain, so `install`, `download` and the CLI header
+    // cannot disagree about which architecture's URLs a package has.
+    pkg.manifest.resolve_urls(arch)
 }
 
 /// Split a Scoop download URL into the URL that is actually requested and the

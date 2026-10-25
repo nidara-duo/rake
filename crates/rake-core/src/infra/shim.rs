@@ -70,235 +70,283 @@ fn escape_powershell_dquote(value: &str) -> String {
     value.replace('`', "``").replace('"', "`\"")
 }
 
+/// The path a shim is written for, **without** resolving the `current` junction.
+///
+/// `canonicalize` opens the file and resolves reparse points, so during a real
+/// install — where `apps/<app>/current` *is* a junction — it rewrote every shim
+/// target to `apps/<app>/<version>/...`. The shim then survived an update only
+/// by accident and pointed at a directory that was about to be deleted. Scoop's
+/// `Convert-Path` does not resolve links either, so neither does this.
+///
+/// `std::path::absolute` is the right primitive: it only normalizes separators
+/// and `.` segments, and joins a relative path onto the working directory.
+fn absolute_no_link_resolution(path: &Path) -> Result<PathBuf> {
+    std::path::absolute(path).map_err(crate::Error::Io)
+}
+
+/// `<shims>/<name>`, lowercased like Scoop's `$name.tolower()`.
+///
+/// A trailing `.exe`/`.com` on the *shim name* is dropped: `bin: [["bun.exe",
+/// "bunx.exe"]]` means the shim called `bunx`, not a second `.exe`. Scoop would
+/// build `bunx.exe.exe` here, which no manifest relies on.
+///
+/// Everything after the first dot is kept otherwise. `Path::with_extension`
+/// cannot be used for the suffixes below for exactly that reason: it replaces
+/// the last extension, so a shim named `python3.11` would silently become
+/// `python3.cmd`.
+fn shim_base(shims_dir: &Path, name: &str) -> PathBuf {
+    let lower = name.to_lowercase();
+    let trimmed = lower
+        .strip_suffix(".exe")
+        .or_else(|| lower.strip_suffix(".com"))
+        .unwrap_or(&lower);
+    shims_dir.join(trimmed)
+}
+
+/// Append a literal suffix (`.cmd`, `.shim`, …) to a shim base name.
+fn with_suffix(base: &Path, suffix: &str) -> PathBuf {
+    let mut name = base.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// ` <args>` for the wrapper bodies, or nothing at all.
+///
+/// Scoop interpolates the argument list verbatim (`"`"$resolved_path`" $arg %*"`),
+/// so quotes and spaces inside an argument survive as written.
+fn args_suffix(args: Option<&[String]>) -> String {
+    match args {
+        Some(args) if !args.is_empty() => format!(" {}", args.join(" ")),
+        _ => String::new(),
+    }
+}
+
 /// Create a single shim for a given target file.
+///
+/// Mirrors `shim` in Scoop's `lib/core.ps1:949`: the wrapper is chosen by the
+/// **target's** extension, not by the shim's name. `bin: [["code.cmd", "code"]]`
+/// must produce a `.cmd` wrapper because the target is a batch file, however the
+/// shim is called.
 pub fn create_shim(
     target: &Path,
     name: &str,
     args: Option<&[String]>,
-    app_name: &str,
     shims_dir: &Path,
 ) -> Result<()> {
     validate_manifest_name(name)?;
-    let target = target.canonicalize()?;
+    let target = absolute_no_link_resolution(target)?;
     let resolved_path = target.to_string_lossy().into_owned();
-    let shim_base = shims_dir.join(name.to_lowercase());
+    let base = shim_base(shims_dir, name);
+    let suffix = args_suffix(args);
 
-    match Path::new(name)
+    match target
         .extension()
         .and_then(|s| s.to_str())
         .map(|s| s.to_lowercase())
         .as_deref()
     {
-        // If name already has .exe extension, treat as exe target
-        Some("exe" | "com") | None if is_exe_target(&target) => {
-            create_exe_shim(&target, &shim_base, args)?;
-        }
-        Some("bat" | "cmd") => {
-            create_batch_shim(&resolved_path, &shim_base)?;
-        }
-        Some("ps1") => {
-            create_powershell_shim(&target, &resolved_path, &shim_base, app_name)?;
-        }
-        Some("jar") => {
-            create_jar_shim(&resolved_path, &shim_base)?;
-        }
-        Some("py") => {
-            create_python_shim(&resolved_path, &shim_base)?;
-        }
-        _ => {
-            // Fallback: detect by existing target file
-            if target
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_lowercase())
-                .as_deref()
-                == Some("exe")
-            {
-                create_exe_shim(&target, &shim_base, args)?;
-            } else {
-                create_batch_shim(&resolved_path, &shim_base)?;
-            }
-        }
+        Some("exe" | "com") => create_exe_shim(&target, &base, args)?,
+        Some("bat" | "cmd") => create_batch_shim(&resolved_path, &base, &suffix)?,
+        Some("ps1") => create_powershell_shim(&resolved_path, &base, &suffix)?,
+        Some("jar") => create_jar_shim(&resolved_path, &base, &suffix)?,
+        Some("py") => create_python_shim(&resolved_path, &base, &suffix)?,
+        // A target without a recognised extension is a shell script: Scoop runs
+        // it through bash, translating the path with wslpath/cygpath.
+        _ => create_bash_shim(&resolved_path, &base, &suffix)?,
     }
 
     Ok(())
 }
 
-fn is_exe_target(target: &Path) -> bool {
-    target
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|s| s.eq_ignore_ascii_case("exe") || s.eq_ignore_ascii_case("com"))
-        .unwrap_or(false)
-}
-
 /// Create a shim for .exe / .com targets using shim.exe + .shim metadata.
-fn create_exe_shim(target: &Path, shim_base: &Path, args: Option<&[String]>) -> Result<()> {
-    let shim_exe_path = shim_base.with_extension("exe");
-    let shim_file_path = shim_base.with_extension("shim");
-
+fn create_exe_shim(target: &Path, base: &Path, args: Option<&[String]>) -> Result<()> {
     // The shim binary is compiled into rake itself (see SHIM_EXE), so there is
     // no external file to locate and no fallback path needed.
-    std::fs::write(&shim_exe_path, SHIM_EXE)?;
+    std::fs::write(with_suffix(base, ".exe"), SHIM_EXE)?;
 
     // .shim metadata, in the format scoop's shim reads.
     let mut shim_content = format!("path = \"{}\"\r\n", target.display());
     if let Some(args) = args.filter(|a| !a.is_empty()) {
         shim_content.push_str(&format!("args = {}\r\n", args.join(" ")));
     }
-    std::fs::write(&shim_file_path, shim_content)?;
+    std::fs::write(with_suffix(base, ".shim"), shim_content)?;
 
     Ok(())
 }
 
-/// Create shim for .bat / .cmd scripts — simple cmd wrapper.
-fn create_batch_shim(resolved: &str, shim_base: &Path) -> Result<()> {
-    let cmd_path = shim_base.with_extension("cmd");
-    let content = format!(
-        "@rem {resolved}\r\n@\"{resolved}\" %*\r\n",
-        resolved = resolved
-    );
-    std::fs::write(&cmd_path, content)?;
-
-    // Unix-compatible shim (no extension)
-    let shim_path = shim_base.with_extension("");
-    let unix_content = format!(
-        "#!/bin/sh\n# {resolved}\nMSYS2_ARG_CONV_EXCL=/C cmd.exe /C \"{resolved}\" \"$@\"\n",
-        resolved = resolved
-    );
-    std::fs::write(&shim_path, unix_content)?;
-
-    Ok(())
-}
-
-/// Create shim for .ps1 scripts — ps1 wrapper + cmd fallback.
-fn create_powershell_shim(
-    target: &Path,
-    resolved: &str,
-    shim_base: &Path,
-    app_name: &str,
-) -> Result<()> {
-    // PowerShell wrapper
-    let ps1_path = shim_base.with_extension("ps1");
-    // `app_name` and the target file name both come from the manifest, and this is
-    // PowerShell source. A `"` in either closes the string and everything after it
-    // becomes code, so it is generated by `escape_powershell_dquote` rather than
-    // pasted in. Verified by execution, not by inspection: an app name of
-    // `demo"; New-Item ...; $x="` really did run the injected command when the
-    // generated shim was launched.
-    let app = escape_powershell_dquote(app_name);
-    let target_rel =
-        escape_powershell_dquote(target.file_name().and_then(|s| s.to_str()).unwrap_or(""));
-    let resolved_comment = escape_powershell_dquote(resolved);
-    let ps1_content = format!(
-        "# {resolved_comment}\n$path = Join-Path $PSScriptRoot \"..\\..\\apps\\{app}\\current\\{target_rel}\"\nif ($MyInvocation.ExpectingInput) {{ $input | & $path @args }} else {{ & $path @args }}\nexit $LASTEXITCODE\n",
-    );
-    std::fs::write(&ps1_path, ps1_content)?;
-
-    // CMD fallback (tries pwsh.exe first, then powershell.exe)
-    let cmd_path = shim_base.with_extension("cmd");
+/// Create shim for .bat / .cmd scripts.
+///
+/// Scoop deliberately does **not** copy `shim.exe` here: a batch file cannot be
+/// executed by the shim binary, so it generates a `.cmd` wrapper (usable from
+/// cmd.exe and from programs that know nothing about PowerShell) and a POSIX
+/// shell wrapper for MSYS/Git Bash.
+fn create_batch_shim(resolved: &str, base: &Path, args: &str) -> Result<()> {
     let cmd_content = format!(
-        "@rem {resolved}\n@echo off\nwhere /q pwsh.exe\nif %errorlevel% equ 0 (\n    pwsh -noprofile -ex unrestricted -file \"{resolved}\" %*\n) else (\n    powershell -noprofile -ex unrestricted -file \"{resolved}\" %*\n)\n",
+        "@rem {resolved}\r\n@\"{resolved}\"{args} %*\r\n",
         resolved = resolved,
+        args = args,
     );
-    std::fs::write(&cmd_path, cmd_content)?;
+    std::fs::write(with_suffix(base, ".cmd"), cmd_content)?;
 
-    // Unix shim
-    let shim_path = shim_base.with_extension("");
     let unix_content = format!(
-        "#!/bin/sh\n# {resolved}\nif command -v pwsh.exe > /dev/null 2>&1; then\n    pwsh.exe -noprofile -ex unrestricted -file \"{resolved}\" \"$@\"\nelse\n    powershell.exe -noprofile -ex unrestricted -file \"{resolved}\" \"$@\"\nfi\n",
+        "#!/bin/sh\n# {resolved}\nMSYS2_ARG_CONV_EXCL=/C cmd.exe /C \"{resolved}\"{args} \"$@\"",
         resolved = resolved,
+        args = args,
     );
-    std::fs::write(&shim_path, unix_content)?;
+    std::fs::write(base, unix_content)?;
 
     Ok(())
 }
 
-/// Create shim for .jar files — cmd wrapper with java -jar.
-fn create_jar_shim(resolved: &str, shim_base: &Path) -> Result<()> {
-    let cmd_path = shim_base.with_extension("cmd");
-    let content = format!(
-        "@rem {resolved}\n@pushd \"{dir}\"\n@java -jar \"{resolved}\" %*\n@popd\n",
-        resolved = resolved,
-        dir = Path::new(resolved).parent().map(|p| p.display()).unwrap(),
+/// Create shim for .ps1 scripts — ps1 wrapper plus cmd and POSIX launchers.
+fn create_powershell_shim(resolved: &str, base: &Path, args: &str) -> Result<()> {
+    // The path is embedded in PowerShell source, inside double quotes, so a `"`
+    // in it would close the string and turn the rest into code. Verified by
+    // execution, not by inspection: an app name of `demo"; New-Item ...; $x="`
+    // really did run the injected command when this was interpolated raw.
+    let quoted = escape_powershell_dquote(resolved);
+    let ps1_content = format!(
+        "# {comment}\r\n$path = \"{quoted}\"\r\nif ($MyInvocation.ExpectingInput) {{ $input | & $path{args} @args }} else {{ & $path{args} @args }}\r\nexit $LASTEXITCODE",
+        comment = quoted,
+        quoted = quoted,
+        args = args,
     );
-    std::fs::write(&cmd_path, content)?;
+    std::fs::write(with_suffix(base, ".ps1"), ps1_content)?;
 
-    let shim_path = shim_base.with_extension("");
-    let unix_content = format!(
-        "#!/bin/sh\n# {resolved}\ncd \"{dir}\"\njava.exe -jar \"{resolved}\" \"$@\"\n",
+    // CMD launcher: pwsh when available, Windows PowerShell otherwise.
+    let cmd_content = format!(
+        "@rem {resolved}\r\n@echo off\r\nwhere /q pwsh.exe\r\nif %errorlevel% equ 0 (\r\n    pwsh -noprofile -ex unrestricted -file \"{resolved}\"{args} %*\r\n) else (\r\n    powershell -noprofile -ex unrestricted -file \"{resolved}\"{args} %*\r\n)",
         resolved = resolved,
-        dir = Path::new(resolved).parent().map(|p| p.display()).unwrap(),
+        args = args,
     );
-    std::fs::write(&shim_path, unix_content)?;
+    std::fs::write(with_suffix(base, ".cmd"), cmd_content)?;
+
+    let unix_content = format!(
+        "#!/bin/sh\n# {resolved}\nif command -v pwsh.exe > /dev/null 2>&1; then\n    pwsh.exe -noprofile -ex unrestricted -file \"{resolved}\"{args} \"$@\"\nelse\n    powershell.exe -noprofile -ex unrestricted -file \"{resolved}\"{args} \"$@\"\nfi",
+        resolved = resolved,
+        args = args,
+    );
+    std::fs::write(base, unix_content)?;
 
     Ok(())
 }
 
-/// Create shim for .py files — cmd wrapper with python.
-fn create_python_shim(resolved: &str, shim_base: &Path) -> Result<()> {
-    let cmd_path = shim_base.with_extension("cmd");
-    let content = format!(
-        "@rem {resolved}\n@python \"{resolved}\" %*\n",
-        resolved = resolved,
-    );
-    std::fs::write(&cmd_path, content)?;
+/// Create shim for .jar files — runs `java -jar` from the jar's own directory,
+/// because jars routinely resolve resources relative to the working directory.
+fn create_jar_shim(resolved: &str, base: &Path, args: &str) -> Result<()> {
+    let dir = Path::new(resolved)
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
 
-    let shim_path = shim_base.with_extension("");
-    let unix_content = format!(
-        "#!/bin/sh\n# {resolved}\npython.exe \"{resolved}\" \"$@\"\n",
+    let cmd_content = format!(
+        "@rem {resolved}\r\n@pushd \"{dir}\"\r\n@java -jar \"{resolved}\"{args} %*\r\n@popd",
         resolved = resolved,
+        dir = dir,
+        args = args,
     );
-    std::fs::write(&shim_path, unix_content)?;
+    std::fs::write(with_suffix(base, ".cmd"), cmd_content)?;
+
+    let unix_content = format!(
+        "#!/bin/sh\n# {resolved}\nif [ $WSL_INTEROP ]\nthen\n  cd $(wslpath -u '{dir}')\nelse\n  cd $(cygpath -u '{dir}')\nfi\njava.exe -jar \"{resolved}\"{args} \"$@\"",
+        resolved = resolved,
+        dir = dir,
+        args = args,
+    );
+    std::fs::write(base, unix_content)?;
 
     Ok(())
 }
 
-/// Remove a single shim by name (removes .exe, .shim, .cmd, .ps1).
+/// Create shim for .py files.
+fn create_python_shim(resolved: &str, base: &Path, args: &str) -> Result<()> {
+    let cmd_content = format!(
+        "@rem {resolved}\r\n@python \"{resolved}\"{args} %*\r\n",
+        resolved = resolved,
+        args = args,
+    );
+    std::fs::write(with_suffix(base, ".cmd"), cmd_content)?;
+
+    let unix_content = format!(
+        "#!/bin/sh\n# {resolved}\npython.exe \"{resolved}\"{args} \"$@\"",
+        resolved = resolved,
+        args = args,
+    );
+    std::fs::write(base, unix_content)?;
+
+    Ok(())
+}
+
+/// Create shim for a target with no recognised extension.
+///
+/// Scoop treats these as shell scripts and runs them through bash, translating
+/// the Windows path with `wslpath` (inside WSL) or `cygpath` (MSYS/Git Bash).
+fn create_bash_shim(resolved: &str, base: &Path, args: &str) -> Result<()> {
+    // Scoop quotes each argument individually in this branch, because the whole
+    // command line is reassembled as one string for `bash -c`.
+    let quoted_args = args
+        .split_whitespace()
+        .map(|a| format!("\"{a}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let quoted_args = if quoted_args.is_empty() {
+        String::new()
+    } else {
+        format!(" {quoted_args}")
+    };
+
+    let cmd_content = format!(
+        "@rem {resolved}\r\n@echo off\r\nbash -c \"command -v wslpath >/dev/null\"\r\nif %errorlevel% equ 0 (\r\n  bash \"$(wslpath -u '{resolved}')\"{quoted_args} %*\r\n) else (\r\n  set args={quoted_args} %*\r\n  setlocal enabledelayedexpansion\r\n  if not \"!args!\"==\"\" set args=!args:\"=\"\"!\r\n  bash -c \"$(cygpath -u '{resolved}') !args!\"\r\n)",
+        resolved = resolved,
+        quoted_args = quoted_args,
+    );
+    std::fs::write(with_suffix(base, ".cmd"), cmd_content)?;
+
+    let unix_content = format!(
+        "#!/bin/sh\n# {resolved}\nif [ $WSL_INTEROP ]\nthen\n  \"$(wslpath -u '{resolved}')\"{args} \"$@\"\nelse\n  \"$(cygpath -u '{resolved}')\"{args} \"$@\"\nfi",
+        resolved = resolved,
+        args = args,
+    );
+    std::fs::write(base, unix_content)?;
+
+    Ok(())
+}
+
+/// Remove a single shim by name (removes .exe, .shim, .cmd, .ps1 and the bare
+/// POSIX wrapper).
 pub fn remove_shim(name: &str, shims_dir: &Path) -> Result<()> {
     validate_manifest_name(name)?;
-    let lower = name.to_lowercase();
-    let base = shims_dir.join(&lower);
-    for ext in &["exe", "shim", "cmd", "ps1"] {
-        let path = base.with_extension(ext);
+    let base = shim_base(shims_dir, name);
+    for suffix in [".exe", ".shim", ".cmd", ".ps1"] {
+        let path = with_suffix(&base, suffix);
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
     }
-    // No-extension shim (Unix compat)
-    let noext = base.with_extension("");
-    if noext.exists() {
-        std::fs::remove_file(&noext)?;
+    if base.exists() {
+        std::fs::remove_file(&base)?;
     }
     Ok(())
 }
 
-/// Create shims for all bin entries in a manifest.
+/// Create shims for all bin entries in a manifest, returning the names that were
+/// actually written (an entry whose target is missing is skipped).
 ///
 /// `app_dir` is the directory the `bin` targets are resolved against. During install
 /// that is the `current` junction, not the version directory, so the recorded shim
 /// target reads `apps/<name>/current/<exe>` and keeps following `current` across
 /// updates — the same layout scoop produces.
-pub fn create_shims(entries: &[BinEntry], app_dir: &Path, shims_dir: &Path) -> Result<()> {
-    let app_name = app_dir
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+pub fn create_shims(entries: &[BinEntry], app_dir: &Path, shims_dir: &Path) -> Result<Vec<String>> {
+    let mut created = Vec::new();
     for entry in entries {
         let target = app_dir.join(&entry.target);
         if !target.exists() {
             continue;
         }
-        create_shim(
-            &target,
-            &entry.name,
-            entry.args.as_deref(),
-            app_name,
-            shims_dir,
-        )?;
+        create_shim(&target, &entry.name, entry.args.as_deref(), shims_dir)?;
+        created.push(entry.name.clone());
     }
-    Ok(())
+    Ok(created)
 }
 
 /// Remove shims for all bin entries.
@@ -628,5 +676,208 @@ mod path_safety_tests {
             &shims_dir,
         );
         assert!(err.is_err(), "traversal must be refused");
+    }
+}
+
+/// The wrapper shapes `shim` in Scoop's `lib/core.ps1:949` produces. The target's
+/// extension decides the wrapper — not the shim's name, and not the download URL.
+#[cfg(test)]
+mod wrapper_tests {
+    use super::*;
+
+    fn layout_file(dir: &Path, app: &str, file: &str) -> (PathBuf, PathBuf) {
+        let app_dir = dir.join("apps").join(app).join("current");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join(file), b"payload").unwrap();
+        let shims_dir = dir.join("shims");
+        std::fs::create_dir_all(&shims_dir).unwrap();
+        (app_dir, shims_dir)
+    }
+
+    fn entry(target: &str, name: &str, args: Option<&[&str]>) -> BinEntry {
+        BinEntry {
+            target: target.to_owned(),
+            name: name.to_owned(),
+            args: args.map(|a| a.iter().map(|s| (*s).to_owned()).collect()),
+        }
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("{} should exist: {e}", path.display()))
+    }
+
+    /// `bin: [["code.cmd", "code"]]` (vscode and 200-odd other manifests) must
+    /// produce a `.cmd` wrapper. Copying `shim.exe` here — which the previous
+    /// implementation did whenever the *shim name* had no extension — produced a
+    /// shim that could not launch a batch file at all.
+    #[test]
+    fn a_cmd_target_gets_a_cmd_wrapper_and_no_shim_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_dir, shims_dir) = layout_file(dir.path(), "vscode", "code.cmd");
+
+        create_shims(&[entry("code.cmd", "code", None)], &app_dir, &shims_dir).unwrap();
+
+        let cmd = read(&shims_dir.join("code.cmd"));
+        assert!(
+            cmd.contains(r#"@"C:"#) && cmd.contains("code.cmd"),
+            "the wrapper must launch the target:\n{cmd}"
+        );
+        assert!(cmd.contains("%*"), "arguments must be forwarded:\n{cmd}");
+        assert!(
+            shims_dir.join("code").is_file(),
+            "the POSIX wrapper must exist too"
+        );
+        assert!(
+            !shims_dir.join("code.exe").exists(),
+            "a batch file must not get a shim.exe"
+        );
+        assert!(
+            !shims_dir.join("code.shim").exists(),
+            "a batch file must not get .shim metadata"
+        );
+    }
+
+    /// Arguments go into every wrapper of the `.cmd` target, not just the `.cmd`.
+    #[test]
+    fn a_cmd_wrapper_carries_the_manifest_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_dir, shims_dir) = layout_file(dir.path(), "demo", "run.cmd");
+
+        create_shims(
+            &[entry("run.cmd", "run", Some(&["--flag", "x"]))],
+            &app_dir,
+            &shims_dir,
+        )
+        .unwrap();
+
+        let cmd = read(&shims_dir.join("run.cmd"));
+        assert!(cmd.contains("--flag x %*"), "args missing in:\n{cmd}");
+        let sh = read(&shims_dir.join("run"));
+        assert!(
+            sh.contains("--flag x \"$@\""),
+            "args missing from the POSIX wrapper:\n{sh}"
+        );
+    }
+
+    /// A `.ps1` target needs all three launchers, each forwarding the arguments.
+    #[test]
+    fn a_ps1_target_writes_ps1_cmd_and_posix_wrappers_with_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_dir, shims_dir) = layout_file(dir.path(), "concfg", "concfg.ps1");
+
+        create_shims(
+            &[entry("concfg.ps1", "concfg", Some(&["-Force"]))],
+            &app_dir,
+            &shims_dir,
+        )
+        .unwrap();
+
+        let ps1 = read(&shims_dir.join("concfg.ps1"));
+        assert!(ps1.contains("& $path -Force @args"), "ps1 body:\n{ps1}");
+        assert!(
+            ps1.contains("$path = \"C:"),
+            "the target must be an absolute path:\n{ps1}"
+        );
+
+        let cmd = read(&shims_dir.join("concfg.cmd"));
+        assert!(cmd.contains("-Force %*"), "cmd body:\n{cmd}");
+        assert!(cmd.contains("pwsh"), "cmd body:\n{cmd}");
+
+        let sh = read(&shims_dir.join("concfg"));
+        assert!(sh.starts_with("#!/bin/sh"), "posix body:\n{sh}");
+        assert!(sh.contains("-Force \"$@\""), "posix body:\n{sh}");
+    }
+
+    #[test]
+    fn jar_and_py_targets_carry_args() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (app_dir, shims_dir) = layout_file(dir.path(), "bfg", "bfg.jar");
+        create_shims(
+            &[entry("bfg.jar", "bfg", Some(&["--noisy"]))],
+            &app_dir,
+            &shims_dir,
+        )
+        .unwrap();
+        let jar = read(&shims_dir.join("bfg.cmd"));
+        assert!(
+            jar.contains("java -jar") && jar.contains("--noisy %*"),
+            "{jar}"
+        );
+        assert!(
+            jar.contains("@pushd"),
+            "the jar's directory must be the cwd: {jar}"
+        );
+
+        let (app_dir, shims_dir) = layout_file(dir.path(), "tool", "tool.py");
+        create_shims(
+            &[entry("tool.py", "tool", Some(&["-v"]))],
+            &app_dir,
+            &shims_dir,
+        )
+        .unwrap();
+        let py = read(&shims_dir.join("tool.cmd"));
+        assert!(py.contains("python") && py.contains("-v %*"), "{py}");
+        let py_sh = read(&shims_dir.join("tool"));
+        assert!(py_sh.contains("-v \"$@\""), "{py_sh}");
+    }
+
+    /// `Path::with_extension("cmd")` would turn `python3.11` into `python3.cmd`.
+    /// The suffix has to be appended, not substituted.
+    #[test]
+    fn a_dotted_shim_name_keeps_everything_after_the_first_dot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_dir, shims_dir) = layout_file(dir.path(), "python", "python.exe");
+
+        create_shims(
+            &[entry("python.exe", "python3.11", None)],
+            &app_dir,
+            &shims_dir,
+        )
+        .unwrap();
+
+        assert!(shims_dir.join("python3.11.shim").is_file());
+        assert!(shims_dir.join("python3.11.exe").is_file());
+        assert!(
+            !shims_dir.join("python3.shim").exists(),
+            "the last extension must not be replaced"
+        );
+
+        remove_shim("python3.11", &shims_dir).unwrap();
+        assert!(!shims_dir.join("python3.11.shim").exists());
+        assert!(!shims_dir.join("python3.11.exe").exists());
+    }
+
+    /// The bug this pins: `canonicalize` resolves the `current` junction, so every
+    /// shim was written against `apps/<app>/<version>/...` and a later update left
+    /// it pointing at a directory that had just been deleted.
+    #[test]
+    fn the_current_junction_is_recorded_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("apps").join("demo");
+        let version_dir = app_dir.join("1.0.0");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("tool.exe"), b"MZ").unwrap();
+        crate::infra::fs::create_junction(&version_dir, &app_dir.join("current")).unwrap();
+        let shims_dir = dir.path().join("shims");
+        std::fs::create_dir_all(&shims_dir).unwrap();
+
+        create_shims(
+            &[entry("tool.exe", "tool", None)],
+            &app_dir.join("current"),
+            &shims_dir,
+        )
+        .unwrap();
+
+        let content = read(&shims_dir.join("tool.shim"));
+        assert!(
+            content.contains(r"current\tool.exe"),
+            "the shim must follow the junction, not the version directory:\n{content}"
+        );
+        assert!(
+            !content.contains("1.0.0"),
+            "the version directory must not be baked in:\n{content}"
+        );
     }
 }

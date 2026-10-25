@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use rake_domain::arch::Arch;
 use rake_domain::manifest::Manifest;
@@ -6,41 +7,76 @@ use rake_domain::package::{InstallRecord, InstallState, Package, PackageSource, 
 
 use crate::Result;
 use crate::event::Event;
-use crate::infra::archive::{ArchiveService, detect_format_for_url, extract_innosetup};
+use crate::infra::archive::{
+    ArchiveFormat, NativeArchive, detect_format, extract_innosetup, normalize_manifest_dir,
+};
 use crate::infra::fs;
 use crate::infra::install_meta;
 use crate::infra::shortcut::ShortcutEntry;
 use crate::infra::{env, persist, script, shim, shortcut};
-use crate::operations::download::DownloadedFile;
+use crate::operations::download::{self, DownloadedFile};
 use crate::session::Session;
 
 /// Re-exported so callers (`update`) share the single canonical type
 /// rather than redefining a private `InstallInfo`.
 pub type InstallInfo = InstallRecord;
 
+/// The directories one install batch writes to, resolved once.
+///
+/// Passed around as one value because every step below needs a different subset
+/// of them, and a seven-argument parameter list on each is where a mix-up lives.
+pub(crate) struct InstallRoots {
+    /// `$SCOOP` — also the base the PowerShell library is loaded from.
+    pub root: PathBuf,
+    pub apps: PathBuf,
+    pub shims: PathBuf,
+    pub persist: PathBuf,
+    pub modules: PathBuf,
+    pub global: PathBuf,
+}
+
+impl InstallRoots {
+    pub(crate) fn from_session(session: &Session) -> Self {
+        let root = session
+            .config()
+            .root_path
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("apps"));
+        let global = session
+            .config()
+            .global_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\rake"));
+
+        Self {
+            apps: root.join("apps"),
+            shims: root.join("shims"),
+            persist: root.join("persist"),
+            modules: root.join("modules"),
+            root,
+            global,
+        }
+    }
+}
+
 /// Commit downloaded files — extract, link, shim, persist.
 /// Does NOT download — caller is responsible for providing DownloadedFile list.
+///
+/// The steps run in the order `install_app` uses
+/// (assets/scoop/lib/install.ps1:48-73): pre_install → installer → `current` →
+/// shims → shortcuts → psmodule → env → persist → post_install → metadata.
+/// `install.json` is written **last**, so a version directory that carries one
+/// is a version directory that finished.
 pub async fn install_packages(
     session: &Session,
     packages: &[Package],
     files: &[DownloadedFile],
     arch: Arch,
 ) -> Result<Vec<Package>> {
-    let mut installed = Vec::new();
-    let root = session
-        .config()
-        .root_path
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("apps"));
-    let shims_dir = root.join("shims");
-    let persist_root = root.join("persist");
-    let global_root = session
-        .config()
-        .global_path
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\rake"));
+    let roots = InstallRoots::from_session(session);
     let tx = session.event_bus().core_sender();
+    let mut installed = Vec::new();
 
     for pkg in packages {
         let _ = tx.try_send(Event::CommitStart(
@@ -51,216 +87,8 @@ pub async fn install_packages(
         let pkg_files: Vec<&DownloadedFile> =
             files.iter().filter(|f| f.ident == pkg.ident).collect();
 
-        let version_dir = apps_version_dir(session, pkg);
-        let app_dir = apps_dir(session, pkg);
-        let pkg_persist_dir = persist_root.join(pkg.name());
-
-        if version_dir.exists() {
-            if install_meta::is_installed(&version_dir) {
-                return Err(crate::Error::Domain(
-                    rake_domain::Error::PackageAlreadyExists(pkg.name().to_owned()),
-                ));
-            }
-            // Partial install — purge and retry
-            let _ = fs::remove_dir(&version_dir);
-        }
-
-        // 1. Extract / copy files
-        let extract_to = pkg
-            .manifest
-            .resolve_extract_to(arch)
-            .map(|et| et.as_slice().to_vec());
-        for (i, file) in pkg_files.iter().enumerate() {
-            let target_dir = match extract_to.as_ref().and_then(|et| et.get(i)) {
-                Some(sub) => version_dir.join(sub),
-                None => version_dir.clone(),
-            };
-
-            // Resolve archive format from the manifest URL, not from the
-            // cache file's own path — the URL may carry a `#/name.ext`
-            // fragment declaring the true format (e.g. a self-extracting
-            // `.7z.exe`), which cache-path-based detection cannot see.
-            let extraction_format = detect_format_for_url(&file.url);
-
-            // InnoSetup extraction is gated on the `innosetup` flag ALONE.
-            //
-            // `installer.script` is not an alternative marker for it. Scoop treats that
-            // field as a PowerShell hook run after extraction: `lib/decompress.ps1`
-            // selects InnoSetup solely via `if ($Manifest.innosetup)` for `.exe`
-            // downloads, and `Expand-InnoArchive` never hands a script to innounp
-            // (its argument list is fixed: -x -d<dest> <path> -y -c<dir>).
-            //
-            // Coupling the two sent plain PowerShell installer scripts into innounp.
-            // In the main bucket that misrouted 37 of the 38 manifests that carry
-            // `installer.script`, leaving only the single one that also sets
-            // `innosetup` working by accident.
-            let is_innosetup = pkg.manifest.innosetup == Some(true);
-
-            if is_innosetup && extraction_format.is_none() {
-                let _ = tx.try_send(Event::CommitProgress(format!(
-                    "Extracting {} ...",
-                    file.target_filename,
-                )));
-                let ed = pkg.manifest.resolve_extract_dir(arch);
-                let ed_str = ed.and_then(|ed| ed.as_slice().first().map(|s| s.as_str()));
-                extract_innosetup(
-                    &file.cache_path,
-                    &target_dir,
-                    session.config().root_path.as_deref(),
-                    ed_str,
-                )?;
-            } else if let Some(format) = extraction_format {
-                let archive =
-                    crate::infra::archive::NativeArchive::new(session.config().root_path.clone());
-                archive
-                    .extract(&file.cache_path, &target_dir, format)
-                    .await?;
-            } else {
-                let dest = target_dir.join(&file.target_filename);
-                fs::ensure_dir(&target_dir)?;
-                std::fs::copy(&file.cache_path, &dest)?;
-            }
-        }
-
-        // 2. Apply extract_dir
-        apply_extract_dir(pkg, &version_dir, arch, &tx)?;
-
-        // 3. Run pre_install
-        if let Some(script_lines) = pkg.manifest.resolve_pre_install(arch) {
-            let ctx = script::HookContext::new(
-                &version_dir,
-                &pkg_persist_dir,
-                &version_dir,
-                pkg.version(),
-            );
-            script::run_powershell_script(&script_lines.iter().cloned().collect::<Vec<_>>(), &ctx)?;
-        }
-
-        // 4. Run the installer hook. `installer.script` is a PowerShell script that
-        // runs after extraction, reached in scoop via `Invoke-HookScript -HookType
-        // 'installer'` (lib/install.ps1:159-167) — still before `current` exists, so
-        // `$dir` is the version directory, same as scoop.
-        if let Some(script_lines) = pkg
-            .manifest
-            .resolve_installer(arch)
-            .and_then(|i| i.script.as_ref())
-        {
-            // `installer.script` bodies call scoop's own functions, so the library has
-            // to be loaded. The other hooks do not, and paying ~0.7s each for it is
-            // not worth it.
-            let ctx = script::HookContext::with_scoop_lib(
-                &version_dir,
-                &pkg_persist_dir,
-                &version_dir,
-                pkg.version(),
-                &root,
-                &global_root,
-            );
-            script::run_powershell_script(&script_lines.iter().cloned().collect::<Vec<_>>(), &ctx)?;
-        }
-
-        // Create the `current` junction BEFORE shims, shortcuts and PATH, mirroring
-        // scoop's lib/install.ps1:58-63. Everything below references the junction and
-        // not the version directory: that indirection is the whole point of the
-        // junction, since a later update only has to repoint `current` for shims,
-        // shortcuts and PATH to follow. Creating it last pointed every shim at
-        // `apps/<name>/<version>`, so the link bought nothing, broke scoop
-        // interoperability, and deleting an old version directory stranded its shims.
-        //
-        // The lock covers the junction swap alone and is released before the steps
-        // below: shim creation is several file writes, and post_install can shell out
-        // to PowerShell for seconds, neither of which should be serialised.
-        {
-            let _guard = session.write_lock()?;
-            link_current(&version_dir, &app_dir)?;
-        }
-        let current_dir = app_dir.join("current");
-
-        // 5. Create shims
-        apply_shims(pkg, &current_dir, &shims_dir, &tx, arch)?;
-
-        // 6. Create Start Menu shortcuts
-        if let Some(shortcut_list) = pkg.manifest.resolve_shortcuts(arch) {
-            let entries: Vec<ShortcutEntry> = shortcut_list
-                .iter()
-                .map(|s| ShortcutEntry {
-                    target: s.first().cloned().unwrap_or_default(),
-                    name: s.get(1).cloned().unwrap_or_default(),
-                    arguments: s.get(2).cloned(),
-                    icon: s.get(3).cloned(),
-                })
-                .filter(|e| !e.target.is_empty() && !e.name.is_empty())
-                .collect();
-            if !entries.is_empty() {
-                let warnings = shortcut::create_shortcuts(&entries, &current_dir, false)?;
-                for w in warnings {
-                    let _ = tx.try_send(Event::CommitProgress(format!("⚠ {}", w)));
-                }
-            }
-        }
-
-        // 7. Apply env
-        apply_env(pkg, session, arch, &current_dir)?;
-
-        // 8. Apply persistence.
-        //
-        // Scoop persists after shims/shortcuts/env (lib/install.ps1:66), and still
-        // writes into the *version* directory rather than the junction.
-        apply_persistence(pkg, &version_dir, &persist_root)?;
-
-        // 9. Run post_install
-        if let Some(script_lines) = pkg.manifest.resolve_post_install(arch) {
-            let ctx = script::HookContext::new(
-                &version_dir,
-                &pkg_persist_dir,
-                &version_dir,
-                pkg.version(),
-            );
-            script::run_powershell_script(&script_lines.iter().cloned().collect::<Vec<_>>(), &ctx)?;
-        }
-
-        // IMPORTANT — Scoop ABI contract on `url`:
-        //
-        // Scoop interprets install.json.url as the location of the
-        // package MANIFEST, not the downloaded archive.
-        //
-        // If this field is populated for bucket installs, Scoop's
-        // manifest() function (lib/manifest.ps1) ignores bucket and
-        // attempts to download the URL as JSON — producing the
-        // "Error parsing JSON at <binary-asset-url>" symptom.
-        //
-        // Rule: url is set ONLY for PackageSource::File (URL-sourced
-        // installs).  For bucket installs and for None, url is null.
-        let install_url = match &pkg.source {
-            Some(PackageSource::File(_manifest_url)) => {
-                // TODO: Scoop expects the manifest URL itself here, not
-                // the download asset URL.  Use _manifest_url once the
-                // File-sourced install path is fully implemented.
-                pkg_files.first().map(|f| f.url.clone())
-            }
-            _ => None,
-        };
-
-        let _guard = session.write_lock()?;
-        finalize_installation(pkg, &version_dir, arch, install_url.as_deref())?;
-        drop(_guard);
-
-        let state = InstallState {
-            version: pkg.version().to_owned(),
-            bucket: Some(pkg.bucket().to_owned()),
-            arch: arch.to_string(),
-            held: false,
-            url: install_url,
-        };
-
-        installed.push(Package {
-            ident: pkg.ident.clone(),
-            manifest: pkg.manifest.clone(),
-            source: pkg.source.clone(),
-            status: PackageStatus::Installed(state),
-            // Just committed: the metadata is written by `finalize_installation`.
-            install_failed: false,
-        });
+        let committed = install_one(session, pkg, &pkg_files, arch, &roots, &tx).await?;
+        installed.push(committed);
 
         let _ = tx.try_send(Event::CommitDone(pkg.ident.clone()));
     }
@@ -268,22 +96,341 @@ pub async fn install_packages(
     Ok(installed)
 }
 
-fn apps_dir(session: &Session, pkg: &Package) -> PathBuf {
-    let root = session
-        .config()
-        .root_path
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("apps"));
+/// One package, in a transaction that is rolled back on any error.
+async fn install_one(
+    session: &Session,
+    pkg: &Package,
+    files: &[&DownloadedFile],
+    arch: Arch,
+    roots: &InstallRoots,
+    tx: &flume::Sender<Event>,
+) -> Result<Package> {
+    let app_dir = roots.apps.join(pkg.name());
+    let version_dir = app_dir.join(version_component(pkg));
+    let persist_dir = roots.persist.join(pkg.name());
 
-    root.join("apps").join(pkg.name())
+    if version_dir.exists() {
+        if install_meta::is_installed(&version_dir) {
+            return Err(crate::Error::Domain(
+                rake_domain::Error::PackageAlreadyExists(pkg.name().to_owned()),
+            ));
+        }
+        // A version directory without metadata is what an interrupted install
+        // leaves behind. Scoop purges it (`ensure_none_failed`) rather than
+        // installing on top of it.
+        fs::remove_dir(&version_dir)?;
+    }
+    fs::ensure_dir(&version_dir)?;
+
+    // IMPORTANT — Scoop ABI contract on `url`:
+    //
+    // Scoop interprets install.json.url as the location of the package MANIFEST,
+    // not the downloaded archive. If this field is populated for bucket installs,
+    // Scoop's manifest() function (lib/manifest.ps1) ignores bucket and attempts
+    // to download the URL as JSON — producing the "Error parsing JSON at
+    // <binary-asset-url>" symptom.
+    //
+    // Rule: url is set ONLY for PackageSource::File (URL-sourced installs). For
+    // bucket installs and for None, url is null.
+    let install_url = match &pkg.source {
+        Some(PackageSource::File(_manifest_url)) => files.first().map(|f| f.url.clone()),
+        _ => None,
+    };
+
+    let mut txn = InstallTransaction::new(&version_dir, &app_dir, &roots.shims, &persist_dir);
+
+    match install_steps(
+        session,
+        pkg,
+        files,
+        arch,
+        roots,
+        &mut txn,
+        tx,
+        install_url.as_deref(),
+    )
+    .await
+    {
+        Ok(()) => Ok(Package {
+            ident: pkg.ident.clone(),
+            manifest: pkg.manifest.clone(),
+            source: pkg.source.clone(),
+            status: PackageStatus::Installed(InstallState {
+                version: pkg.version().to_owned(),
+                bucket: Some(pkg.bucket().to_owned()),
+                arch: arch.to_string(),
+                held: false,
+                url: install_url,
+            }),
+            // Just committed: the metadata is written by `finalize_installation`.
+            install_failed: false,
+        }),
+        Err(e) => {
+            txn.rollback();
+            Err(e)
+        }
+    }
 }
 
-fn apps_version_dir(session: &Session, pkg: &Package) -> PathBuf {
-    apps_dir(session, pkg).join(version_component(pkg))
+/// Everything the transaction created, so a failure can undo exactly that.
+///
+/// The version directory is created before this is constructed and removed by
+/// [`InstallTransaction::rollback`]; nothing else is touched until it is
+/// recorded here.
+struct InstallTransaction {
+    version_dir: PathBuf,
+    app_dir: PathBuf,
+    shims_dir: PathBuf,
+    persist_dir: PathBuf,
+    persist_entries: Vec<persist::PersistEntry>,
+    created_shims: Vec<String>,
+    created_shortcuts: Vec<ShortcutEntry>,
+    created_module: Option<PathBuf>,
+    linked_current: bool,
 }
 
-fn version_component(pkg: &Package) -> String {
+impl InstallTransaction {
+    fn new(version_dir: &Path, app_dir: &Path, shims_dir: &Path, persist_dir: &Path) -> Self {
+        Self {
+            version_dir: version_dir.to_path_buf(),
+            app_dir: app_dir.to_path_buf(),
+            shims_dir: shims_dir.to_path_buf(),
+            persist_dir: persist_dir.to_path_buf(),
+            persist_entries: Vec::new(),
+            created_shims: Vec::new(),
+            created_shortcuts: Vec::new(),
+            created_module: None,
+            linked_current: false,
+        }
+    }
+
+    /// Point `apps/<app>/current` at the version directory, or return the
+    /// version directory itself when `no_junction` is set.
+    ///
+    /// The lock covers the junction swap alone: shim creation is several file
+    /// writes and post_install can shell out to PowerShell for seconds, neither
+    /// of which should be serialised.
+    fn activate_current(&mut self, session: &Session) -> Result<PathBuf> {
+        if session.config().no_junction.unwrap_or(false) {
+            return Ok(self.version_dir.clone());
+        }
+
+        {
+            let _guard = session.write_lock()?;
+            link_current(&self.version_dir, &self.app_dir)?;
+        }
+        self.linked_current = true;
+        Ok(self.app_dir.join("current"))
+    }
+
+    /// Undo everything this transaction created. Best effort: every step runs
+    /// even if an earlier one failed, because a rollback that stops halfway
+    /// leaves more behind than one that carries on.
+    ///
+    /// Persist links go first — they live inside the version directory, and
+    /// removing the directory through them would delete the user's data.
+    fn rollback(&mut self) {
+        if !self.persist_entries.is_empty() {
+            let _ = persist::unlink(&self.persist_entries, &self.version_dir);
+        }
+        for name in &self.created_shims {
+            let _ = shim::remove_shim(name, &self.shims_dir);
+        }
+        if !self.created_shortcuts.is_empty() {
+            let _ = shortcut::remove_shortcuts(&self.created_shortcuts, false);
+        }
+        if let Some(module) = &self.created_module {
+            let _ = fs::remove_symlink(module);
+        }
+        if self.linked_current {
+            // `link_current` removed any previous link before creating this one,
+            // so whatever is there now points at *our* version directory.
+            let _ = fs::remove_symlink(&self.app_dir.join("current"));
+        }
+        let _ = fs::remove_dir(&self.version_dir);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn install_steps(
+    session: &Session,
+    pkg: &Package,
+    files: &[&DownloadedFile],
+    arch: Arch,
+    roots: &InstallRoots,
+    txn: &mut InstallTransaction,
+    tx: &flume::Sender<Event>,
+    install_url: Option<&str>,
+) -> Result<()> {
+    let version_dir = txn.version_dir.clone();
+    let persist_dir = txn.persist_dir.clone();
+    let manifest = &pkg.manifest;
+
+    stage_and_extract(session, pkg, files, arch, &version_dir, tx).await?;
+
+    // pre_install runs while the files are in the version directory but before
+    // `current`, shims and persist exist (install.ps1:54).
+    if let Some(lines) = manifest.resolve_pre_install(arch) {
+        run_hook(lines, &version_dir, &persist_dir, pkg.version())?;
+    }
+
+    run_installer(
+        manifest,
+        arch,
+        &version_dir,
+        &persist_dir,
+        pkg.version(),
+        roots,
+        false,
+    )?;
+
+    // `current` before shims/shortcuts/env, so all three reference the junction
+    // rather than the version directory (install.ps1:58).
+    let dir = txn.activate_current(session)?;
+
+    txn.created_shims = apply_shims(manifest, &dir, &roots.shims, tx, arch)?;
+
+    txn.created_shortcuts = apply_shortcuts(manifest, &dir, arch, tx)?;
+
+    txn.created_module = install_psmodule(session, manifest, &dir, roots)?;
+
+    apply_env(manifest, session, arch, &dir)?;
+
+    // Scoop persists *after* env and still writes into the version directory
+    // rather than the junction (install.ps1:66); both names resolve to the same
+    // directory while the junction is in place.
+    txn.persist_entries = apply_persistence(manifest, pkg.name(), &version_dir, &roots.persist)?;
+
+    if let Some(lines) = manifest.resolve_post_install(arch) {
+        run_hook(lines, &version_dir, &persist_dir, pkg.version())?;
+    }
+
+    // The metadata is the commit record: written last, under both spellings so
+    // old and new Scoop can each read what Rake installed.
+    {
+        let _guard = session.write_lock()?;
+        finalize_installation(pkg, &version_dir, arch, install_url)?;
+    }
+
+    Ok(())
+}
+
+/// Stage every artifact in the version directory, then extract the containers.
+///
+/// Mirrors Scoop's `Invoke-ScoopDownload` (lib/download.ps1:23): each cached
+/// file is copied to `<version_dir>\<url_filename>` before anything is
+/// extracted. The copy is not redundant — an `.msi` that references external
+/// cabinets (`msival2`, `orca`, `visualc`) needs the `.cab` files sitting next
+/// to it, and the cache does not keep them together.
+async fn stage_and_extract(
+    session: &Session,
+    pkg: &Package,
+    files: &[&DownloadedFile],
+    arch: Arch,
+    version_dir: &Path,
+    tx: &flume::Sender<Event>,
+) -> Result<()> {
+    for file in files {
+        let dest = version_dir.join(&file.target_filename);
+        if let Some(parent) = dest.parent() {
+            fs::ensure_dir(parent)?;
+        }
+        std::fs::copy(&file.cache_path, &dest)?;
+    }
+
+    let extract_dirs: Vec<String> = pkg
+        .manifest
+        .resolve_extract_dir(arch)
+        .map(|dirs| dirs.as_slice().to_vec())
+        .unwrap_or_default();
+    let extract_tos: Vec<String> = pkg
+        .manifest
+        .resolve_extract_to(arch)
+        .map(|dirs| dirs.as_slice().to_vec())
+        .unwrap_or_default();
+    let innosetup = pkg.manifest.innosetup == Some(true);
+    let archive = NativeArchive::new(session.config().root_path.clone());
+
+    // `extract_dir` / `extract_to` pair with the *extracted* archives, not with
+    // every URL: `Invoke-Extraction` advances a separate `$extracted` counter
+    // only when a file is actually unpacked (lib/decompress.ps1:20,58). A
+    // non-archive in the middle of `url` therefore does not consume an entry.
+    let mut extracted = 0usize;
+    for file in files {
+        let staged = version_dir.join(&file.target_filename);
+        let Some(plan) = extraction_plan(&file.target_filename, innosetup) else {
+            continue;
+        };
+
+        let extract_dir = extract_dirs.get(extracted).map(String::as_str);
+        let target_dir = match normalize_manifest_dir(
+            "extract_to",
+            extract_tos.get(extracted).map(String::as_str),
+        )? {
+            Some(sub) => version_dir.join(sub),
+            None => version_dir.to_path_buf(),
+        };
+        fs::ensure_dir(&target_dir)?;
+
+        let _ = tx.try_send(Event::CommitProgress(format!(
+            "Extracting {} ...",
+            file.target_filename,
+        )));
+
+        match plan {
+            Extraction::Inno => extract_innosetup(
+                &staged,
+                &target_dir,
+                session.config().root_path.as_deref(),
+                extract_dir,
+            )?,
+            Extraction::Archive(format) => {
+                archive
+                    .extract_with(&staged, &target_dir, format, extract_dir)
+                    .await?
+            }
+        }
+
+        // Scoop passes `-Removal` to every extractor: once unpacked, the staged
+        // archive must not end up in the app directory.
+        std::fs::remove_file(&staged)?;
+        extracted += 1;
+    }
+
+    Ok(())
+}
+
+/// How a staged download has to be handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Extraction {
+    /// InnoSetup installer, unpacked with `innounp`.
+    Inno,
+    /// A real archive, unpacked by [`NativeArchive`].
+    Archive(ArchiveFormat),
+}
+
+/// Decide whether a staged file is a container, from its name on disk.
+///
+/// The name is `DownloadedFile::target_filename`, which already honours Scoop's
+/// `#/dl.7z` fragment, because that is what `Invoke-Extraction` switches on
+/// (lib/decompress.ps1:25). A bare `.exe` is only an installer when the
+/// manifest says `innosetup`; otherwise it is payload and stays where it was
+/// copied.
+fn extraction_plan(filename: &str, innosetup: bool) -> Option<Extraction> {
+    if let Some(format) = detect_format(filename) {
+        return Some(Extraction::Archive(format));
+    }
+
+    if innosetup && filename.to_lowercase().ends_with(".exe") {
+        return Some(Extraction::Inno);
+    }
+
+    None
+}
+
+/// The version directory name for a package — `nightly` for nightlies, which
+/// reuse one directory instead of accumulating versions.
+pub(crate) fn version_component(pkg: &Package) -> String {
     if pkg.is_nightly() {
         "nightly".to_owned()
     } else {
@@ -291,42 +438,342 @@ fn version_component(pkg: &Package) -> String {
     }
 }
 
-pub(crate) fn apply_persistence(
-    pkg: &Package,
-    version_dir: &std::path::Path,
-    persist_root: &std::path::Path,
+/// Run a `pre_install` / `post_install` / `*_uninstall` hook standalone.
+fn run_hook(
+    lines: &rake_domain::one_or_many::OneOrMany<String>,
+    version_dir: &Path,
+    persist_dir: &Path,
+    version: &str,
 ) -> Result<()> {
-    if let Some(ref persist_val) = pkg.manifest.persist {
-        let entries = persist::parse_persist(persist_val);
-        let pkg_persist_dir = persist_root.join(pkg.name());
-        if !entries.is_empty() {
-            persist::apply(&entries, version_dir, &pkg_persist_dir)?;
+    let ctx = script::HookContext::new(version_dir, persist_dir, version_dir, version);
+    let body: Vec<String> = lines.iter().cloned().collect();
+    script::run_powershell_script(&body, &ctx)
+}
+
+/// Run `installer` / `uninstaller`, exactly as `Invoke-Installer` does
+/// (assets/scoop/lib/install.ps1:84).
+///
+/// Order matters: the executable runs first and the hook script second. A
+/// `.ps1` executable is invoked inside PowerShell and is never deleted, because
+/// Scoop's `Remove-Item` sits in the `else` branch.
+pub(crate) fn run_installer(
+    manifest: &Manifest,
+    arch: Arch,
+    dir: &Path,
+    persist_dir: &Path,
+    version: &str,
+    roots: &InstallRoots,
+    uninstall: bool,
+) -> Result<()> {
+    let (title, file, args, script_lines, keep) = if uninstall {
+        let Some(spec) = manifest.resolve_uninstaller(arch) else {
+            return Ok(());
+        };
+        (
+            "Uninstaller",
+            spec.file.as_deref(),
+            spec.args.as_ref(),
+            spec.script.as_ref(),
+            false,
+        )
+    } else {
+        let Some(spec) = manifest.resolve_installer(arch) else {
+            return Ok(());
+        };
+        (
+            "Installer",
+            spec.file.as_deref(),
+            spec.args.as_ref(),
+            spec.script.as_ref(),
+            spec.keep.unwrap_or(false),
+        )
+    };
+
+    if file.is_some() || args.is_some() {
+        // The filename is either explicit (`installer.file`) or the name the
+        // first URL downloads to (`url_filename @(url $manifest $architecture)`).
+        let name = file.map(str::to_owned).or_else(|| {
+            manifest
+                .resolve_urls(arch)
+                .first()
+                .map(|url| download::target_filename(url))
+        });
+
+        if let Some(name) = name {
+            let prog = dir.join(&name);
+            if !is_in_dir(dir, &prog) {
+                return Err(crate::Error::Custom(format!(
+                    "Error in manifest: {title} {} is outside the app directory.",
+                    prog.display()
+                )));
+            }
+            if !prog.is_file() {
+                return Err(crate::Error::Custom(format!(
+                    "{title} {} is missing.",
+                    prog.display()
+                )));
+            }
+
+            let fn_args = substitute_args(args, dir, version);
+            if name.to_lowercase().ends_with(".ps1") {
+                // `& $progName @fnArgs` runs in-process, where scoop's library is
+                // already loaded — so the installer can call its functions.
+                run_ps1_installer(&prog, &fn_args, dir, persist_dir, version, roots)?;
+            } else {
+                let status = Command::new(&prog).args(&fn_args).status()?;
+                if !status.success() {
+                    return Err(crate::Error::Custom(if uninstall {
+                        "Uninstallation aborted.".to_owned()
+                    } else {
+                        "Installation aborted. You might need to run 'rake uninstall' \
+                         before trying again."
+                            .to_owned()
+                    }));
+                }
+                // Scoop keeps the installer only when `installer.keep` is true;
+                // the uninstaller spec has no such flag, so it is always removed.
+                if !keep {
+                    std::fs::remove_file(&prog)?;
+                }
+            }
         }
     }
+
+    if let Some(lines) = script_lines {
+        let ctx = script::HookContext::with_scoop_lib(
+            dir,
+            persist_dir,
+            dir,
+            version,
+            &roots.root,
+            &roots.global,
+        );
+        let body: Vec<String> = lines.iter().cloned().collect();
+        script::run_powershell_script(&body, &ctx)?;
+    }
+
     Ok(())
 }
 
+fn run_ps1_installer(
+    prog: &Path,
+    args: &[String],
+    dir: &Path,
+    persist_dir: &Path,
+    version: &str,
+    roots: &InstallRoots,
+) -> Result<()> {
+    let mut line = format!(
+        "& {}",
+        script::quote_powershell_string(&prog.to_string_lossy())
+    );
+    for arg in args {
+        line.push(' ');
+        line.push_str(&script::quote_powershell_string(arg));
+    }
+
+    let ctx = script::HookContext::with_scoop_lib(
+        dir,
+        persist_dir,
+        dir,
+        version,
+        &roots.root,
+        &roots.global,
+    );
+    script::run_powershell_script(&[line], &ctx)
+}
+
+/// `substitute` from lib/core.ps1:1286 for the three keys `Invoke-Installer`
+/// supplies. `$global` is always `False`: rake has no global installs, and
+/// PowerShell renders the boolean that way.
+fn substitute_args(
+    args: Option<&rake_domain::one_or_many::OneOrMany<String>>,
+    dir: &Path,
+    version: &str,
+) -> Vec<String> {
+    let Some(args) = args else {
+        return Vec::new();
+    };
+    let dir = dir.to_string_lossy();
+
+    args.as_slice()
+        .iter()
+        .map(|arg| {
+            arg.replace("$dir", &dir)
+                .replace("$global", "False")
+                .replace("$version", version)
+        })
+        .collect()
+}
+
+pub(crate) fn apply_persistence(
+    manifest: &Manifest,
+    app_name: &str,
+    version_dir: &Path,
+    persist_root: &Path,
+) -> Result<Vec<persist::PersistEntry>> {
+    let Some(persist_val) = manifest.persist.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let entries = persist::parse_persist(persist_val);
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    persist::apply(&entries, version_dir, &persist_root.join(app_name))?;
+    Ok(entries)
+}
+
+/// Create the manifest's `bin` shims and return the names that were written, so
+/// a failed install can take them away again.
 pub(crate) fn apply_shims(
-    pkg: &Package,
-    version_dir: &std::path::Path,
-    shims_dir: &std::path::Path,
+    manifest: &Manifest,
+    dir: &Path,
+    shims_dir: &Path,
     tx: &flume::Sender<Event>,
     arch: Arch,
-) -> Result<()> {
-    if let Some(bin_val) = pkg.manifest.resolve_bin(arch) {
-        let entries = shim::parse_bin(bin_val);
-        for entry in &entries {
-            let _ = tx.try_send(Event::CommitProgress(format!(
-                "Creating shim for '{}'.",
-                entry.name
-            )));
-        }
-        if !entries.is_empty() {
-            fs::ensure_dir(shims_dir)?;
-            shim::create_shims(&entries, version_dir, shims_dir)?;
-        }
+) -> Result<Vec<String>> {
+    let Some(bin_val) = manifest.resolve_bin(arch) else {
+        return Ok(Vec::new());
+    };
+    let entries = shim::parse_bin(bin_val);
+    if entries.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(())
+
+    for entry in &entries {
+        let _ = tx.try_send(Event::CommitProgress(format!(
+            "Creating shim for '{}'.",
+            entry.name
+        )));
+    }
+    fs::ensure_dir(shims_dir)?;
+    shim::create_shims(&entries, dir, shims_dir)
+}
+
+/// Create the manifest's Start Menu shortcuts, returning them for rollback.
+pub(crate) fn apply_shortcuts(
+    manifest: &Manifest,
+    dir: &Path,
+    arch: Arch,
+    tx: &flume::Sender<Event>,
+) -> Result<Vec<ShortcutEntry>> {
+    let Some(list) = manifest.resolve_shortcuts(arch) else {
+        return Ok(Vec::new());
+    };
+    let entries = parse_shortcuts(list);
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let warnings = shortcut::create_shortcuts(&entries, dir, false)?;
+    for w in warnings {
+        let _ = tx.try_send(Event::CommitProgress(format!("⚠ {}", w)));
+    }
+    Ok(entries)
+}
+
+/// `[target, name, arguments, icon]` from a manifest's `shortcuts` array.
+pub(crate) fn parse_shortcuts(list: &[Vec<String>]) -> Vec<ShortcutEntry> {
+    list.iter()
+        .map(|s| ShortcutEntry {
+            target: s.first().cloned().unwrap_or_default(),
+            name: s.get(1).cloned().unwrap_or_default(),
+            arguments: s.get(2).cloned(),
+            icon: s.get(3).cloned(),
+        })
+        .filter(|e| !e.target.is_empty() && !e.name.is_empty())
+        .collect()
+}
+
+/// Link a PowerShell module into `modules/<name>` and make sure that directory
+/// is on `PSModulePath` (lib/psmodules.ps1:1).
+pub(crate) fn install_psmodule(
+    session: &Session,
+    manifest: &Manifest,
+    dir: &Path,
+    roots: &InstallRoots,
+) -> Result<Option<PathBuf>> {
+    let Some(module) = manifest.resolve_psmodule() else {
+        return Ok(None);
+    };
+    let Some(name) = module
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    else {
+        return Err(crate::Error::Custom(
+            "Invalid manifest: The 'name' property is missing from 'psmodule'.".to_owned(),
+        ));
+    };
+    // The name is manifest input and becomes a directory under `modules/`.
+    fs::validate_relative_path("psmodule name", name)?;
+
+    fs::ensure_dir(&roots.modules)?;
+    let link = roots.modules.join(name);
+    if link.exists() || link.is_symlink() {
+        fs::remove_symlink(&link)?;
+    }
+    fs::create_junction(dir, &link)?;
+
+    ensure_psmodule_path(session, &roots.modules)?;
+    Ok(Some(link))
+}
+
+/// Remove the module link an install created, leaving the version directory
+/// alone (lib/psmodules.ps1:27).
+pub(crate) fn uninstall_psmodule(
+    manifest: &Manifest,
+    roots: &InstallRoots,
+) -> Result<Option<PathBuf>> {
+    let Some(module) = manifest.resolve_psmodule() else {
+        return Ok(None);
+    };
+    let Some(name) = module
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    else {
+        return Ok(None);
+    };
+    fs::validate_relative_path("psmodule name", name)?;
+
+    let link = roots.modules.join(name);
+    if link.exists() || link.is_symlink() {
+        fs::remove_symlink(&link)?;
+        return Ok(Some(link));
+    }
+    Ok(None)
+}
+
+/// Add the modules directory to the persisted user `PSModulePath`.
+///
+/// Scoop prepends it and only when the value does not already mention it
+/// (`psmodules.ps1:44`). The value is read from the registry, not from the
+/// process, for the same reason PATH is: the process copy is the merged value
+/// and writing it back would fold the machine-wide entries into the user's own.
+fn ensure_psmodule_path(session: &Session, modules_dir: &Path) -> Result<()> {
+    let dir = modules_dir.to_string_lossy().to_string();
+    let current = env::read_user_env("PSModulePath")?.unwrap_or_else(|| {
+        // Scoop's fallback when the variable does not exist yet. Expanded here
+        // rather than stored as `%USERPROFILE%`, because the value is written
+        // back as a plain string.
+        std::env::var("USERPROFILE")
+            .map(|home| format!(r"{home}\Documents\WindowsPowerShell\Modules"))
+            .unwrap_or_default()
+    });
+
+    if current.to_lowercase().contains(&dir.to_lowercase()) {
+        return Ok(());
+    }
+
+    let value = if current.is_empty() {
+        dir
+    } else {
+        format!("{dir};{current}")
+    };
+    session.env_service().set_env("PSModulePath", &value)
 }
 
 /// Mirror of scoop's `is_in_dir` (lib/core.ps1:695).
@@ -350,13 +797,18 @@ pub(crate) fn is_in_dir(dir: &Path, check: &Path) -> bool {
     check.to_lowercase().starts_with(&prefix)
 }
 
-pub(crate) fn apply_env(pkg: &Package, session: &Session, arch: Arch, dir: &Path) -> Result<()> {
-    if let Some(env_set) = pkg.manifest.resolve_env_set(arch) {
+pub(crate) fn apply_env(
+    manifest: &Manifest,
+    session: &Session,
+    arch: Arch,
+    dir: &Path,
+) -> Result<()> {
+    if let Some(env_set) = manifest.resolve_env_set(arch) {
         for (k, v) in env_set {
             session.env_service().set_env(k, v)?;
         }
     }
-    for path in resolve_env_add_paths(&pkg.manifest, arch, dir) {
+    for path in resolve_env_add_paths(manifest, arch, dir) {
         // Not `EnvService::add_path`: that one reads the *process* PATH and writes the
         // result into HKCU\Environment\PATH, folding every machine-wide entry into the
         // user's own value on each run and downgrading REG_EXPAND_SZ to REG_SZ.
@@ -444,81 +896,6 @@ pub(crate) fn finalize_installation(
     // what Rake installed (see infra::install_meta).
     install_meta::write_install_record(version_dir, install_info)?;
     install_meta::write_installed_manifest(version_dir, &pkg.manifest)?;
-
-    Ok(())
-}
-
-fn apply_extract_dir(
-    pkg: &Package,
-    version_dir: &std::path::Path,
-    arch: Arch,
-    tx: &flume::Sender<Event>,
-) -> Result<()> {
-    let manifest = &pkg.manifest;
-
-    let dirs: Vec<String> = match manifest.resolve_extract_dir(arch) {
-        Some(ed) => ed.clone().into_vec(),
-        None => return Ok(()),
-    };
-
-    for subdir in &dirs {
-        let src = version_dir.join(subdir);
-        if !src.exists() {
-            let _ = tx.try_send(Event::CommitProgress(format!(
-                "⚠ extract_dir '{}' not found under {} — archive layout may not match manifest expectations",
-                subdir,
-                version_dir.display()
-            )));
-            continue;
-        }
-
-        let tmp = version_dir.join(".extract_tmp");
-        fs::ensure_dir(&tmp)?;
-
-        for entry in walkdir::WalkDir::new(&src) {
-            let entry = entry.map_err(std::io::Error::other)?;
-            let relative = entry.path().strip_prefix(&src).unwrap();
-            let target = tmp.join(relative);
-
-            if entry.file_type().is_dir() {
-                fs::ensure_dir(&target)?;
-            } else {
-                if let Some(parent) = target.parent() {
-                    fs::ensure_dir(parent)?;
-                }
-                std::fs::copy(entry.path(), &target)?;
-            }
-        }
-
-        fs::remove_dir(&src)?;
-
-        for entry in walkdir::WalkDir::new(&tmp) {
-            let entry = entry.map_err(std::io::Error::other)?;
-            let relative = entry.path().strip_prefix(&tmp).unwrap();
-            let target = version_dir.join(relative);
-
-            if entry.file_type().is_dir() {
-                fs::ensure_dir(&target)?;
-            } else {
-                if let Some(parent) = target.parent() {
-                    fs::ensure_dir(parent)?;
-                }
-                std::fs::copy(entry.path(), &target)?;
-            }
-        }
-
-        fs::remove_dir(&tmp)?;
-
-        // Clean up empty ancestor directories left behind by extraction
-        let mut parent = src.parent();
-        while let Some(p) = parent {
-            if p == version_dir {
-                break;
-            }
-            let _ = std::fs::remove_dir(p);
-            parent = p.parent();
-        }
-    }
 
     Ok(())
 }

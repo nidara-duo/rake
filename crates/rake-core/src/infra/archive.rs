@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
@@ -17,11 +17,31 @@ pub enum ArchiveFormat {
     Bz2,
     Msi,
     Rar,
+    /// A format only 7-Zip can read (`.zst`, `.lzma`, `.lzh`, `.iso`, `.img`,
+    /// split `.001` volumes). Scoop hands these to `Expand-7zipArchive` through
+    /// `Test-7zipRequirement` (lib/depends.ps1:134), so Rake must too.
+    External7z,
 }
 
+/// Detect an archive format from a file name.
+///
+/// The input is the file's name on disk — for a manifest URL that is
+/// `url_filename(url)`, i.e. the `#/name.ext` fragment when present. This is
+/// exactly what Scoop's `Invoke-Extraction` switches on (`$Name[$i]`,
+/// lib/decompress.ps1:25), so `Setup.exe#/dl.7z` is a 7-Zip archive and a bare
+/// `tool.exe` is not.
+///
+/// Two deliberate omissions, both copied from Scoop:
+/// * `.cab` is **not** an archive. Main-bucket manifests (`msival2`, `orca`,
+///   `visualc`) download `.cab` files next to an `.msi`; `msiexec /a` resolves
+///   external cabinets relative to the `.msi`, so the cabinets have to stay on
+///   disk. Extracting them breaks those packages.
+/// * `.jar` is **not** an archive either. `plantuml` ships a `.jar` that Scoop
+///   copies into the version directory and runs; unzipping it would destroy it.
 pub fn detect_format(path: &str) -> Option<ArchiveFormat> {
     let lower = path.to_lowercase();
     let path = lower.split('?').next().unwrap_or(&lower);
+    // Compound extensions first: `.tar.gz` must not be mistaken for `.gz`.
     if path.ends_with(".zip") || path.ends_with(".nupkg") {
         Some(ArchiveFormat::Zip)
     } else if path.ends_with(".7z") {
@@ -42,10 +62,17 @@ pub fn detect_format(path: &str) -> Option<ArchiveFormat> {
         Some(ArchiveFormat::Bz2)
     } else if path.ends_with(".msi") {
         Some(ArchiveFormat::Msi)
-    } else if path.ends_with(".jar") {
-        Some(ArchiveFormat::Zip)
     } else if path.ends_with(".rar") {
         Some(ArchiveFormat::Rar)
+    } else if path.ends_with(".zst")
+        || path.ends_with(".tzst")
+        || path.ends_with(".lzma")
+        || path.ends_with(".lzh")
+        || path.ends_with(".iso")
+        || path.ends_with(".img")
+        || path.ends_with(".001")
+    {
+        Some(ArchiveFormat::External7z)
     } else {
         None
     }
@@ -101,26 +128,243 @@ impl NativeArchive {
     }
 }
 
-#[async_trait]
-impl ArchiveService for NativeArchive {
-    async fn extract(&self, src: &Path, dest: &Path, format: ArchiveFormat) -> Result<()> {
+impl NativeArchive {
+    /// Extract `src` into `dest`, applying Scoop's `extract_dir` semantics.
+    ///
+    /// `extract_dir` names a directory *inside* the archive whose contents must
+    /// end up directly in `dest`. Scoop does this by extracting into
+    /// `<dest>\_tmp` and then `movedir`-ing `_tmp\<extract_dir>` onto `dest`
+    /// (lib/decompress.ps1:281-296). The move has to merge, not rename: `dest`
+    /// is the version directory, which already holds the other artifacts of the
+    /// package and may be the target of a previous URL.
+    pub async fn extract_with(
+        &self,
+        src: &Path,
+        dest: &Path,
+        format: ArchiveFormat,
+        extract_dir: Option<&str>,
+    ) -> Result<()> {
+        let root = self.root.as_deref();
         match format {
-            ArchiveFormat::Zip => extract_zip(src, dest),
-            ArchiveFormat::SevenZ => extract_7z(src, dest, self.root.as_deref()),
+            ArchiveFormat::Zip => extract_zip(src, dest, extract_dir, root),
+            ArchiveFormat::SevenZ => extract_7z(src, dest, extract_dir, root, false),
+            ArchiveFormat::Rar | ArchiveFormat::External7z => {
+                extract_7z(src, dest, extract_dir, root, true)
+            }
+            ArchiveFormat::Msi => extract_msi(src, dest, extract_dir, root),
             ArchiveFormat::TarGz
             | ArchiveFormat::TarBz2
             | ArchiveFormat::TarXz
-            | ArchiveFormat::Tar => extract_tar(src, dest).await,
-            ArchiveFormat::Gz => extract_gz(src, dest).await,
-            ArchiveFormat::Xz => extract_xz(src, dest).await,
-            ArchiveFormat::Bz2 => extract_bz2(src, dest).await,
-            ArchiveFormat::Msi => extract_msi(src, dest),
-            ArchiveFormat::Rar => extract_rar(src, dest, self.root.as_deref()),
+            | ArchiveFormat::Tar
+            | ArchiveFormat::Gz
+            | ArchiveFormat::Xz
+            | ArchiveFormat::Bz2 => {
+                let staged = StagedExtraction::new(dest, extract_dir)?;
+                match extract_plain(src, &staged.staging, format).await {
+                    Ok(()) => staged.finish(),
+                    Err(native_error) => match find_7z(root) {
+                        Some(helper) => {
+                            tracing::warn!(
+                                "{}: native extraction failed ({native_error}), retrying with 7-Zip",
+                                src.display()
+                            );
+                            staged.reset()?;
+                            run_7z(&helper, src, &staged.staging, None)?;
+                            staged.finish()
+                        }
+                        None => Err(native_error),
+                    },
+                }
+            }
         }
     }
 }
 
-fn extract_zip(src: &Path, dest: &Path) -> Result<()> {
+#[async_trait]
+impl ArchiveService for NativeArchive {
+    async fn extract(&self, src: &Path, dest: &Path, format: ArchiveFormat) -> Result<()> {
+        self.extract_with(src, dest, format, None).await
+    }
+}
+
+async fn extract_plain(src: &Path, dest: &Path, format: ArchiveFormat) -> Result<()> {
+    match format {
+        ArchiveFormat::TarGz
+        | ArchiveFormat::TarBz2
+        | ArchiveFormat::TarXz
+        | ArchiveFormat::Tar => extract_tar(src, dest).await,
+        ArchiveFormat::Gz => extract_gz(src, dest).await,
+        ArchiveFormat::Xz => extract_xz(src, dest).await,
+        ArchiveFormat::Bz2 => extract_bz2(src, dest).await,
+        other => Err(crate::Error::Archive(format!(
+            "extract_plain called with {other:?}"
+        ))),
+    }
+}
+
+/// One extraction destination, plus the `extract_dir` merge that has to follow.
+///
+/// When `extract_dir` is set the archive is unpacked into `<dest>\_tmp` and the
+/// contents of `_tmp\<extract_dir>` are merged into `dest` afterwards. Without
+/// it the archive goes straight into `dest`.
+struct StagedExtraction {
+    staging: PathBuf,
+    dest: PathBuf,
+    extract_dir: Option<String>,
+}
+
+impl StagedExtraction {
+    fn new(dest: &Path, extract_dir: Option<&str>) -> Result<Self> {
+        let extract_dir = normalize_manifest_dir("extract_dir", extract_dir)?;
+        let staging = match extract_dir {
+            Some(_) => dest.join("_tmp"),
+            None => dest.to_path_buf(),
+        };
+        crate::infra::fs::ensure_dir(&staging)?;
+
+        Ok(Self {
+            staging,
+            dest: dest.to_path_buf(),
+            extract_dir,
+        })
+    }
+
+    /// Clear a staging directory that a failed native extractor may have left
+    /// half-written. Never touches `dest` itself, which may already contain
+    /// artifacts from earlier URLs.
+    fn reset(&self) -> Result<()> {
+        if self.extract_dir.is_some() {
+            crate::infra::fs::remove_dir(&self.staging)?;
+            crate::infra::fs::ensure_dir(&self.staging)?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        let Some(dir) = &self.extract_dir else {
+            return Ok(());
+        };
+
+        let result = merge_move(&self.staging.join(dir), &self.dest);
+        // Removes `_tmp` (and the empty ancestors of `extract_dir` with it) even
+        // when the merge failed: a broken archive must not leave `_tmp` inside
+        // the app directory.
+        let _ = crate::infra::fs::remove_dir(&self.staging);
+        result
+    }
+}
+
+/// Normalize a manifest `extract_dir` / `extract_to` value.
+///
+/// Manifests write these with either separator (`PFiles\Gossip\Gossip`,
+/// `bin/tool`), and `Path::join` only understands the platform's own. `"."`
+/// means the destination itself. Absolute paths and `..` are rejected: they are
+/// untrusted manifest input and would move files out of the version directory.
+pub(crate) fn normalize_manifest_dir(field: &str, value: Option<&str>) -> Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+
+    let normalized = value
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .trim_start_matches("./")
+        .to_owned();
+
+    if normalized.is_empty() || normalized == "." {
+        return Ok(None);
+    }
+
+    crate::infra::fs::validate_relative_path(field, &normalized)?;
+    Ok(Some(normalized))
+}
+
+/// Move everything inside `from` into `to`, merging with what is already there.
+///
+/// This is Scoop's `movedir` (`robocopy /e /move`, lib/core.ps1:864). A plain
+/// `fs::rename` cannot replace `to` on Windows when it is an existing
+/// directory, and `to` is the version directory — which always exists and
+/// usually already holds the files of other URLs.
+pub(crate) fn merge_move(from: &Path, to: &Path) -> Result<()> {
+    if !from.exists() {
+        return Err(crate::Error::Io(std::io::Error::other(format!(
+            "extract_dir '{}' not found inside the archive",
+            from.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| from.display().to_string())
+        ))));
+    }
+
+    crate::infra::fs::ensure_dir(to)?;
+
+    for entry in walkdir::WalkDir::new(from).min_depth(1) {
+        let entry = entry.map_err(std::io::Error::other)?;
+        let relative = entry
+            .path()
+            .strip_prefix(from)
+            .map_err(std::io::Error::other)?;
+        let target = to.join(relative);
+
+        if entry.file_type().is_dir() {
+            crate::infra::fs::ensure_dir(&target)?;
+            continue;
+        }
+
+        if let Some(parent) = target.parent() {
+            crate::infra::fs::ensure_dir(parent)?;
+        }
+        // Windows refuses to rename onto an existing read-only file, and a
+        // directory can sit where a file is about to land.
+        if target.is_dir() {
+            crate::infra::fs::remove_dir(&target)?;
+        } else if target.is_file() || target.is_symlink() {
+            std::fs::remove_file(&target)?;
+        }
+
+        match std::fs::rename(entry.path(), &target) {
+            Ok(()) => {}
+            // Different volume, or a handle still open: fall back to a copy.
+            Err(_) => {
+                std::fs::copy(entry.path(), &target)?;
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+    }
+
+    crate::infra::fs::remove_dir(from)?;
+    Ok(())
+}
+
+fn extract_zip(
+    src: &Path,
+    dest: &Path,
+    extract_dir: Option<&str>,
+    root_path: Option<&Path>,
+) -> Result<()> {
+    let staged = StagedExtraction::new(dest, extract_dir)?;
+
+    match extract_zip_native(src, &staged.staging) {
+        Ok(()) => staged.finish(),
+        Err(native_error) => {
+            // A zip the `zip` crate rejects (ZIP64 oddities, exotic compression
+            // methods) is still readable by 7-Zip. Scoop reaches for 7-Zip for
+            // every `.zip` when the helper is installed for exactly this reason.
+            let Some(helper) = find_7z(root_path) else {
+                return Err(native_error);
+            };
+
+            tracing::warn!(
+                "{}: native unzip failed ({native_error}), retrying with 7-Zip",
+                src.display()
+            );
+            staged.reset()?;
+            run_7z(&helper, src, &staged.staging, None)?;
+            staged.finish()
+        }
+    }
+}
+
+fn extract_zip_native(src: &Path, dest: &Path) -> Result<()> {
     let file = std::fs::File::open(src)?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| crate::Error::Archive(format!("zip: {}", e)))?;
@@ -151,53 +395,70 @@ fn extract_zip(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Extract a `.7z` archive, including self-extracting `.7z.exe` (SFX)
-/// archives such as Git for Windows' PortableGit installer (identified
-/// via a manifest URL's `#/name.7z` fragment — see
-/// [`detect_format_for_url`]).
+/// Extract a `.7z` archive, including self-extracting `.7z.exe` (SFX) archives
+/// such as Git for Windows' PortableGit installer — which is why a manifest URL
+/// carries `#/dl.7z`: the fragment renames the download to something
+/// [`detect_format`] recognises as a 7-Zip archive.
 ///
-/// Prefers the external `7z` tool when available: 7-Zip's own archive
-/// engine transparently locates 7z data embedded after an SFX stub,
-/// which the pure-Rust `sevenz-rust2` crate is not guaranteed to do.
-/// Falls back to `sevenz-rust2` only when no external 7z tool is
-/// installed — this still correctly handles plain, non-SFX `.7z`
-/// files, just not self-extracting ones.
-fn extract_7z(src: &Path, dest: &Path, root_path: Option<&Path>) -> Result<()> {
-    // Find 7-Zip under as many aliases as Scoop/Rake install it under:
-    //   - `7zip`   — the actual Scoop app name (most common)
-    //   - `7z`     — what `rake install 7zip` is colloquially called
-    //   - `7-Zip`  — the upstream product name (normalised to `7zip` in find_helper)
-    // The previous code only tried `7z` and `7-Zip` with root_path=None,
-    // so it never looked under `<root>/apps/7zip/current/7z.exe` and
-    // silently fell through to sevenz-rust2, which cannot handle SFX
-    // `.7z.exe` archives (e.g. Git for Windows PortableGit).
-    let helper = find_helper("7zip", root_path)
-        .or_else(|| find_helper("7z", root_path))
-        .or_else(|| find_helper("7-Zip", root_path));
+/// `external_only` is set for formats no Rust crate handles (`.rar`, `.zst`,
+/// `.lzma`, `.iso`, …). Those fail with an actionable message instead of a
+/// misleading "BadSignature" from a native parser.
+fn extract_7z(
+    src: &Path,
+    dest: &Path,
+    extract_dir: Option<&str>,
+    root_path: Option<&Path>,
+    external_only: bool,
+) -> Result<()> {
+    let staged = StagedExtraction::new(dest, extract_dir)?;
 
-    if let Some(helper) = helper {
-        crate::infra::fs::ensure_dir(dest)?;
-        let status = std::process::Command::new(&helper)
-            .args([
-                "x",
-                &src.to_string_lossy(),
-                &format!("-o{}", dest.display()),
-                "-y",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| crate::Error::Io(std::io::Error::other(format!("7z: {e}"))))?;
+    if let Some(helper) = find_7z(root_path) {
+        run_7z(&helper, src, &staged.staging, staged.extract_dir.as_deref())?;
+        return staged.finish();
+    }
 
-        if status.success() {
-            return Ok(());
-        }
+    if external_only {
+        return Err(crate::Error::Io(std::io::Error::other(format!(
+            "{} requires 7-Zip — run 'rake install 7zip' first",
+            src.display()
+        ))));
+    }
 
-        // External 7-Zip ran but failed. Surface this rather than silently
-        // falling back to sevenz-rust2: for an SFX archive the fallback
-        // will fail anyway with a misleading `BadSignature([MZ…])`, and
-        // the external tool's stderr (which it printed itself) is the
-        // actually-useful diagnostic.
+    // No external 7-Zip available — pure-Rust fallback. This handles plain,
+    // non-SFX `.7z` files; for SFX archives it will fail, and the user should
+    // `rake install 7zip` (see rake checkup).
+    sevenz_rust2::decompress_file(src, &staged.staging)
+        .map_err(|e| crate::Error::Archive(format!("7z: {e}")))?;
+    staged.finish()
+}
+
+/// Run 7-Zip's `x` command into `dest`.
+///
+/// `-ir!<extract_dir>\*` narrows the extraction to the requested subtree, the
+/// same switch Scoop passes (lib/decompress.ps1:97). `-xr!*.nsis` drops the
+/// NSIS payload that some SFX archives carry, also matching Scoop.
+fn run_7z(helper: &Path, src: &Path, dest: &Path, extract_dir: Option<&str>) -> Result<()> {
+    crate::infra::fs::ensure_dir(dest)?;
+
+    let mut args: Vec<String> = vec![
+        "x".to_owned(),
+        src.to_string_lossy().into_owned(),
+        format!("-o{}", dest.display()),
+        "-xr!*.nsis".to_owned(),
+        "-y".to_owned(),
+    ];
+    if let Some(dir) = extract_dir {
+        args.push(format!("-ir!{}\\*", dir.replace('/', "\\")));
+    }
+
+    let status = std::process::Command::new(helper)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| crate::Error::Io(std::io::Error::other(format!("7z: {e}"))))?;
+
+    if !status.success() {
         return Err(crate::Error::Io(std::io::Error::other(format!(
             "7z exited with {:?} (using {})",
             status.code(),
@@ -205,10 +466,13 @@ fn extract_7z(src: &Path, dest: &Path, root_path: Option<&Path>) -> Result<()> {
         ))));
     }
 
-    // No external 7-Zip available — pure-Rust fallback. This handles
-    // plain, non-SFX `.7z` files; for SFX archives it will fail, and the
-    // user should `rake install 7zip` (see rake checkup).
-    sevenz_rust2::decompress_file(src, dest).map_err(|e| crate::Error::Archive(format!("7z: {e}")))
+    Ok(())
+}
+
+fn find_7z(root_path: Option<&Path>) -> Option<PathBuf> {
+    find_helper("7zip", root_path)
+        .or_else(|| find_helper("7z", root_path))
+        .or_else(|| find_helper("7-Zip", root_path))
 }
 
 async fn extract_tar(src: &Path, dest: &Path) -> Result<()> {
@@ -220,10 +484,10 @@ async fn extract_tar(src: &Path, dest: &Path) -> Result<()> {
             Some("gz") | Some("tgz") => Box::new(tokio::io::BufReader::new(
                 async_compression::tokio::bufread::GzipDecoder::new(reader),
             )),
-            Some("bz2") => Box::new(tokio::io::BufReader::new(
+            Some("bz2") | Some("tbz") | Some("tbz2") => Box::new(tokio::io::BufReader::new(
                 async_compression::tokio::bufread::BzDecoder::new(reader),
             )),
-            Some("xz") => Box::new(tokio::io::BufReader::new(
+            Some("xz") | Some("txz") => Box::new(tokio::io::BufReader::new(
                 async_compression::tokio::bufread::XzDecoder::new(reader),
             )),
             _ => Box::new(reader),
@@ -292,75 +556,82 @@ async fn extract_bz2(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn extract_rar(src: &Path, dest: &Path, root_path: Option<&Path>) -> Result<()> {
-    // For .rar files, use external 7z or unrar helper
-    // (no pure-Rust RAR library that handles modern RAR5)
-    let helper = find_helper("7zip", root_path)
-        .or_else(|| find_helper("7z", root_path))
-        .or_else(|| find_helper("7-Zip", root_path))
-        .or_else(|| find_helper("unrar", root_path))
-        .ok_or_else(|| {
-            crate::Error::Io(std::io::Error::other(
-                "RAR extraction requires 7z or unrar — run 'rake install 7zip' first",
-            ))
-        })?;
-
-    let status = std::process::Command::new(&helper)
-        .args([
-            "x",
-            &src.to_string_lossy(),
-            &format!("-o{}", dest.display()),
-            "-y",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| crate::Error::Io(std::io::Error::other(format!("rar: {e}"))))?;
-
-    if !status.success() {
-        return Err(crate::Error::Io(std::io::Error::other(
-            "RAR extraction failed",
-        )));
-    }
-
-    Ok(())
-}
-
 #[cfg(windows)]
-fn extract_msi(src: &Path, dest: &Path) -> crate::Result<()> {
-    let tmp = dest.join("_msi_tmp");
-    crate::infra::fs::ensure_dir(&tmp)?;
+fn extract_msi(
+    src: &Path,
+    dest: &Path,
+    extract_dir: Option<&str>,
+    root_path: Option<&Path>,
+) -> crate::Result<()> {
+    // Scoop's Expand-MsiArchive (lib/decompress.ps1:169-225) always stages the
+    // extraction and then moves the payload out, because `msiexec /a` insists
+    // on writing a `SourceDir` tree:
+    //   * with `extract_dir`, stage into `<dest>\_tmp` and move `_tmp\SourceDir\<dir>`;
+    //   * without it, move `_tmp\SourceDir` itself up into `dest`.
+    // The move must merge: `dest` is the version directory, which already holds
+    // the other downloads of this package.
+    let staging = dest.join("_msi_tmp");
+    crate::infra::fs::remove_dir(&staging)?;
+    crate::infra::fs::ensure_dir(&staging)?;
 
-    let status = std::process::Command::new("msiexec")
-        .args([
-            "/a",
-            &src.to_string_lossy(),
-            "/qn",
-            &format!(r"TARGETDIR={}\SourceDir", tmp.display()),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| crate::Error::Io(std::io::Error::other(format!("msiexec: {e}"))))?;
+    let target_dir = staging.join("SourceDir");
+    let extracted = match find_helper("lessmsi", root_path) {
+        Some(lessmsi) => std::process::Command::new(&lessmsi)
+            .args([
+                "x",
+                &src.to_string_lossy(),
+                &format!("{}\\", staging.display()),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| crate::Error::Io(std::io::Error::other(format!("lessmsi: {e}"))))?,
+        None => std::process::Command::new("msiexec")
+            .args([
+                "/a",
+                &src.to_string_lossy(),
+                "/qn",
+                &format!("TARGETDIR={}", target_dir.display()),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| crate::Error::Io(std::io::Error::other(format!("msiexec: {e}"))))?,
+    };
 
-    if !status.success() {
-        let _ = crate::infra::fs::remove_dir(&tmp);
+    if !extracted.success() {
+        let _ = crate::infra::fs::remove_dir(&staging);
         return Err(crate::Error::Io(std::io::Error::other(
-            "msiexec extraction failed",
+            "MSI extraction failed (needs lessmsi or msiexec)",
         )));
     }
 
-    let source_dir = tmp.join("SourceDir");
-    if source_dir.exists() {
-        crate::infra::fs::copy_dir(&source_dir, dest)?;
-    }
+    // lessmsi writes the payload straight into `staging`; msiexec nests it in
+    // `SourceDir`. Both shapes exist, so pick whichever appeared.
+    let payload = if target_dir.is_dir() {
+        target_dir
+    } else {
+        staging.clone()
+    };
 
-    crate::infra::fs::remove_dir(&tmp)?;
-    Ok(())
+    let result = match normalize_manifest_dir("extract_dir", extract_dir)? {
+        Some(dir) => merge_move(&payload.join(dir), dest),
+        None => merge_move(&payload, dest),
+    };
+
+    // `_msi_tmp` also swallows an extracted copy of the .msi itself when the
+    // staging directory is the destination (Scoop does the same cleanup).
+    let _ = crate::infra::fs::remove_dir(&staging);
+    result
 }
 
 #[cfg(unix)]
-fn extract_msi(_src: &Path, _dest: &Path) -> crate::Result<()> {
+fn extract_msi(
+    _src: &Path,
+    _dest: &Path,
+    _extract_dir: Option<&str>,
+    _root_path: Option<&Path>,
+) -> crate::Result<()> {
     Err(crate::Error::Io(std::io::Error::other(
         "MSI extraction is not supported on this platform",
     )))
@@ -577,6 +848,10 @@ fn find_helper(name: &str, root_path: Option<&Path>) -> Option<std::path::PathBu
 
     // First, look in actual root_path if provided
     if let Some(root) = root_path {
+        // Scoop puts a shim for every helper in `<root>\shims`, so a helper
+        // that is on PATH only through Scoop is found here even when the
+        // process PATH has not been refreshed.
+        candidates.push(root.join("shims").join(&exe_name));
         candidates.push(root.join("apps").join(name).join("current").join(&exe_name));
         // Also try windows-capitalized form (7-Zip → 7zip)
         let normalized = name.to_lowercase().replace(['-', ' '], "");
@@ -655,7 +930,7 @@ mod extraction_tests {
         let dest = tmp.path().join("out");
         write_zip(&src, &[("app.exe", b"binary"), ("readme.txt", b"hello")]);
 
-        extract_zip(&src, &dest).unwrap();
+        extract_zip(&src, &dest, None, None).unwrap();
 
         assert_eq!(std::fs::read(dest.join("app.exe")).unwrap(), b"binary");
         assert_eq!(std::fs::read(dest.join("readme.txt")).unwrap(), b"hello");
@@ -675,7 +950,7 @@ mod extraction_tests {
             ],
         );
 
-        extract_zip(&src, &dest).unwrap();
+        extract_zip(&src, &dest, None, None).unwrap();
 
         assert_eq!(std::fs::read(dest.join("bin/tool/deep.txt")).unwrap(), b"x");
     }
@@ -700,7 +975,7 @@ mod extraction_tests {
             let src = tmp.path().join("evil.zip");
             write_zip(&src, &[(evil, b"pwned"), ("safe.txt", b"ok")]);
 
-            extract_zip(&src, &dest).unwrap();
+            extract_zip(&src, &dest, None, None).unwrap();
 
             assert!(
                 !dest.parent().unwrap().join("escaped.txt").exists(),
@@ -730,7 +1005,7 @@ mod extraction_tests {
         };
         write_zip(&src, &[(absolute, b"pwned"), ("safe.txt", b"ok")]);
 
-        extract_zip(&src, &dest).unwrap();
+        extract_zip(&src, &dest, None, None).unwrap();
 
         assert!(
             !Path::new(absolute).exists(),
@@ -833,6 +1108,154 @@ mod extraction_tests {
     /// And the deeper form, plus a check that ordinary entries in the same archive
     /// still extract — so this cannot pass by the whole archive being rejected.
     #[tokio::test]
+    async fn extract_dir_merges_into_an_existing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in.zip");
+        let dest = tmp.path().join("version");
+        std::fs::create_dir_all(&dest).unwrap();
+        // What a previous URL of the same package already put there.
+        std::fs::write(dest.join("first.txt"), b"from another url").unwrap();
+
+        write_zip(
+            &src,
+            &[
+                ("nested/inner/tool.exe", b"binary"),
+                ("nested/inner/share/readme.txt", b"hello"),
+                ("unrelated.txt", b"must not be kept"),
+            ],
+        );
+
+        NativeArchive::new(None)
+            .extract_with(&src, &dest, ArchiveFormat::Zip, Some("nested/inner"))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(dest.join("tool.exe")).unwrap(), b"binary");
+        assert_eq!(
+            std::fs::read(dest.join("share/readme.txt")).unwrap(),
+            b"hello"
+        );
+        assert!(
+            !dest.join("unrelated.txt").exists(),
+            "only the contents of extract_dir belong in the version directory"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("first.txt")).unwrap(),
+            b"from another url",
+            "the merge must not wipe files that were already there"
+        );
+        assert!(!dest.join("_tmp").exists(), "_tmp must be removed");
+        assert!(
+            !dest.join("nested").exists(),
+            "the extract_dir path must not survive the move"
+        );
+    }
+
+    /// Manifests write `extract_dir` with either separator; `PFiles\Gossip\Gossip`
+    /// is the real spelling in `extras/gossip.json`.
+    #[tokio::test]
+    async fn extract_dir_accepts_backslash_separators() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in.zip");
+        let dest = tmp.path().join("version");
+        write_zip(&src, &[("nested/inner/tool.exe", b"binary")]);
+
+        NativeArchive::new(None)
+            .extract_with(&src, &dest, ArchiveFormat::Zip, Some(r"nested\inner"))
+            .await
+            .unwrap();
+
+        assert!(dest.join("tool.exe").is_file());
+        assert!(!dest.join("_tmp").exists());
+    }
+
+    /// A manifest that names a directory the archive does not contain is broken,
+    /// and silently leaving the files nested one level too deep would produce an
+    /// app whose `bin` does not exist. Scoop aborts on `movedir`'s robocopy
+    /// error; so does this.
+    #[tokio::test]
+    async fn a_missing_extract_dir_is_an_error_and_leaves_no_tmp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in.zip");
+        let dest = tmp.path().join("version");
+        write_zip(&src, &[("elsewhere/tool.exe", b"binary")]);
+
+        let err = NativeArchive::new(None)
+            .extract_with(&src, &dest, ArchiveFormat::Zip, Some("nested/inner"))
+            .await
+            .expect_err("a missing extract_dir must fail the extraction");
+
+        assert!(
+            err.to_string().contains("not found"),
+            "the error should name the missing directory, got: {err}"
+        );
+        assert!(!dest.join("_tmp").exists(), "_tmp must be cleaned up");
+    }
+
+    /// `extract_dir` is manifest input; it must not be able to move files out of
+    /// the version directory.
+    #[tokio::test]
+    async fn an_extract_dir_escaping_the_destination_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("in.zip");
+        let dest = tmp.path().join("version");
+        write_zip(&src, &[("tool.exe", b"binary")]);
+
+        for evil in ["../escape", r"..\..\Windows", "C:\\Windows"] {
+            assert!(
+                NativeArchive::new(None)
+                    .extract_with(&src, &dest, ArchiveFormat::Zip, Some(evil))
+                    .await
+                    .is_err(),
+                "{evil:?} must be refused"
+            );
+        }
+    }
+
+    /// Two archives into the same destination, the second with its own
+    /// `extract_dir`: the first merge must not be undone by the second.
+    #[tokio::test]
+    async fn consecutive_extractions_accumulate_in_one_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("version");
+        let first = tmp.path().join("first.zip");
+        let second = tmp.path().join("second.zip");
+        write_zip(&first, &[("one/a.txt", b"a")]);
+        write_zip(&second, &[("two/b.txt", b"b")]);
+
+        let archive = NativeArchive::new(None);
+        archive
+            .extract_with(&first, &dest, ArchiveFormat::Zip, Some("one"))
+            .await
+            .unwrap();
+        archive
+            .extract_with(&second, &dest, ArchiveFormat::Zip, Some("two"))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dest.join("b.txt")).unwrap(), b"b");
+    }
+
+    /// The merge replaces a file that exists in both trees, the way
+    /// `robocopy /e /move` does.
+    #[test]
+    fn merge_move_replaces_colliding_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(from.join("same.txt"), b"new").unwrap();
+        std::fs::write(to.join("same.txt"), b"old").unwrap();
+
+        merge_move(&from, &to).unwrap();
+
+        assert_eq!(std::fs::read(to.join("same.txt")).unwrap(), b"new");
+        assert!(!from.exists(), "the source directory is consumed");
+    }
+
+    #[tokio::test]
     async fn deep_tar_traversal_is_refused_while_ordinary_entries_extract() {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("out");
@@ -883,6 +1306,55 @@ mod format_detection_tests {
     fn returns_none_for_unrecognized_extension() {
         let url = "https://example.com/tool-1.0.0.exe";
         assert_eq!(detect_format_for_url(url), None);
+    }
+
+    /// `Invoke-Extraction` switches on the file name in the version directory,
+    /// i.e. `url_filename(url)` — the `#/name` fragment wins over the remote
+    /// name. This is the pair that decides how `Setup.exe#/dl.7z` is unpacked.
+    #[test]
+    fn detection_uses_the_renamed_target_not_the_remote_extension() {
+        assert_eq!(detect_format("dl.7z"), Some(ArchiveFormat::SevenZ));
+        assert_eq!(
+            detect_format("Setup.exe"),
+            None,
+            "a bare .exe is payload unless the manifest sets innosetup"
+        );
+        assert_eq!(detect_format("app-win64.exe"), None);
+    }
+
+    #[test]
+    fn nupkg_is_a_zip() {
+        assert_eq!(detect_format("package.nupkg"), Some(ArchiveFormat::Zip));
+    }
+
+    /// Scoop copies both of these, and extracting either breaks a real package:
+    /// `.cab` files belong next to the `.msi` that references them (`msival2`,
+    /// `orca`, `visualc`), and `plantuml` ships a runnable `.jar`.
+    #[test]
+    fn cab_and_jar_are_payload_not_archives() {
+        assert_eq!(detect_format("8e4755178e6b5bcba8d3538c3630b7a5.cab"), None);
+        assert_eq!(detect_format("plantuml.jar"), None);
+    }
+
+    /// `Test-7zipRequirement` (lib/depends.ps1:134) routes these to 7-Zip, and
+    /// no Rust crate reads them.
+    #[test]
+    fn formats_only_seven_zip_reads_are_marked_external() {
+        for name in [
+            "tool.zst",
+            "archive.tar.zst",
+            "tool.lzma",
+            "tool.lzh",
+            "image.iso",
+            "image.img",
+            "archive.7z.001",
+        ] {
+            assert_eq!(
+                detect_format(name),
+                Some(ArchiveFormat::External7z),
+                "{name} needs 7-Zip"
+            );
+        }
     }
 }
 

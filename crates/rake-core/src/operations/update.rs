@@ -1,14 +1,13 @@
-use std::collections::HashSet;
-
-use std::path::PathBuf;
+use std::path::Path;
 
 use rake_domain::arch::Arch;
-use rake_domain::package::Package;
+use rake_domain::manifest::Manifest;
+use rake_domain::package::{Package, PackageStatus};
 
 use crate::Result;
 use crate::event::{BucketState, Event};
 use crate::infra::git::GitService;
-use crate::infra::{fs, persist, script, shim, shortcut};
+use crate::infra::{fs, install_meta, persist, script, shim, shortcut};
 use crate::operations::bucket;
 use crate::operations::download::DownloadedFile;
 use crate::operations::install;
@@ -274,16 +273,9 @@ pub async fn bucket_update(session: &Session) -> Result<BucketSyncReport> {
 }
 
 pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<Vec<Package>> {
-    let mut updated = Vec::new();
-    let root = session
-        .config()
-        .root_path
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("apps"));
-    let shims_dir = root.join("shims");
-    let persist_root = root.join("persist");
+    let roots = install::InstallRoots::from_session(session);
     let tx = session.event_bus().core_sender();
+    let mut updated = Vec::new();
 
     for spec in specs {
         let _ = tx.try_send(Event::UpdateStart(
@@ -292,179 +284,332 @@ pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<
             spec.candidate.version().to_owned(),
         ));
 
-        let app_dir = root.join("apps").join(spec.installed.name());
-        let old_version_str = if spec.installed.is_nightly() {
-            "nightly".to_owned()
-        } else {
-            spec.installed.version().to_owned()
-        };
-        let old_version_dir = app_dir.join(&old_version_str);
-        let old_manifest = spec.installed.manifest.clone();
-        let pkg_persist_dir = persist_root.join(spec.installed.name());
-
-        let same_version = spec.installed.version() == spec.candidate.version();
-        let temp_backup_dir = if same_version && old_version_dir.exists() {
-            let backup = app_dir.join(format!("{old_version_str}_updating_old"));
-            let _ = std::fs::rename(&old_version_dir, &backup);
-            Some(backup)
-        } else {
-            None
-        };
-        let old_version_dir_for_scripts = temp_backup_dir.as_ref().unwrap_or(&old_version_dir);
-
-        // --- STEP A: install the NEW version first. If this fails the old install is
-        // UNTOUCHED (not one file of it has been modified), so the package is simply
-        // skipped and the batch continues. ---
-        let _ = tx.try_send(Event::UpdateProgress(
-            "Installing new version...".to_owned(),
-        ));
-
-        let install_result = install::install_packages(
-            session,
-            std::slice::from_ref(&spec.candidate),
-            &spec.downloaded,
-            spec.arch,
-        )
-        .await;
-
-        if let Err(e) = &install_result {
-            if let Some(ref backup) = temp_backup_dir {
-                let _ = std::fs::rename(backup, &old_version_dir);
+        // Everything is already downloaded (the caller drops specs whose
+        // download failed), so nothing here can leave the old version touched
+        // because of a network problem.
+        match update_one(session, spec, &roots, &tx).await {
+            Ok(pkg) => {
+                let _ = tx.try_send(Event::UpdateDone(pkg.ident.clone()));
+                updated.push(pkg);
             }
-            let _ = tx.try_send(Event::UpdateProgress(format!(
-                "Failed to install new version, keeping old version intact: {e}"
-            )));
-            continue;
-        }
-
-        let mut installed_new = install_result?;
-
-        let installed_new = match installed_new.pop() {
-            Some(pkg) => pkg,
-            None => {
-                let _ = tx.try_send(Event::UpdateProgress(
-                    "Install produced no package, keeping old version intact.".to_owned(),
-                ));
-                if let Some(ref backup) = temp_backup_dir {
-                    let _ = std::fs::rename(backup, &old_version_dir);
-                }
-                continue;
-            }
-        };
-
-        // --- STEP B: the point of no return has been passed — the new version is ALIVE
-        // and `current` already points at it (install_packages does this via
-        // link_current). It is now safe to tear down whatever the old version left
-        // behind that the new one did not take over. ---
-
-        // B1. pre_uninstall script of the OLD version (best effort, never blocks)
-        if let Some(script_lines) = old_manifest.resolve_pre_uninstall(spec.arch) {
-            let ctx = script::HookContext::new(
-                old_version_dir_for_scripts,
-                &pkg_persist_dir,
-                old_version_dir_for_scripts,
-                spec.installed.version(),
-            );
-            let _ = script::run_powershell_script(
-                &script_lines.iter().cloned().collect::<Vec<_>>(),
-                &ctx,
-            );
-        }
-
-        // B2. Drop ORPHANED shims: those the old manifest declared and the new one does
-        // not. When the new version ships the same binary, install_packages has already
-        // rewritten the shim with its new target, so there is nothing left to do.
-        if let Some(old_bin_val) = old_manifest.resolve_bin(spec.arch) {
-            let old_entries = shim::parse_bin(old_bin_val);
-            let new_bin_val = installed_new.manifest.resolve_bin(spec.arch);
-            let new_names: HashSet<String> = new_bin_val
-                .map(|b| {
-                    shim::parse_bin(b)
-                        .iter()
-                        .map(|e| e.name.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            let orphaned: Vec<_> = old_entries
-                .into_iter()
-                .filter(|e| !new_names.contains(&e.name))
-                .collect();
-            if !orphaned.is_empty() {
-                let _ = shim::remove_shims(&orphaned, &shims_dir);
+            Err(e) => {
+                // The old version has been put back by `update_one`; one package
+                // failing must not abandon the rest of the batch.
+                let _ = tx.try_send(Event::UpdateProgress(format!(
+                    "Failed to update '{}', keeping the old version: {e}",
+                    spec.candidate.name()
+                )));
             }
         }
-
-        // B3. Drop environment variables of the old version that the new one lacks.
-        if let Some(old_env) = old_manifest.resolve_env_set(spec.arch) {
-            let new_env = installed_new.manifest.resolve_env_set(spec.arch);
-            for k in old_env.keys() {
-                let still_present = new_env.is_some_and(|m| m.contains_key(k));
-                if !still_present {
-                    let _ = session.env_service().remove_env(k);
-                }
-            }
-        }
-        // B3b. Drop from PATH whatever the old manifest added.
-        //
-        // Goes through install's shared resolver so the entry removed is exactly the
-        // one that was added. The previous code took the raw manifest string ("bin")
-        // and tried to remove that from PATH, which can never match: installation puts
-        // the resolved "<apps>/<name>/current/bin" there instead.
-        install::remove_env_add_paths(&old_manifest, spec.arch, &app_dir.join("current"));
-
-        // B4. Drop the old version's shortcuts (install_packages has already created the
-        // new version's: same name overwrites, a different name is simply added, and only
-        // the leftover one still needs removing).
-        if let Some(old_shortcuts) = old_manifest.resolve_shortcuts(spec.arch) {
-            let entries: Vec<shortcut::ShortcutEntry> = old_shortcuts
-                .iter()
-                .map(|s| shortcut::ShortcutEntry {
-                    target: s.first().cloned().unwrap_or_default(),
-                    name: s.get(1).cloned().unwrap_or_default(),
-                    arguments: s.get(2).cloned(),
-                    icon: s.get(3).cloned(),
-                })
-                .filter(|e| !e.target.is_empty() && !e.name.is_empty())
-                .collect();
-            if !entries.is_empty() {
-                let _ = shortcut::remove_shortcuts(&entries, false);
-            }
-        }
-
-        // B5. Unlink the old version's persist entries. The persist root is shared
-        // across versions, so the stored data is left alone; only the junction pointing
-        // into the old version directory has to go before that directory is removed.
-        if let Some(ref persist_val) = old_manifest.persist {
-            let entries = persist::parse_persist(persist_val);
-            let _ = persist::unlink(&entries, old_version_dir_for_scripts);
-        }
-
-        // B6. post_uninstall script of the OLD version (best effort)
-        if let Some(script_lines) = old_manifest.resolve_post_uninstall(spec.arch) {
-            let ctx = script::HookContext::new(
-                old_version_dir_for_scripts,
-                &pkg_persist_dir,
-                old_version_dir_for_scripts,
-                spec.installed.version(),
-            );
-            let _ = script::run_powershell_script(
-                &script_lines.iter().cloned().collect::<Vec<_>>(),
-                &ctx,
-            );
-        }
-
-        // B7. Remove the old version directory (or temp_backup_dir, if one was made).
-        if let Some(ref backup) = temp_backup_dir {
-            let _ = std::fs::rename(backup, app_dir.join(format!("{old_version_str}_old")));
-        } else if old_version_dir.exists() {
-            let _ = fs::remove_dir(&old_version_dir);
-        }
-
-        let _ = tx.try_send(Event::UpdateDone(installed_new.ident.clone()));
-        updated.push(installed_new);
     }
 
     Ok(updated)
+}
+
+/// Update one package: deactivate the old version, install the new one, then
+/// carry the old version's `hold` flag over.
+///
+/// Deactivation happens **before** the install, not after. It is what makes the
+/// install honest: the old shims, shortcuts and `current` are gone before the
+/// new version claims them, so a failure cannot leave two versions fighting over
+/// the same names. The old version directory itself is kept, and its `install.json`
+/// with it.
+async fn update_one(
+    session: &Session,
+    spec: &UpdateSpec,
+    roots: &install::InstallRoots,
+    tx: &flume::Sender<Event>,
+) -> Result<Package> {
+    let app_dir = roots.apps.join(spec.installed.name());
+    let persist_dir = roots.persist.join(spec.installed.name());
+    let old_version = install::version_component(&spec.installed);
+    let new_version = install::version_component(&spec.candidate);
+    let old_dir = app_dir.join(&old_version);
+    let new_dir = app_dir.join(&new_version);
+
+    // `hold` and the manifest come from what is actually on disk. The bucket
+    // copy (`spec.installed.manifest`) may already describe the new version by
+    // the time an update runs, and deactivation has to undo what was installed.
+    let old_record = install_meta::read_install_record(&old_dir).ok().flatten();
+    let held = old_record.as_ref().is_some_and(|r| r.held);
+    let old_manifest = install_meta::read_installed_manifest(&old_dir)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| spec.installed.manifest.clone());
+
+    // A same-version reinstall (`--force`, or any nightly) installs into the
+    // directory the old version occupies, so that directory is moved aside and
+    // put back if the install fails.
+    let backup = if old_dir == new_dir && old_dir.exists() {
+        let backup = app_dir.join(format!("{old_version}.updating"));
+        fs::remove_dir(&backup)?;
+        std::fs::rename(&old_dir, &backup)?;
+        Some(backup)
+    } else {
+        None
+    };
+    let active_old_dir = backup.as_deref().unwrap_or(&old_dir).to_path_buf();
+
+    let _ = tx.try_send(Event::UpdateProgress(
+        "Deactivating old version...".to_owned(),
+    ));
+    if let Err(e) = deactivate_old(
+        session,
+        &old_manifest,
+        spec,
+        &active_old_dir,
+        &app_dir,
+        &persist_dir,
+        roots,
+        tx,
+    ) {
+        // Deactivation stops at the first real failure, so the old version may
+        // still be fully reachable — but it may also have lost its link or its
+        // shims, so put everything back rather than guess.
+        restore_old_version(
+            session,
+            &old_manifest,
+            spec,
+            backup.as_deref(),
+            &old_dir,
+            &app_dir,
+            roots,
+            tx,
+        );
+        return Err(e);
+    }
+
+    let _ = tx.try_send(Event::UpdateProgress(
+        "Installing new version...".to_owned(),
+    ));
+    let installed_new = match install::install_packages(
+        session,
+        std::slice::from_ref(&spec.candidate),
+        &spec.downloaded,
+        spec.arch,
+    )
+    .await
+    {
+        Ok(mut packages) => packages.pop(),
+        Err(e) => {
+            // The install rolled itself back; now put the old version back the
+            // way it was, including the link and the shims that deactivation
+            // removed.
+            restore_old_version(
+                session,
+                &old_manifest,
+                spec,
+                backup.as_deref(),
+                &old_dir,
+                &app_dir,
+                roots,
+                tx,
+            );
+            return Err(e);
+        }
+    };
+
+    let Some(mut installed_new) = installed_new else {
+        restore_old_version(
+            session,
+            &old_manifest,
+            spec,
+            backup.as_deref(),
+            &old_dir,
+            &app_dir,
+            roots,
+            tx,
+        );
+        return Err(crate::Error::Custom(format!(
+            "installing '{}' produced no package",
+            spec.candidate.name()
+        )));
+    };
+
+    // Same-version install succeeded: the moved-aside copy is now stale.
+    if let Some(backup) = backup {
+        let _ = fs::remove_dir(&backup);
+    }
+
+    // `hold` survives an update, including a forced reinstall of the same
+    // version. Written through the record the install just produced so `bucket`,
+    // `architecture` and `url` stay exactly as installed.
+    if held {
+        if let Ok(Some(mut record)) = install_meta::read_install_record(&new_dir) {
+            record.held = true;
+            install_meta::write_install_record(&new_dir, &record)?;
+        }
+        if let PackageStatus::Installed(state) = &mut installed_new.status {
+            state.held = true;
+        }
+    }
+
+    Ok(installed_new)
+}
+
+/// Take the old version out of service, leaving its directory in place.
+///
+/// Mirrors `uninstall_app` (assets/scoop/libexec/scoop-uninstall.ps1), except
+/// that the version directory and its metadata are kept: the point of an update
+/// is that the previous version is still there if the new one turns out worse.
+#[allow(clippy::too_many_arguments)]
+fn deactivate_old(
+    session: &Session,
+    manifest: &Manifest,
+    spec: &UpdateSpec,
+    version_dir: &Path,
+    app_dir: &Path,
+    persist_dir: &Path,
+    roots: &install::InstallRoots,
+    tx: &flume::Sender<Event>,
+) -> Result<()> {
+    let arch = spec.arch;
+
+    // 1. pre_uninstall, best effort: Scoop does not fail an uninstall because a
+    //    notification hook could not run.
+    if let Some(lines) = manifest.resolve_pre_uninstall(arch) {
+        let ctx = script::HookContext::new(
+            version_dir,
+            persist_dir,
+            version_dir,
+            spec.installed.version(),
+        );
+        let body: Vec<String> = lines.iter().cloned().collect();
+        let _ = script::run_powershell_script(&body, &ctx);
+    }
+
+    // 2. The package's own uninstaller. A failure here aborts the update: the
+    //    old version may have half-removed itself, and installing on top of that
+    //    is worse than not updating.
+    install::run_installer(
+        manifest,
+        arch,
+        version_dir,
+        persist_dir,
+        spec.installed.version(),
+        roots,
+        true,
+    )?;
+
+    // 3. Unlink persist before anything else touches the directory. The links
+    //    live inside it, and following one would delete the user's data.
+    if let Some(ref persist_val) = manifest.persist {
+        let entries = persist::parse_persist(persist_val);
+        let _ = persist::unlink(&entries, version_dir);
+    }
+
+    // 4. Shims, shortcuts and the module link the old version owns.
+    if let Some(bin_val) = manifest.resolve_bin(arch) {
+        let entries = shim::parse_bin(bin_val);
+        let _ = shim::remove_shims(&entries, &roots.shims);
+    }
+    if let Some(list) = manifest.resolve_shortcuts(arch) {
+        let entries = install::parse_shortcuts(list);
+        if !entries.is_empty() {
+            let _ = shortcut::remove_shortcuts(&entries, false);
+        }
+    }
+    let _ = install::uninstall_psmodule(manifest, roots);
+
+    // 5. Environment entries the old version added. The new install re-adds its
+    //    own; leaving the old ones behind is how a PATH entry for a version that
+    //    no longer exists survives forever.
+    if let Some(env_set) = manifest.resolve_env_set(arch) {
+        for key in env_set.keys() {
+            let _ = session.env_service().remove_env(key);
+        }
+    }
+    install::remove_env_add_paths(manifest, arch, &app_dir.join("current"));
+
+    // 6. `current` itself. The new install creates it again.
+    if !session.config().no_junction.unwrap_or(false) {
+        let _ = tx.try_send(Event::UpdateProgress("Unlinking current...".to_owned()));
+        fs::remove_symlink(&app_dir.join("current"))?;
+    }
+
+    // 7. post_uninstall, best effort. It still sees the version directory.
+    if let Some(lines) = manifest.resolve_post_uninstall(arch) {
+        let ctx = script::HookContext::new(
+            version_dir,
+            persist_dir,
+            version_dir,
+            spec.installed.version(),
+        );
+        let body: Vec<String> = lines.iter().cloned().collect();
+        let _ = script::run_powershell_script(&body, &ctx);
+    }
+
+    Ok(())
+}
+
+/// Put the old version back into service after a failed install.
+///
+/// Deactivation removed everything that made the old version reachable, so
+/// undoing it means recreating exactly those things — and nothing that would
+/// touch the new version directory, which the failed install already removed.
+#[allow(clippy::too_many_arguments)]
+fn reactivate_old(
+    session: &Session,
+    manifest: &Manifest,
+    spec: &UpdateSpec,
+    version_dir: &Path,
+    app_dir: &Path,
+    roots: &install::InstallRoots,
+    tx: &flume::Sender<Event>,
+) -> Result<()> {
+    let arch = spec.arch;
+    let no_junction = session.config().no_junction.unwrap_or(false);
+
+    if !no_junction {
+        install::link_current(version_dir, app_dir)?;
+    }
+    let dir = if no_junction {
+        version_dir.to_path_buf()
+    } else {
+        app_dir.join("current")
+    };
+
+    let _ = install::apply_shims(manifest, &dir, &roots.shims, tx, arch);
+    let _ = install::apply_shortcuts(manifest, &dir, arch, tx);
+    let _ = install::install_psmodule(session, manifest, &dir, roots);
+    let _ = install::apply_env(manifest, session, arch, &dir);
+    let _ =
+        install::apply_persistence(manifest, spec.installed.name(), version_dir, &roots.persist);
+
+    Ok(())
+}
+
+/// Move a same-version backup back into place, if there was one.
+fn restore_backup(backup: Option<&Path>, version_dir: &Path) {
+    if let Some(backup) = backup {
+        // The failed install removed the version directory it created.
+        let _ = fs::remove_dir(version_dir);
+        let _ = std::fs::rename(backup, version_dir);
+    }
+}
+
+/// Undo a partial update: put the old version directory back where it belongs
+/// and make it reachable again.
+///
+/// Best effort throughout — the caller already has an error to report, and a
+/// recovery step that fails must not replace it with a less useful one.
+#[allow(clippy::too_many_arguments)]
+fn restore_old_version(
+    session: &Session,
+    manifest: &Manifest,
+    spec: &UpdateSpec,
+    backup: Option<&Path>,
+    old_dir: &Path,
+    app_dir: &Path,
+    roots: &install::InstallRoots,
+    tx: &flume::Sender<Event>,
+) {
+    // The backup, when there is one, is renamed back to `old_dir` here — so
+    // reactivation must be handed `old_dir`, not the `.updating` path.
+    restore_backup(backup, old_dir);
+    if let Err(e) = reactivate_old(session, manifest, spec, old_dir, app_dir, roots, tx) {
+        let _ = tx.try_send(Event::UpdateProgress(format!(
+            "Could not reactivate the old version: {e}"
+        )));
+    }
 }

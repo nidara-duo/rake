@@ -11,13 +11,12 @@ pub fn has_buckets(session: &Session) -> bool {
     matches!(rake_core::bucket::added_buckets(session), Ok(b) if !b.is_empty())
 }
 
-/// Report the result of the download-only stub used by `install` and `update`.
+/// Report what `--dry-run` downloaded and verified, and that nothing was installed.
 ///
-/// Both commands share this so their wording cannot drift: the artifacts are
-/// really downloaded and hash-verified, and the mutating half is deliberately
-/// skipped until the installer rewrite lands. The verified cache is usable by
-/// Scoop itself in the meantime.
-pub fn report_install_stub(action: &str, app: &str, files: &[DownloadedFile]) {
+/// Both commands share this so their wording cannot drift. The artifacts really
+/// are downloaded and hash-verified, and the mutating half is deliberately
+/// skipped: the cache is left ready for a real run.
+pub fn report_dry_run(action: &str, app: &str, files: &[DownloadedFile]) {
     println!(
         " {} '{}' downloaded to the cache:",
         style("✓").green(),
@@ -42,14 +41,8 @@ pub fn report_install_stub(action: &str, app: &str, files: &[DownloadedFile]) {
         );
     }
 
-    println!(
-        " {} {action} is temporarily disabled while the installer is being rewritten;",
-        style("!").yellow(),
-    );
-    println!("   the verified cache is ready — run `scoop {action} {app}` in the meantime.");
-    println!(
-        "   (maintainers: `rake {action} --unstable-install` runs the work-in-progress installer)"
-    );
+    println!(" {} dry run: nothing was {action}ed.", style("!").yellow(),);
+    println!("   run `rake {action} {app}` without --dry-run to apply it.");
 }
 
 pub fn human_size(bytes: u64) -> String {

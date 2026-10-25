@@ -111,6 +111,22 @@ pub fn is_installed(dir: &Path) -> bool {
         || dir.join(INSTALLED_MANIFEST_LEGACY).is_file()
 }
 
+/// The architecture a version directory was installed for.
+///
+/// Read from `scoop-install.json`, because that is the architecture the
+/// manifest's architecture-specific blocks were resolved with — not the
+/// machine's current architecture. Falls back to the current architecture when
+/// the record is missing or names something unknown, which is what Scoop's
+/// callers do (they pass `$architecture` through and let the resolver pick the
+/// top-level block).
+pub fn installed_arch(dir: &Path) -> rake_domain::arch::Arch {
+    read_install_record(dir)
+        .ok()
+        .flatten()
+        .and_then(|record| record.arch.parse().ok())
+        .unwrap_or_else(rake_domain::arch::Arch::current)
+}
+
 /// Best-effort version for a version directory whose manifest is missing or
 /// unreadable.
 ///

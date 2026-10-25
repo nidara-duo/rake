@@ -1,11 +1,7 @@
-use std::path::PathBuf;
-
-use rake_domain::arch::Arch;
-
 use crate::Result;
 use crate::infra::fs;
-use crate::infra::shortcut::ShortcutEntry;
-use crate::infra::{persist, script, shim, shortcut};
+use crate::infra::{install_meta, persist, script, shim, shortcut};
+use crate::operations::install;
 use crate::session::Session;
 
 #[derive(Debug, Clone)]
@@ -27,22 +23,16 @@ pub fn uninstall_packages(
     purge: bool,
 ) -> Result<Vec<Uninstalled>> {
     let _guard = session.write_lock()?;
-    let root = session
-        .config()
-        .root_path
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("apps"));
-
-    let apps_root = root.join("apps");
+    let roots = install::InstallRoots::from_session(session);
+    let apps_root = roots.apps.clone();
     if !apps_root.exists() {
         return Ok(Vec::new());
     }
 
     let is_wildcard = names.iter().any(|p| p == "*" || p == "-a" || p == "--all");
     let mut result = Vec::new();
-    let shims_dir = root.join("shims");
-    let persist_root = root.join("persist");
+    let shims_dir = roots.shims.clone();
+    let persist_root = roots.persist.clone();
 
     let entries: Vec<_> = std::fs::read_dir(&apps_root)
         .map_err(crate::Error::Io)?
@@ -69,66 +59,52 @@ pub fn uninstall_packages(
             None => continue,
         };
         let manifest = load_manifest(&version_dir);
-        let arch = load_arch(&version_dir);
+        // The architecture the app was installed for, not the machine's — the
+        // manifest's architecture blocks were resolved with it.
+        let arch = install_meta::installed_arch(&version_dir);
         let pkg_persist_dir = persist_root.join(&name);
+        let version_str = version.as_deref().unwrap_or("");
 
-        // 1. Run pre_uninstall script
+        // The order below is Scoop's `uninstall_app`
+        // (libexec/scoop-uninstall.ps1): the hooks and the package's own
+        // uninstaller run while everything is still in place, the links and
+        // shims are taken down next, and the directory is removed last.
+
+        // 1. pre_uninstall, best effort: a notification hook must not be able to
+        //    block an uninstall.
         if let Some(ref m) = manifest
             && let Some(script_lines) = m.resolve_pre_uninstall(arch)
         {
-            let ctx = script::HookContext::new(
-                &version_dir,
-                &pkg_persist_dir,
-                &version_dir,
-                version.as_deref().unwrap_or(""),
-            );
+            let ctx =
+                script::HookContext::new(&version_dir, &pkg_persist_dir, &version_dir, version_str);
             let _ = script::run_powershell_script(
                 &script_lines.iter().cloned().collect::<Vec<_>>(),
                 &ctx,
             );
         }
 
-        // 2. Remove shims
-        if let Some(ref m) = manifest
-            && let Some(bin_val) = m.resolve_bin(arch)
-        {
-            let entries = shim::parse_bin(bin_val);
-            shim::remove_shims(&entries, &shims_dir)?;
-        }
-
-        // 3. Remove env vars
+        // 2. The package's own uninstaller. It runs before the persisted data is
+        //    unlinked, because it is usually the only thing that knows how to
+        //    clean up what it wrote there.
         if let Some(ref m) = manifest {
-            if let Some(env_set) = m.resolve_env_set(arch) {
-                for k in env_set.keys() {
-                    session.env_service().remove_env(k)?;
-                }
-            }
-            // Goes through install's shared resolver so the path removed is the one
-            // that was added. The previous code removed the raw manifest string
-            // ("bin"), which never appears in PATH, so the entry stayed forever.
-            crate::operations::install::remove_env_add_paths(m, arch, &app_dir.join("current"));
+            install::run_installer(
+                m,
+                arch,
+                &version_dir,
+                &pkg_persist_dir,
+                version_str,
+                &roots,
+                true,
+            )?;
         }
 
-        // 4. Remove shortcuts
-        if let Some(ref m) = manifest
-            && let Some(shortcut_list) = m.resolve_shortcuts(arch)
-        {
-            let entries: Vec<ShortcutEntry> = shortcut_list
-                .iter()
-                .map(|s| ShortcutEntry {
-                    target: s.first().cloned().unwrap_or_default(),
-                    name: s.get(1).cloned().unwrap_or_default(),
-                    arguments: s.get(2).cloned(),
-                    icon: s.get(3).cloned(),
-                })
-                .filter(|e| !e.target.is_empty() && !e.name.is_empty())
-                .collect();
-            if !entries.is_empty() {
-                let _ = shortcut::remove_shortcuts(&entries, false);
-            }
-        }
-
-        // 5. Unlink persist junctions
+        // 3. Unlink persist junctions/hardlinks **before** anything deletes a
+        //    directory. A junction still in place would make the recursive delete
+        //    walk straight into `persist/<app>` and take the user's data with it.
+        //
+        //    Both the `current` link and every version directory are covered: an
+        //    update leaves old versions behind, and each of them can carry its own
+        //    links.
         if let Some(ref m) = manifest
             && let Some(ref persist_val) = m.persist
         {
@@ -146,13 +122,50 @@ pub fn uninstall_packages(
             }
         }
 
-        // 6. Remove current junction
+        // 4. Environment: `env_set` keys and the `env_add_path` entries, resolved
+        //    through the same helper the installer used so the removed entry is
+        //    exactly the one that was added.
+        if let Some(ref m) = manifest {
+            if let Some(env_set) = m.resolve_env_set(arch) {
+                for k in env_set.keys() {
+                    session.env_service().remove_env(k)?;
+                }
+            }
+            install::remove_env_add_paths(m, arch, &app_dir.join("current"));
+        }
+
+        // 5. The PowerShell module link, before the version directory it points
+        //    at is removed — a junction left behind would dangle.
+        if let Some(ref m) = manifest {
+            install::uninstall_psmodule(session, m, &roots)?;
+        }
+
+        // 6. Shims. `remove_shims` clears every wrapper spelling the installer
+        //    can produce (`.exe`/`.shim` for exe targets, `.cmd` and the bare
+        //    POSIX script for batch/jar/py targets, `.ps1` for scripts).
+        if let Some(ref m) = manifest
+            && let Some(bin_val) = m.resolve_bin(arch)
+        {
+            let entries = shim::parse_bin(bin_val);
+            shim::remove_shims(&entries, &shims_dir)?;
+        }
+
+        // 7. Start Menu shortcuts.
+        if let Some(ref m) = manifest
+            && let Some(shortcut_list) = m.resolve_shortcuts(arch)
+        {
+            let entries = install::parse_shortcuts(shortcut_list);
+            if !entries.is_empty() {
+                let _ = shortcut::remove_shortcuts(&entries, false);
+            }
+        }
+
+        // 8. Remove the `current` junction itself, then every version directory.
         let current_link = app_dir.join("current");
         if current_link.exists() || current_link.is_symlink() {
             fs::remove_symlink(&current_link)?;
         }
 
-        // 7. Remove all version directories
         let mut failed = Vec::new();
         if let Ok(version_entries) = std::fs::read_dir(&app_dir) {
             for ve in version_entries.flatten() {
@@ -165,41 +178,33 @@ pub fn uninstall_packages(
             }
         }
 
-        // 8. Remove app directory itself. It can legitimately refuse when something is
-        // left inside, so only a genuine failure is worth reporting — and by this point
-        // a failure has already been recorded above.
+        // 9. Remove the app directory itself. It can legitimately refuse when
+        //    something is left inside, so only a genuine failure is worth
+        //    reporting — and by this point a failure has already been recorded
+        //    above.
         if let Err(e) = fs::remove_dir(&app_dir)
             && failed.is_empty()
         {
             failed.push(format!("{}: {e}", app_dir.display()));
         }
 
-        // 9. Run post_uninstall script (after removal, but persist dir still exists)
+        // 10. post_uninstall, best effort, after the app is gone but while the
+        //     persisted data is still there.
         if let Some(ref m) = manifest
             && let Some(script_lines) = m.resolve_post_uninstall(arch)
+            && pkg_persist_dir.exists()
         {
-            let persist_dir = persist_root.join(&name);
-            if persist_dir.exists() {
-                // Keep persist_dir alive for script to use
-                let ctx = script::HookContext::new(
-                    &version_dir,
-                    &persist_dir,
-                    &version_dir,
-                    version.as_deref().unwrap_or(""),
-                );
-                let _ = script::run_powershell_script(
-                    &script_lines.iter().cloned().collect::<Vec<_>>(),
-                    &ctx,
-                );
-            }
+            let ctx =
+                script::HookContext::new(&version_dir, &pkg_persist_dir, &version_dir, version_str);
+            let _ = script::run_powershell_script(
+                &script_lines.iter().cloned().collect::<Vec<_>>(),
+                &ctx,
+            );
         }
 
-        // 10. Purge persisted data
-        if purge {
-            let pkg_persist_dir = persist_root.join(&name);
-            if pkg_persist_dir.exists() {
-                fs::remove_dir(&pkg_persist_dir)?;
-            }
+        // 11. `--purge` is the explicit request to destroy the persisted data.
+        if purge && pkg_persist_dir.exists() {
+            fs::remove_dir(&pkg_persist_dir)?;
         }
 
         result.push(Uninstalled {
@@ -243,19 +248,6 @@ fn load_manifest(version_dir: &std::path::Path) -> Option<rake_domain::manifest:
     crate::infra::install_meta::read_installed_manifest(version_dir)
         .ok()
         .flatten()
-}
-
-fn load_arch(version_dir: &std::path::Path) -> Arch {
-    if let Ok(Some(info)) = crate::infra::install_meta::read_install_record(version_dir) {
-        match info.arch.to_lowercase().as_str() {
-            "x86_64" | "amd64" | "x64" | "64bit" => Arch::Amd64,
-            "x86" | "i386" | "i686" | "32bit" => Arch::Ia32,
-            "aarch64" | "arm64" => Arch::Aarch64,
-            _ => Arch::Amd64,
-        }
-    } else {
-        Arch::Amd64
-    }
 }
 
 #[cfg(test)]
@@ -563,5 +555,45 @@ mod tests {
 
         assert!(result[0].failed.is_empty(), "got {:?}", result[0].failed);
         assert!(!root.join("apps/demo").exists());
+    }
+
+    /// The package's own uninstaller has to run **before** the directory is
+    /// removed, and with `$dir` substituted — it is the only thing that knows how
+    /// to clean up whatever the installer set up.
+    ///
+    /// The marker is written into `persist/` on purpose: the version directory is
+    /// gone by the time the test can look, so a marker left there would prove
+    /// nothing.
+    #[test]
+    fn the_packages_own_uninstaller_runs_before_the_directory_is_removed() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let (s, _env) = session(root);
+        install(
+            root,
+            "demo",
+            "1.0.0",
+            r#"{"version":"1.0.0","uninstaller":{"file":"uninstall.bat","args":["$dir"]}}"#,
+        );
+
+        let version_dir = root.join("apps").join("demo").join("1.0.0");
+        let persist_dir = root.join("persist").join("demo");
+        std::fs::create_dir_all(&persist_dir).unwrap();
+        let marker = persist_dir.join("uninstalled.txt");
+
+        std::fs::write(
+            version_dir.join("uninstall.bat"),
+            format!("@echo off\r\necho %1 > \"{}\"\r\n", marker.display()),
+        )
+        .unwrap();
+
+        uninstall_packages(&s, &["demo".to_owned()], false).unwrap();
+
+        assert!(marker.is_file(), "the package's uninstaller must run");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim_end(),
+            version_dir.display().to_string(),
+            "$dir must be substituted with the version directory"
+        );
     }
 }

@@ -56,8 +56,12 @@ pub struct Args {
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
-    /// Run the work-in-progress installer instead of the download-only stub
+    /// Download and verify into the cache, but do not update
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Deprecated no-op: the real installer is now the default
     #[arg(long, hide = true)]
+    #[allow(dead_code)]
     pub unstable_install: bool,
 }
 
@@ -595,15 +599,14 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
         return Ok(());
     }
 
-    // Safe stub: the artifacts above are downloaded and verified, but nothing
-    // has been written into `apps/<app>` yet. `--unstable-install` is the only
-    // way to hand control to the work-in-progress installer.
-    if !args.unstable_install {
+    // Dry run: the artifacts above are downloaded and verified, but nothing is
+    // written into `apps/<app>`. The old stub behaviour, now opt-in.
+    if args.dry_run {
         drop(_guard);
         let _ = ui_handle.join();
 
         for spec in &specs {
-            crate::util::report_install_stub("update", spec.candidate.name(), &spec.downloaded);
+            crate::util::report_dry_run("update", spec.candidate.name(), &spec.downloaded);
         }
 
         return Ok(());

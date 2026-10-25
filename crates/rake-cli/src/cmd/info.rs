@@ -3,6 +3,7 @@ use clap::Parser;
 use crossterm::style::Stylize;
 use rake_core::operations::query;
 use rake_core::session::Session;
+use rake_domain::arch::Arch;
 use rake_domain::package::PackageStatus;
 
 /// Show package(s) basic information
@@ -37,6 +38,20 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
                 && matches!(p.status, PackageStatus::Installed(_))
         });
 
+        // Architecture-dependent manifest fields (`bin`, `shortcuts`,
+        // `env_add_path`, ...) must be resolved for the architecture the package
+        // is installed for, not the machine's: an app installed as 32-bit keeps
+        // 32-bit shims even on a 64-bit host. Scoop's `info` reads
+        // `$install.architecture` for exactly this reason
+        // (libexec/scoop-info.ps1), and falls back to the current one when the
+        // package is not installed.
+        let arch = state
+            .and_then(|p| match &p.status {
+                PackageStatus::Installed(s) => s.arch.parse().ok(),
+                PackageStatus::NotInstalled => None,
+            })
+            .unwrap_or_else(Arch::current);
+
         let version_display = match state {
             Some(state) if let PackageStatus::Installed(s) = &state.status => {
                 if s.version == pkg.version() {
@@ -63,7 +78,7 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
         if let Some(ref deps) = pkg.manifest.depends {
             print_field("Dependencies", &deps.as_slice().join(", "));
         }
-        if let Some(ref bins) = pkg.manifest.bin {
+        if let Some(bins) = pkg.manifest.resolve_bin(arch) {
             let shims: Vec<&str> = bins
                 .as_slice()
                 .iter()

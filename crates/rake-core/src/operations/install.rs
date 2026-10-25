@@ -722,7 +722,13 @@ pub(crate) fn install_psmodule(
 
 /// Remove the module link an install created, leaving the version directory
 /// alone (lib/psmodules.ps1:27).
+///
+/// The `modules` directory itself stays: it is shared by every module, and
+/// Scoop leaves it in place. Only when it has become empty is the directory
+/// dropped from `PSModulePath` again — a path entry pointing at a directory
+/// with nothing in it is dead weight that no other app will ever remove.
 pub(crate) fn uninstall_psmodule(
+    session: &Session,
     manifest: &Manifest,
     roots: &InstallRoots,
 ) -> Result<Option<PathBuf>> {
@@ -740,11 +746,19 @@ pub(crate) fn uninstall_psmodule(
     fs::validate_relative_path("psmodule name", name)?;
 
     let link = roots.modules.join(name);
-    if link.exists() || link.is_symlink() {
-        fs::remove_symlink(&link)?;
-        return Ok(Some(link));
+    if !link.exists() && !link.is_symlink() {
+        return Ok(None);
     }
-    Ok(None)
+    fs::remove_symlink(&link)?;
+
+    let modules_empty = std::fs::read_dir(&roots.modules)
+        .map(|entries| entries.filter_map(|e| e.ok()).next().is_none())
+        .unwrap_or(false);
+    if modules_empty {
+        forget_psmodule_path(session, &roots.modules)?;
+    }
+
+    Ok(Some(link))
 }
 
 /// Add the modules directory to the persisted user `PSModulePath`.
@@ -774,6 +788,37 @@ fn ensure_psmodule_path(session: &Session, modules_dir: &Path) -> Result<()> {
         format!("{dir};{current}")
     };
     session.env_service().set_env("PSModulePath", &value)
+}
+
+/// Drop the modules directory from the persisted user `PSModulePath`.
+///
+/// The entry was prepended by [`ensure_psmodule_path`], so it is the first
+/// `;`-separated element in the ordinary case; the position is not relied on,
+/// and every occurrence is removed. An entry that is not there is not an error:
+/// uninstalling a package must not fail because the user already cleaned up.
+fn forget_psmodule_path(session: &Session, modules_dir: &Path) -> Result<()> {
+    let dir = modules_dir.to_string_lossy().to_string();
+    let Some(current) = env::read_user_env("PSModulePath")? else {
+        return Ok(());
+    };
+
+    let kept: Vec<&str> = current
+        .split(';')
+        .filter(|entry| !entry.is_empty() && !entry.eq_ignore_ascii_case(&dir))
+        .collect();
+    let original: Vec<&str> = current.split(';').filter(|e| !e.is_empty()).collect();
+
+    if kept.len() == original.len() {
+        return Ok(());
+    }
+
+    if kept.is_empty() {
+        session.env_service().remove_env("PSModulePath")
+    } else {
+        session
+            .env_service()
+            .set_env("PSModulePath", &kept.join(";"))
+    }
 }
 
 /// Mirror of scoop's `is_in_dir` (lib/core.ps1:695).

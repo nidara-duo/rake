@@ -964,3 +964,191 @@ mod lifecycle_tests {
         );
     }
 }
+
+/// The lifecycle after an install: `reset` has to rebuild everything the
+/// installer linked, and `uninstall` has to take all of it down again without
+/// ever touching the user's persisted data.
+#[cfg(test)]
+mod uninstall_lifecycle_tests {
+    use std::io::Write;
+    use std::path::Path;
+
+    use rake_domain::arch::Arch;
+    use rake_domain::config::Config;
+    use rake_domain::manifest::Manifest;
+    use rake_domain::package::{Package, PackageIdent, PackageStatus};
+
+    use crate::operations::download::DownloadedFile;
+    use crate::operations::install::install_packages;
+    use crate::operations::reset::reset_packages;
+    use crate::operations::uninstall::uninstall_packages;
+    use crate::session::Session;
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, data) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(data).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    fn downloaded(ident: &PackageIdent, cache_path: &Path, target: &str) -> DownloadedFile {
+        DownloadedFile {
+            ident: ident.clone(),
+            url: format!("https://example.com/{target}"),
+            cache_path: cache_path.to_path_buf(),
+            target_filename: target.to_owned(),
+            verified: true,
+        }
+    }
+
+    fn session(root: &Path) -> Session {
+        let (session, _recorder) = Session::from_config_recording_env(Config {
+            root_path: Some(root.to_path_buf()),
+            ..Default::default()
+        });
+        session
+    }
+
+    /// A package that exercises every kind of link the installer creates: a
+    /// batch shim (generated wrappers, no `shim.exe`), a persisted directory and
+    /// a PowerShell module junction.
+    fn manifest() -> Manifest {
+        serde_json::from_value(serde_json::json!({
+            "version": "1.0.0",
+            "url": "https://example.com/demo.zip",
+            "bin": [["tool.cmd", "demo-tool"]],
+            "persist": "config",
+            "psmodule": { "name": "DemoModule" }
+        }))
+        .expect("manifest should parse")
+    }
+
+    #[tokio::test]
+    async fn reset_rebuilds_and_uninstall_removes_links_but_keeps_persisted_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("scoop");
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+
+        let archive = cache.join("demo#1.0.0#demo.zip");
+        write_zip(
+            &archive,
+            &[
+                ("tool.cmd", b"@echo off\r\n"),
+                ("config/default.cfg", b"shipped"),
+            ],
+        );
+
+        let ident = PackageIdent::new("main", "demo");
+        let pkg = Package::new(ident.clone(), manifest(), None, PackageStatus::NotInstalled);
+
+        let session = session(&root);
+        install_packages(
+            &session,
+            &[pkg],
+            &[downloaded(&ident, &archive, "demo.zip")],
+            Arch::Amd64,
+        )
+        .await
+        .expect("install should succeed");
+
+        let app_dir = root.join("apps").join("demo");
+        let version_dir = app_dir.join("1.0.0");
+        let current = app_dir.join("current");
+        let shims = root.join("shims");
+        let module_link = root.join("modules").join("DemoModule");
+        let persist_dir = root.join("persist").join("demo");
+
+        // --- what the install produced ---
+        assert!(version_dir.join("scoop-install.json").is_file());
+        assert!(
+            current.exists(),
+            "current must link to the version directory"
+        );
+        assert!(
+            shims.join("demo-tool.cmd").is_file() && shims.join("demo-tool").is_file(),
+            "a batch target gets a .cmd wrapper and a POSIX wrapper"
+        );
+        assert!(
+            !shims.join("demo-tool.exe").exists(),
+            "a batch target must not get shim.exe"
+        );
+        assert!(
+            module_link.exists(),
+            "the PowerShell module must be linked into modules/"
+        );
+        assert!(
+            current.join("config").exists(),
+            "the persisted directory must be linked back into the app"
+        );
+
+        // What the application writes at runtime.
+        std::fs::write(persist_dir.join("config").join("user.cfg"), b"mine").unwrap();
+
+        // --- reset ---
+        // Break the links a reset is supposed to restore.
+        std::fs::remove_file(shims.join("demo-tool.cmd")).unwrap();
+        std::fs::remove_file(shims.join("demo-tool")).unwrap();
+        crate::infra::fs::remove_symlink(&current).unwrap();
+
+        let reset = reset_packages(&session, &["demo".to_owned()]).expect("reset should succeed");
+        assert_eq!(reset.len(), 1, "reset must report the package it reset");
+
+        assert!(current.exists(), "reset must recreate the current junction");
+        assert!(
+            shims.join("demo-tool.cmd").is_file() && shims.join("demo-tool").is_file(),
+            "reset must recreate both wrappers"
+        );
+        assert!(
+            module_link.exists(),
+            "reset must recreate the module junction"
+        );
+        assert_eq!(
+            std::fs::read(persist_dir.join("config").join("user.cfg")).unwrap(),
+            b"mine",
+            "reset must not disturb the persisted data"
+        );
+        assert_eq!(
+            std::fs::read(current.join("config").join("user.cfg")).unwrap(),
+            b"mine",
+            "the app must still reach its persisted data through the junction"
+        );
+        assert!(
+            !version_dir.join("config.original").exists(),
+            "reset must unlink before re-applying persist, or it would leave \
+             a `.original` junction behind"
+        );
+
+        // --- uninstall ---
+        let removed = uninstall_packages(&session, &["demo".to_owned()], false)
+            .expect("uninstall should succeed");
+        assert_eq!(removed.len(), 1);
+        assert!(
+            removed[0].failed.is_empty(),
+            "a clean uninstall reports nothing: {:?}",
+            removed[0].failed
+        );
+
+        assert!(!app_dir.exists(), "the app directory must be gone");
+        assert!(
+            !shims.join("demo-tool.cmd").exists()
+                && !shims.join("demo-tool").exists()
+                && !shims.join("demo-tool.exe").exists()
+                && !shims.join("demo-tool.shim").exists(),
+            "every wrapper spelling must be removed"
+        );
+        assert!(
+            !module_link.exists() && !module_link.is_symlink(),
+            "the module junction must be removed, or it would dangle"
+        );
+        assert_eq!(
+            std::fs::read(persist_dir.join("config").join("user.cfg")).unwrap(),
+            b"mine",
+            "a plain uninstall must never delete persisted data"
+        );
+    }
+}

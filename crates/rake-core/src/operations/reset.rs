@@ -1,12 +1,8 @@
 use std::path::PathBuf;
 
-use rake_domain::arch::Arch;
-
 use crate::Result;
-use crate::event::Event;
-use crate::infra::fs;
-use crate::infra::shortcut::ShortcutEntry;
-use crate::infra::{persist, shim, shortcut};
+use crate::infra::{install_meta, persist};
+use crate::operations::install;
 use crate::session::Session;
 
 pub fn reset_packages(
@@ -14,14 +10,8 @@ pub fn reset_packages(
     packages: &[String],
 ) -> Result<Vec<(String, String, PathBuf)>> {
     let _guard = session.write_lock()?;
-    let root = session
-        .config()
-        .root_path
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("apps"));
-
-    let apps_root = root.join("apps");
+    let roots = install::InstallRoots::from_session(session);
+    let apps_root = roots.apps.clone();
     if !apps_root.exists() {
         return Ok(Vec::new());
     }
@@ -30,9 +20,10 @@ pub fn reset_packages(
         .iter()
         .any(|p| p == "*" || p == "-a" || p == "--all");
     let mut reset = Vec::new();
-    let shims_dir = root.join("shims");
-    let persist_root = root.join("persist");
+    let shims_dir = roots.shims.clone();
+    let persist_root = roots.persist.clone();
     let tx = session.event_bus().core_sender();
+    let no_junction = session.config().no_junction.unwrap_or(false);
 
     let entries: Vec<_> = std::fs::read_dir(&apps_root)
         .map_err(crate::Error::Io)?
@@ -62,80 +53,39 @@ pub fn reset_packages(
             continue;
         }
 
-        // Re-link current junction
-        let current_link = app_dir.join("current");
-        if current_link.exists() || current_link.is_symlink() {
-            fs::remove_symlink(&current_link)?;
-        }
-        fs::create_junction(&version_dir, &current_link)?;
+        // Re-link `current` first: everything below resolves against it, exactly
+        // as `install_app` does (lib/install.ps1:58). `link_current` replaces any
+        // stale link and honours `no_junction`.
+        install::link_current(&version_dir, &app_dir)?;
+        let dir = if no_junction {
+            version_dir.clone()
+        } else {
+            app_dir.join("current")
+        };
 
-        // Re-create shims & shortcuts
-        if let Ok(Some(manifest)) =
-            crate::infra::install_meta::read_installed_manifest(&current_link)
-        {
-            let arch = load_arch(&version_dir);
+        // The manifest is read through the link, so a reset of an app whose
+        // metadata lives under the version directory still works.
+        if let Ok(Some(manifest)) = install_meta::read_installed_manifest(&dir) {
+            let arch = install_meta::installed_arch(&version_dir);
 
-            // Re-create shims
-            if let Some(bin_val) = manifest.resolve_bin(arch) {
-                let entries = shim::parse_bin(bin_val);
-                if !entries.is_empty() {
-                    fs::ensure_dir(&shims_dir)?;
-                    shim::create_shims(&entries, &version_dir, &shims_dir)?;
-                }
-            }
+            // Re-create shims, shortcuts, the module link and environment
+            // entries through the same helpers the installer uses. Keeping a
+            // second implementation here is how reset drifts away from install.
+            let _ = install::apply_shims(&manifest, &dir, &shims_dir, &tx, arch)?;
+            let _ = install::apply_shortcuts(&manifest, &dir, arch, &tx)?;
+            let _ = install::install_psmodule(session, &manifest, &dir, &roots)?;
+            install::apply_env(&manifest, session, arch, &dir)?;
 
-            // Re-create shortcuts
-            if let Some(shortcut_list) = manifest.resolve_shortcuts(arch) {
-                let entries: Vec<ShortcutEntry> = shortcut_list
-                    .iter()
-                    .map(|s| ShortcutEntry {
-                        target: s.first().cloned().unwrap_or_default(),
-                        name: s.get(1).cloned().unwrap_or_default(),
-                        arguments: s.get(2).cloned(),
-                        icon: s.get(3).cloned(),
-                    })
-                    .filter(|e| !e.target.is_empty() && !e.name.is_empty())
-                    .collect();
-                if !entries.is_empty() {
-                    let _ = shortcut::remove_shortcuts(&entries, false);
-                    if let Ok(warnings) = shortcut::create_shortcuts(&entries, &version_dir, false)
-                    {
-                        for w in warnings {
-                            let _ = tx.try_send(Event::CommitProgress(format!("⚠ {}", w)));
-                        }
-                    }
-                }
-            }
-
-            // Re-apply persist
+            // Persist: unlink first, then re-apply. `persist::apply` moves a
+            // shipped copy aside to `<name>.original` when the target already
+            // exists, so applying without unlinking would rename the *junction*
+            // and leave a `.original` link behind on every reset.
             if let Some(ref persist_val) = manifest.persist {
                 let entries = persist::parse_persist(persist_val);
-                let pkg_persist_dir = persist_root.join(&name);
                 if !entries.is_empty() {
-                    persist::unlink(&entries, &current_link)?;
-                    persist::apply(&entries, &version_dir, &pkg_persist_dir)?;
+                    persist::unlink(&entries, &version_dir)?;
+                    persist::apply(&entries, &version_dir, &persist_root.join(&name))?;
                 }
-            }
-
-            // Re-apply env vars
-            if let Some(env_set) = manifest.resolve_env_set(arch) {
-                for k in env_set.keys() {
-                    session.env_service().remove_env(k)?;
-                }
-                for (k, v) in env_set {
-                    session.env_service().set_env(k, v)?;
-                }
-            }
-            // Re-apply env vars. The PATH entries go through the same resolver the
-            // installer uses, so the removal matches what was written. The previous
-            // remove-then-add on the raw manifest string went through the broken
-            // process-PATH implementation and rewrote HKCU\Environment\PATH on every
-            // `rake reset`.
-            for path in
-                crate::operations::install::resolve_env_add_paths(&manifest, arch, &current_link)
-            {
-                let _ = crate::infra::env::remove_user_path(&path);
-                crate::infra::env::add_user_path(&path)?;
             }
         }
 
@@ -143,19 +93,6 @@ pub fn reset_packages(
     }
 
     Ok(reset)
-}
-
-fn load_arch(version_dir: &std::path::Path) -> Arch {
-    if let Ok(Some(info)) = crate::infra::install_meta::read_install_record(version_dir) {
-        match info.arch.to_lowercase().as_str() {
-            "x86_64" | "amd64" | "x64" | "64bit" => Arch::Amd64,
-            "x86" | "i386" | "i686" | "32bit" => Arch::Ia32,
-            "aarch64" | "arm64" => Arch::Aarch64,
-            _ => Arch::Amd64,
-        }
-    } else {
-        Arch::Amd64
-    }
 }
 
 fn resolve_installed_version(app_dir: &std::path::Path) -> Option<String> {

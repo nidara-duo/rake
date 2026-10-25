@@ -509,7 +509,7 @@ fn deactivate_old(
             let _ = shortcut::remove_shortcuts(&entries, false);
         }
     }
-    let _ = install::uninstall_psmodule(manifest, roots);
+    let _ = install::uninstall_psmodule(session, manifest, roots);
 
     // 5. Environment entries the old version added. The new install re-adds its
     //    own; leaving the old ones behind is how a PATH entry for a version that

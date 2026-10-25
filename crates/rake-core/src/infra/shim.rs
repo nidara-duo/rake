@@ -880,4 +880,59 @@ mod wrapper_tests {
             "the version directory must not be baked in:\n{content}"
         );
     }
+
+    /// `remove_shim` is what an uninstall runs, and the wrappers a target can
+    /// produce are not uniform: `.exe`/`.shim` for a program, `.cmd` plus a bare
+    /// POSIX script for batch/jar/py targets, `.ps1` for scripts. Anything left
+    /// behind is a shim pointing at a path that no longer exists.
+    #[test]
+    fn remove_shim_clears_every_wrapper_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_dir, shims_dir) = layout_file(dir.path(), "multi", "tool.exe");
+
+        let targets = [
+            ("tool.exe", "prog"),
+            ("tool.cmd", "batch"),
+            ("tool.ps1", "script"),
+            ("tool.jar", "jar"),
+            ("tool.py", "py"),
+            ("tool", "bash"),
+        ];
+        for (file, name) in targets {
+            std::fs::write(app_dir.join(file), b"payload").unwrap();
+            create_shims(&[entry(file, name, None)], &app_dir, &shims_dir).unwrap();
+        }
+
+        // Every spelling that was produced, per target.
+        for file in [
+            "prog.exe",
+            "prog.shim",
+            "batch.cmd",
+            "batch",
+            "script.ps1",
+            "script.cmd",
+            "script",
+            "jar.cmd",
+            "jar",
+            "py.cmd",
+            "py",
+            "bash.cmd",
+            "bash",
+        ] {
+            assert!(
+                shims_dir.join(file).is_file(),
+                "{file} should have been created"
+            );
+        }
+
+        for (_, name) in targets {
+            remove_shim(name, &shims_dir).unwrap();
+        }
+
+        assert_eq!(
+            std::fs::read_dir(&shims_dir).unwrap().count(),
+            0,
+            "every wrapper spelling must be removed"
+        );
+    }
 }

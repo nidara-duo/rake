@@ -24,8 +24,12 @@ pub struct Args {
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
-    /// Run the work-in-progress installer instead of the download-only stub
+    /// Download and verify into the cache, but do not install
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Deprecated no-op: the real installer is now the default
     #[arg(long, hide = true)]
+    #[allow(dead_code)]
     pub unstable_install: bool,
 }
 
@@ -132,10 +136,10 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
 
     // 4. Scoop-style header for each package
     let _ = stdout.execute(cursor::Hide);
-    let verb = if args.unstable_install {
-        "Installing"
-    } else {
+    let verb = if args.dry_run {
         "Downloading"
+    } else {
+        "Installing"
     };
     for pkg in &packages {
         writeln!(
@@ -300,10 +304,10 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
         }
     };
 
-    // 5b. Safe stub: everything above really downloaded and verified the
-    // artifacts, but extraction/linking into `apps/<app>` is disabled until the
-    // installer rewrite lands. `--unstable-install` is the only way past this.
-    if !args.unstable_install {
+    // 5b. Dry run: everything above really downloaded and verified the
+    // artifacts, but nothing is extracted or linked into `apps/<app>`. This is
+    // the old stub behaviour, now opt-in.
+    if args.dry_run {
         let mut any_failed = false;
         for pkg in &packages {
             let pkg_files: Vec<download::DownloadedFile> = files
@@ -316,14 +320,14 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
                 any_failed = true;
                 writeln!(
                     stdout,
-                    " {} '{}' failed to download — nothing was installed",
+                    " {} '{}' failed to download",
                     style("✗").red(),
                     pkg.name(),
                 )?;
                 continue;
             }
 
-            crate::util::report_install_stub("install", pkg.name(), &pkg_files);
+            crate::util::report_dry_run("install", pkg.name(), &pkg_files);
         }
 
         return if any_failed {

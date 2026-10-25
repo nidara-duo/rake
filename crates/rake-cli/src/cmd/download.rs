@@ -282,20 +282,38 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
     let _ = ui_handle.join();
     let _ = std::io::stdout().execute(cursor::Show);
 
-    if let Err(e) = result {
-        writeln!(std::io::stdout(), "Download failed: {e}")?;
-        return Err(e.into());
+    let files = match result {
+        Ok(files) => files,
+        Err(e) => {
+            writeln!(std::io::stdout(), "Download failed: {e}")?;
+            return Err(e.into());
+        }
+    };
+
+    // `download_packages` keeps going after a failed package, so the success
+    // line must be driven by the files that actually exist, not by the input
+    // list. A package with no files is a failure, not a success.
+    let mut missing = 0usize;
+    for pkg in &packages {
+        if files.iter().any(|f| f.ident == pkg.ident) {
+            writeln!(
+                std::io::stdout(),
+                " {} '{}' ({}) was downloaded successfully!",
+                style("✓").green(),
+                style(pkg.name()).green(),
+                pkg.version(),
+            )?;
+        } else {
+            missing += 1;
+        }
     }
 
-    // Scoop-style success for each package
-    for pkg in &packages {
-        writeln!(
-            std::io::stdout(),
-            " {} '{}' ({}) was downloaded successfully!",
-            style("✓").green(),
-            style(pkg.name()).green(),
-            pkg.version(),
-        )?;
+    if missing > 0 {
+        return Err(anyhow::anyhow!(
+            "{} of {} package(s) failed to download",
+            missing,
+            packages.len()
+        ));
     }
 
     Ok(())

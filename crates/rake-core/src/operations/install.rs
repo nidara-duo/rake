@@ -99,7 +99,7 @@ pub async fn install_packages(
             if is_innosetup && extraction_format.is_none() {
                 let _ = tx.try_send(Event::CommitProgress(format!(
                     "Extracting {} ...",
-                    file.url.split('/').next_back().unwrap_or("file"),
+                    file.target_filename,
                 )));
                 let ed = pkg.manifest.resolve_extract_dir(arch);
                 let ed_str = ed.and_then(|ed| ed.as_slice().first().map(|s| s.as_str()));
@@ -116,7 +116,7 @@ pub async fn install_packages(
                     .extract(&file.cache_path, &target_dir, format)
                     .await?;
             } else {
-                let dest = target_dir.join(file.url.split('/').next_back().unwrap_or("file"));
+                let dest = target_dir.join(&file.target_filename);
                 fs::ensure_dir(&target_dir)?;
                 std::fs::copy(&file.cache_path, &dest)?;
             }
@@ -258,6 +258,8 @@ pub async fn install_packages(
             manifest: pkg.manifest.clone(),
             source: pkg.source.clone(),
             status: PackageStatus::Installed(state),
+            // Just committed: the metadata is written by `finalize_installation`.
+            install_failed: false,
         });
 
         let _ = tx.try_send(Event::CommitDone(pkg.ident.clone()));

@@ -74,6 +74,15 @@ pub struct Package {
     pub manifest: Manifest,
     pub source: Option<PackageSource>,
     pub status: PackageStatus,
+    /// True when the app directory exists but the install never finished: no
+    /// `current` junction (unless `NO_JUNCTION`), no version directory, or a
+    /// version directory missing `install.json` / `manifest.json` under either
+    /// spelling.
+    ///
+    /// `list` and `status` report such an app as `Install failed` instead of
+    /// treating it as installed. The bucket is then unknown by definition, so
+    /// no version comparison can be made — see `operations::query`.
+    pub install_failed: bool,
 }
 
 impl Package {
@@ -88,6 +97,7 @@ impl Package {
             manifest,
             source,
             status,
+            install_failed: false,
         }
     }
 

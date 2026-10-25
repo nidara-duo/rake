@@ -24,6 +24,9 @@ pub struct Args {
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
+    /// Run the work-in-progress installer instead of the download-only stub
+    #[arg(long, hide = true)]
+    pub unstable_install: bool,
 }
 
 fn parse_app_name(raw: &str) -> &str {
@@ -129,10 +132,16 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
 
     // 4. Scoop-style header for each package
     let _ = stdout.execute(cursor::Hide);
+    let verb = if args.unstable_install {
+        "Installing"
+    } else {
+        "Downloading"
+    };
     for pkg in &packages {
         writeln!(
             stdout,
-            "Installing '{}' ({}) [{}]",
+            "{} '{}' ({}) [{}]",
+            verb,
             style(pkg.name()).bold(),
             pkg.version(),
             arch,
@@ -290,6 +299,58 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
             }
         }
     };
+
+    // 5b. Safe stub: everything above really downloaded and verified the
+    // artifacts, but extraction/linking into `apps/<app>` is disabled until the
+    // installer rewrite lands. `--unstable-install` is the only way past this.
+    if !args.unstable_install {
+        let mut any_failed = false;
+        for pkg in &packages {
+            let pkg_files: Vec<download::DownloadedFile> = files
+                .iter()
+                .filter(|f| f.ident == pkg.ident)
+                .cloned()
+                .collect();
+
+            if pkg_files.is_empty() {
+                any_failed = true;
+                writeln!(
+                    stdout,
+                    " {} '{}' failed to download — nothing was installed",
+                    style("✗").red(),
+                    pkg.name(),
+                )?;
+                continue;
+            }
+
+            crate::util::report_install_stub("install", pkg.name(), &pkg_files);
+        }
+
+        return if any_failed {
+            Err(anyhow::anyhow!(
+                "one or more packages could not be downloaded"
+            ))
+        } else {
+            Ok(())
+        };
+    }
+
+    // Refuse to hand a partial package to the installer: extracting only one of
+    // two artifacts produces exactly the broken app this rewrite is fixing.
+    for pkg in &packages {
+        if !files.iter().any(|f| f.ident == pkg.ident) {
+            writeln!(
+                stdout,
+                " {} '{}' failed to download — refusing to install it",
+                style("✗").red(),
+                pkg.name(),
+            )?;
+            return Err(anyhow::anyhow!(
+                "package '{}' has no verified files to install",
+                pkg.name()
+            ));
+        }
+    }
 
     // 6. Commit (extract, link, shim, persist)
     let commit_result = {

@@ -247,18 +247,24 @@ pub async fn collect_status(session: &Session, mode: CheckBuckets) -> Result<Sta
     let no_junction = session.config().no_junction.unwrap_or(false);
 
     let ignored = ["lessmsi", "innounp", "7zip", "dark", "scoop"];
-    let installed_names: std::collections::HashSet<String> = installed
-        .iter()
-        .map(|p| p.name().to_ascii_lowercase())
-        .collect();
 
-    // Failed installs never reach `query_installed`, so they are collected from
-    // the directory listing that `installed_apps` walks in etalon.
+    // The authoritative disk verdict. `query_installed` carries the same flag,
+    // but repeating the check here keeps `status` honest even if the directory
+    // changed between the two calls, and keeps it identical to `list`.
     let failed_names: std::collections::HashSet<String> = query::installed_app_dirs(session)?
         .iter()
         .filter(|dir| query::is_failed_install(dir, no_junction))
         .filter_map(|dir| dir.file_name().map(|n| n.to_string_lossy().to_string()))
         .map(|n| n.to_ascii_lowercase())
+        .collect();
+
+    // Only a healthy install satisfies a dependency: a failed install keeps
+    // its directory but provides nothing, so it must not hide a missing dep.
+    let healthy_names: std::collections::HashSet<String> = installed
+        .iter()
+        .filter(|p| !p.install_failed)
+        .map(|p| p.name().to_ascii_lowercase())
+        .filter(|name| !failed_names.contains(name))
         .collect();
 
     let mut entries = Vec::new();
@@ -272,10 +278,19 @@ pub async fn collect_status(session: &Session, mode: CheckBuckets) -> Result<Sta
             _ => continue,
         };
 
+        let install_failed = pkg.install_failed || failed_names.contains(&name_lower);
+
         let mut flags = Vec::new();
 
-        // A failed install is not installed, so `version` is meaningless and no
-        // version comparison makes sense.
+        if install_failed {
+            flags.push(StatusInfoFlag::InstallFailed);
+        }
+
+        // `app_status` (lib/core.ps1:575-584) computes `failed` and `removed`
+        // independently. When `install.json` is missing the recorded bucket is
+        // empty, and the manifest lookup falls through to every local bucket —
+        // so a failed install can also be an orphaned one, and both labels are
+        // shown ("Install failed, Manifest removed").
         let (manifest_source, bucket_manifest) =
             resolve_bucket_manifest(&buckets, state.bucket.as_deref(), &name);
 
@@ -291,7 +306,9 @@ pub async fn collect_status(session: &Session, mode: CheckBuckets) -> Result<Sta
                 .cloned()
         };
 
-        if latest_version.is_some() {
+        // A failed install has no installed version to compare against, so it
+        // is never reported as outdated.
+        if !install_failed && latest_version.is_some() {
             flags.push(StatusInfoFlag::Outdated);
         }
 
@@ -315,11 +332,15 @@ pub async fn collect_status(session: &Session, mode: CheckBuckets) -> Result<Sta
         let mut missing_deps = Vec::new();
         if let Some(depends) = bucket_manifest.as_ref().and_then(|m| m.depends.as_ref()) {
             for dep in depends.iter() {
-                let dep_lower = dep.to_ascii_lowercase();
+                // A dependency may be written as `<bucket>/<app>`. Only the app
+                // name identifies an installed package — lib/core.ps1:599-605
+                // runs it through `parse_app` before calling `installed`.
+                let dep_app = dep.rsplit('/').next().unwrap_or(dep.as_str());
+                let dep_lower = dep_app.to_ascii_lowercase();
                 if ignored.contains(&dep_lower.as_str()) {
                     continue;
                 }
-                if !installed_names.contains(&dep_lower) {
+                if !healthy_names.contains(&dep_lower) {
                     missing_deps.push(dep.clone());
                 }
             }
@@ -334,32 +355,18 @@ pub async fn collect_status(session: &Session, mode: CheckBuckets) -> Result<Sta
 
         entries.push(StatusEntry {
             name,
-            installed_version: Some(state.version.clone()),
+            // An interrupted install has no usable version, which is why Scoop
+            // prints an empty `Installed Version` for it.
+            installed_version: if install_failed {
+                None
+            } else {
+                Some(state.version.clone())
+            },
             latest_version,
             missing_dependencies: missing_deps,
             flags,
         });
     }
-
-    // A failed install has no readable version, so it cannot also be reported
-    // as outdated. If a healthy entry slipped in for the same app (readable
-    // metadata but a broken junction), the failure wins.
-    let mut failed_reported = std::collections::HashSet::new();
-    for name in &failed_names {
-        if failed_reported.insert(name.clone()) {
-            entries.push(StatusEntry {
-                name: name.clone(),
-                installed_version: None,
-                latest_version: None,
-                missing_dependencies: Vec::new(),
-                flags: vec![StatusInfoFlag::InstallFailed],
-            });
-        }
-    }
-    entries.retain(|e| {
-        let lower = e.name.to_ascii_lowercase();
-        !failed_names.contains(&lower) || e.flags.contains(&StatusInfoFlag::InstallFailed)
-    });
 
     entries.sort_by_key(|e| e.name.to_ascii_lowercase());
 
@@ -547,9 +554,97 @@ mod tests {
             .iter()
             .find(|e| e.name == "broken")
             .expect("failed install must be reported");
-        assert_eq!(entry.flags, vec![StatusInfoFlag::InstallFailed]);
+        // `failed` and `removed` are independent (lib/core.ps1:575-584): with no
+        // install.json the bucket is empty and the manifest is not in any
+        // bucket, so both labels apply.
+        assert_eq!(
+            entry.flags,
+            vec![
+                StatusInfoFlag::InstallFailed,
+                StatusInfoFlag::ManifestRemoved
+            ]
+        );
         assert_eq!(entry.installed_version, None);
         assert!(!report.entries.iter().any(|e| e.name == "git"));
+    }
+
+    /// The reported `vectorcraft` state: a version directory with a manifest
+    /// but no `install.json`, and no manifest in any bucket. Scoop prints
+    /// `Install failed, Manifest removed`.
+    #[tokio::test]
+    async fn broken_install_reports_failed_and_manifest_removed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write(
+            &root,
+            "apps/vectorcraft/0.4.0/scoop-manifest.json",
+            r#"{"version":"0.4.0"}"#,
+        );
+
+        let report = status_of(root).await;
+        let entry = report
+            .entries
+            .iter()
+            .find(|e| e.name == "vectorcraft")
+            .expect("broken install must be reported");
+
+        assert_eq!(
+            entry.flags,
+            vec![
+                StatusInfoFlag::InstallFailed,
+                StatusInfoFlag::ManifestRemoved
+            ],
+            "failed and removed are computed independently"
+        );
+        assert_eq!(entry.installed_version, None, "no usable version");
+    }
+
+    /// A broken install whose manifest is still in a bucket is failed but not
+    /// orphaned: only the `Install failed` label applies.
+    #[tokio::test]
+    async fn broken_install_with_a_bucket_manifest_is_not_removed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write(
+            &root,
+            "apps/vectorcraft/0.4.0/scoop-manifest.json",
+            r#"{"version":"0.4.0"}"#,
+        );
+        write(
+            &root,
+            "buckets/extras/bucket/vectorcraft.json",
+            r#"{"version":"0.4.0"}"#,
+        );
+
+        let report = status_of(root).await;
+        assert_eq!(
+            flags_of(&report, "vectorcraft"),
+            &[StatusInfoFlag::InstallFailed]
+        );
+    }
+
+    /// A deprecated manifest still means the app is not orphaned, even when the
+    /// install itself is broken.
+    #[tokio::test]
+    async fn broken_install_with_a_deprecated_manifest_is_deprecated() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write(
+            &root,
+            "apps/vectorcraft/0.4.0/scoop-manifest.json",
+            r#"{"version":"0.4.0"}"#,
+        );
+        write(
+            &root,
+            "buckets/extras/deprecated/vectorcraft.json",
+            r#"{"version":"0.4.0","deprecated":true}"#,
+        );
+
+        let report = status_of(root).await;
+        assert_eq!(
+            flags_of(&report, "vectorcraft"),
+            &[StatusInfoFlag::InstallFailed, StatusInfoFlag::Deprecated]
+        );
     }
 
     #[tokio::test]
@@ -603,6 +698,70 @@ mod tests {
         let report = status_of(root).await;
         let entry = report.entries.iter().find(|e| e.name == "needs").unwrap();
         assert_eq!(entry.missing_dependencies, vec!["absent".to_owned()]);
+        assert!(entry.flags.contains(&StatusInfoFlag::MissingDependencies));
+    }
+
+    /// A dependency may be written as `<bucket>/<app>`. Scoop resolves it
+    /// through `parse_app` (lib/core.ps1:599-605), so the installed
+    /// `vcredist2022` satisfies `extras/vcredist2022`.
+    #[tokio::test]
+    async fn bucket_qualified_dependency_is_matched_by_app_name() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        install_app(&root, "extras", "vcredist2022", "14.0.0");
+        install_app(&root, "main", "needs", "1.0.0");
+        write(
+            &root,
+            "buckets/main/bucket/needs.json",
+            r#"{"version":"1.0.0","depends":"extras/vcredist2022"}"#,
+        );
+
+        let report = status_of(root).await;
+        assert!(
+            !report.entries.iter().any(|e| e.name == "needs"),
+            "an installed dependency must not be reported missing: {:?}",
+            report.entries
+        );
+    }
+
+    /// The other half of the same rule: a bucket-qualified dependency that is
+    /// genuinely absent is still reported, with its original spelling.
+    #[tokio::test]
+    async fn bucket_qualified_missing_dependency_is_reported() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        install_app(&root, "main", "needs", "1.0.0");
+        write(
+            &root,
+            "buckets/main/bucket/needs.json",
+            r#"{"version":"1.0.0","depends":"extras/absent"}"#,
+        );
+
+        let report = status_of(root).await;
+        let entry = report.entries.iter().find(|e| e.name == "needs").unwrap();
+        assert_eq!(entry.missing_dependencies, vec!["extras/absent".to_owned()]);
+        assert!(entry.flags.contains(&StatusInfoFlag::MissingDependencies));
+    }
+
+    /// A failed install provides nothing, so its directory must not satisfy a
+    /// dependency.
+    #[tokio::test]
+    async fn broken_install_does_not_satisfy_a_dependency() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        install_app(&root, "extras", "vcredist2022", "14.0.0");
+        install_app(&root, "main", "needs", "1.0.0");
+        write(
+            &root,
+            "buckets/main/bucket/needs.json",
+            r#"{"version":"1.0.0","depends":"vcredist2022"}"#,
+        );
+        // Interrupt the dependency's install: no install record any more.
+        std::fs::remove_file(root.join("apps/vcredist2022/current/scoop-install.json")).unwrap();
+
+        let report = status_of(root).await;
+        let entry = report.entries.iter().find(|e| e.name == "needs").unwrap();
+        assert_eq!(entry.missing_dependencies, vec!["vcredist2022".to_owned()]);
         assert!(entry.flags.contains(&StatusInfoFlag::MissingDependencies));
     }
 

@@ -49,6 +49,7 @@ pub(crate) fn query_installed_inner(session: &Session) -> Result<Vec<Package>> {
             let app_dir = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             let current_dir = app_dir.join("current");
+            let version_dir = resolve_version_dir(&app_dir).unwrap_or_else(|| current_dir.clone());
 
             // Both file spellings are accepted (see infra::install_meta): recent
             // Scoop writes `scoop-install.json` / `scoop-manifest.json`, older
@@ -56,7 +57,7 @@ pub(crate) fn query_installed_inner(session: &Session) -> Result<Vec<Package>> {
             // legacy names made every recently-installed app disappear from
             // `list`, `status`, `uninstall`, `hold` and `cleanup`.
             let install_info: Option<InstallRecord> =
-                match install_meta::read_install_record(&current_dir) {
+                match install_meta::read_install_record(&version_dir) {
                     Ok(record) => record,
                     Err(e) => {
                         tracing::warn!("{}: unreadable install record: {e}", name);
@@ -65,13 +66,19 @@ pub(crate) fn query_installed_inner(session: &Session) -> Result<Vec<Package>> {
                 };
 
             let manifest: Option<Manifest> =
-                match install_meta::read_installed_manifest(&current_dir) {
+                match install_meta::read_installed_manifest(&version_dir) {
                     Ok(manifest) => manifest,
                     Err(e) => {
                         tracing::warn!("{}: unreadable installed manifest: {e}", name);
                         None
                     }
                 };
+
+            // The authoritative health check: an app whose metadata is
+            // incomplete is an interrupted install, not a package with an
+            // unknown bucket. `list` and `status` both key off this flag.
+            let install_failed =
+                is_failed_install(&app_dir, session.config().no_junction.unwrap_or(false));
 
             // A missing or corrupt manifest must not hide an app that is
             // installed on disk. Fall back to the version directory name, the
@@ -122,8 +129,11 @@ pub(crate) fn query_installed_inner(session: &Session) -> Result<Vec<Package>> {
                 .and_then(|i| i.bucket.clone())
                 .or_else(|| url.as_ref().and_then(|u| extract_bucket_from_url(u)));
 
-            let ident =
-                PackageIdent::new(bucket.clone().unwrap_or_else(|| "__unknown__".into()), name);
+            // An install with no readable record has no bucket. The identity
+            // carries an empty bucket so nothing downstream can mistake it for
+            // a real one — the old code invented a placeholder bucket name
+            // here, which `list` then printed as if it were real.
+            let ident = PackageIdent::new(bucket.clone().unwrap_or_default(), name);
             let status = PackageStatus::Installed(InstallState {
                 version,
                 bucket,
@@ -137,7 +147,9 @@ pub(crate) fn query_installed_inner(session: &Session) -> Result<Vec<Package>> {
             // stored separately in the `bucket` field.  If URL-sourced
             // installs are implemented in the future, a `source` field
             // should be added to InstallRecord to recover this.
-            Some(Package::new(ident, manifest, None, status))
+            let mut package = Package::new(ident, manifest, None, status);
+            package.install_failed = install_failed;
+            Some(package)
         })
         .collect();
 
@@ -334,21 +346,31 @@ pub(crate) fn query_synced_matching_inner(
     Ok(packages)
 }
 
-/// Whether an app directory represents a healthy install.
+/// The directory holding the installed version's metadata: `current` when the
+/// junction exists, otherwise the newest version directory.
 ///
-/// Mirrors Scoop's `failed()` in lib/core.ps1:
-/// ```text
-/// $hasCurrent = (get_config NO_JUNCTION) -or (Test-Path "$appPath\current")
-/// return (Test-Path $appPath) -and !($hasCurrent -and (installed $app))
-/// ```
-/// So an app fails when its directory exists but either there is no
-/// `current` junction, or `current` does not resolve to a version. Under
-/// `NO_JUNCTION` the `current` check is skipped, because that layout never
-/// creates a junction.
+/// The fallback covers the `NO_JUNCTION` layout and a `current` junction whose
+/// target is gone; `Select-CurrentVersion` resolves the same way.
+fn resolve_version_dir(app_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let current_dir = app_dir.join("current");
+    if current_dir.is_dir() {
+        return Some(current_dir);
+    }
+
+    install_meta::fallback_version(app_dir, &current_dir).map(|version| app_dir.join(version))
+}
+
+/// Whether an app directory represents a broken install.
 ///
-/// The directory listing comes from `installed_apps`, which deliberately
-/// includes broken installs — that is the only way a failed install can be
-/// reported at all.
+/// An install is healthy only when all of these hold:
+/// * a version directory exists — `current`, or a version directory when
+///   `NO_JUNCTION` is set;
+/// * that directory contains a readable `install.json` / `scoop-install.json`;
+/// * that directory contains a readable `manifest.json` / `scoop-manifest.json`.
+///
+/// Scoop's `failed()` (lib/core.ps1) only checks the junction, but an install
+/// that lost its metadata is just as unusable: that is the state which used to
+/// be reported under a placeholder bucket and, worse, as up to date.
 pub fn is_failed_install(app_dir: &std::path::Path, no_junction: bool) -> bool {
     if !app_dir.exists() {
         return false;
@@ -357,15 +379,20 @@ pub fn is_failed_install(app_dir: &std::path::Path, no_junction: bool) -> bool {
     let current_dir = app_dir.join("current");
     let has_current = no_junction || current_dir.exists();
 
-    // `installed` == Select-CurrentVersion is non-null, which reads the version
-    // from the manifest and otherwise falls back to the newest version dir.
-    let installed = install_meta::read_installed_manifest(&current_dir)
-        .ok()
-        .flatten()
-        .is_some_and(|m| !m.version().is_empty())
-        || install_meta::fallback_version(app_dir, &current_dir).is_some();
+    // Both files must exist *and* parse. A truncated install.json is an
+    // interrupted install, not an install with an unknown bucket.
+    let metadata_ok = resolve_version_dir(app_dir).is_some_and(|dir| {
+        install_meta::read_install_record(&dir)
+            .ok()
+            .flatten()
+            .is_some()
+            && install_meta::read_installed_manifest(&dir)
+                .ok()
+                .flatten()
+                .is_some()
+    });
 
-    !(has_current && installed)
+    !(has_current && metadata_ok)
 }
 
 /// App directories present under `<root>/apps`, excluding `scoop`.
@@ -704,10 +731,106 @@ mod tests {
             r#"{"version":"1.96.0"}"#,
         )
         .unwrap();
+        std::fs::write(
+            version_dir.join(install_meta::INSTALL_RECORD),
+            r#"{"version":"1.96.0","bucket":"extras"}"#,
+        )
+        .unwrap();
 
         // NO_JUNCTION layouts never create `current`, so Scoop skips that check.
         let app_dir = root.join("apps").join("brave");
         assert!(!is_failed_install(&app_dir, true));
+    }
+
+    /// An interrupted install leaves a version directory with only one of the
+    /// two metadata files. That is not an app with an unknown bucket — it is a
+    /// failed install, and `list` must not claim it is up to date.
+    #[test]
+    fn version_dir_without_install_record_is_failed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let version_dir = root.join("apps").join("vectorcraft").join("0.4.0");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(
+            version_dir.join(install_meta::INSTALLED_MANIFEST),
+            r#"{"version":"0.4.0"}"#,
+        )
+        .unwrap();
+        // No install.json at all: this is the state `rake install` left behind.
+
+        let app_dir = root.join("apps").join("vectorcraft");
+        assert!(is_failed_install(&app_dir, false));
+        assert!(is_failed_install(&app_dir, true));
+    }
+
+    #[test]
+    fn version_dir_without_manifest_is_failed() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let version_dir = root.join("apps").join("vectorcraft").join("0.4.0");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(
+            version_dir.join(install_meta::INSTALL_RECORD),
+            r#"{"version":"0.4.0","bucket":"extras"}"#,
+        )
+        .unwrap();
+
+        assert!(is_failed_install(
+            &root.join("apps").join("vectorcraft"),
+            false
+        ));
+    }
+
+    /// The reported case: `apps/vectorcraft/0.4.0` exists, the manifest is
+    /// there, `install.json` is not. `query` must say "failed, no bucket"
+    /// rather than inventing a bucket name.
+    #[test]
+    fn query_reports_a_broken_install_without_a_bucket() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let version_dir = root.join("apps").join("vectorcraft").join("0.4.0");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(
+            version_dir.join(install_meta::INSTALLED_MANIFEST),
+            r#"{"version":"0.4.0","description":"vector editor"}"#,
+        )
+        .unwrap();
+
+        let session = make_session(root);
+        let installed = query_installed(&session).unwrap();
+        assert_eq!(installed.len(), 1);
+
+        let pkg = &installed[0];
+        assert!(
+            pkg.install_failed,
+            "missing install.json is a failed install"
+        );
+        assert_eq!(pkg.version(), "0.4.0", "version comes from the directory");
+        match &pkg.status {
+            PackageStatus::Installed(state) => {
+                assert_eq!(state.bucket, None, "no bucket can be inferred");
+            }
+            other => panic!("expected Installed, got {other:?}"),
+        }
+        assert_eq!(pkg.bucket(), "", "no magic bucket placeholder");
+    }
+
+    #[test]
+    fn query_reports_a_healthy_install_with_its_bucket() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_installed_app(
+            &root,
+            "nu",
+            "0.116.1",
+            install_meta::INSTALLED_MANIFEST,
+            install_meta::INSTALL_RECORD,
+        );
+
+        let session = make_session(root);
+        let installed = query_installed(&session).unwrap();
+        assert!(!installed[0].install_failed);
+        assert_eq!(installed[0].bucket(), "main");
     }
 
     #[test]

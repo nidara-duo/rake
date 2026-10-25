@@ -25,6 +25,9 @@ use rake_domain::version::compare_versions;
 pub struct Args {
     /// Package(s) to update (use `*` for all installed)
     pub names: Vec<String>,
+    /// Update every installed package (same as passing `*`)
+    #[arg(long)]
+    pub all: bool,
     /// Force reinstall even if up-to-date
     #[arg(short, long)]
     pub force: bool,
@@ -53,6 +56,9 @@ pub struct Args {
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
+    /// Run the work-in-progress installer instead of the download-only stub
+    #[arg(long, hide = true)]
+    pub unstable_install: bool,
 }
 
 use crate::util::human_size;
@@ -411,7 +417,7 @@ fn needs_report(outcome: &update::BucketSyncOutcome, display_drew: bool) -> bool
 /// Update installed packages to latest versions
 pub async fn execute(args: Args, session: &Session) -> Result<()> {
     let installed = query::query_installed(session)?;
-    let has_wildcard = args.names.iter().any(|n| n == "*");
+    let has_wildcard = args.all || args.names.iter().any(|n| n == "*");
     let effective_names: Vec<String> = if has_wildcard {
         installed.iter().map(|p| p.name().to_owned()).collect()
     } else {
@@ -583,7 +589,23 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
     specs.retain(|s| !s.downloaded.is_empty());
 
     if specs.is_empty() {
+        drop(_guard);
+        let _ = ui_handle.join();
         println!("No packages were updated.");
+        return Ok(());
+    }
+
+    // Safe stub: the artifacts above are downloaded and verified, but nothing
+    // has been written into `apps/<app>` yet. `--unstable-install` is the only
+    // way to hand control to the work-in-progress installer.
+    if !args.unstable_install {
+        drop(_guard);
+        let _ = ui_handle.join();
+
+        for spec in &specs {
+            crate::util::report_install_stub("update", spec.candidate.name(), &spec.downloaded);
+        }
+
         return Ok(());
     }
 

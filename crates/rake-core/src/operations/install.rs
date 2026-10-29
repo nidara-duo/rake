@@ -265,13 +265,25 @@ async fn install_steps(
     let version_dir = txn.version_dir.clone();
     let persist_dir = txn.persist_dir.clone();
     let manifest = &pkg.manifest;
+    let fnames: Vec<String> = files.iter().map(|f| f.target_filename.clone()).collect();
+    let arch_str = arch.as_str();
 
     stage_and_extract(session, pkg, files, arch, &version_dir, tx).await?;
 
     // pre_install runs while the files are in the version directory but before
     // `current`, shims and persist exist (install.ps1:54).
     if let Some(lines) = manifest.resolve_pre_install(arch) {
-        run_hook(lines, &version_dir, &persist_dir, pkg.version())?;
+        run_hook(
+            lines,
+            &version_dir,
+            &version_dir,
+            &persist_dir,
+            pkg.version(),
+            pkg.name(),
+            arch_str,
+            &fnames,
+            roots,
+        )?;
     }
 
     run_installer(
@@ -280,6 +292,8 @@ async fn install_steps(
         &version_dir,
         &persist_dir,
         pkg.version(),
+        pkg.name(),
+        &fnames,
         roots,
         false,
     )?;
@@ -302,7 +316,17 @@ async fn install_steps(
     txn.persist_entries = apply_persistence(manifest, pkg.name(), &version_dir, &roots.persist)?;
 
     if let Some(lines) = manifest.resolve_post_install(arch) {
-        run_hook(lines, &version_dir, &persist_dir, pkg.version())?;
+        run_hook(
+            lines,
+            &dir,
+            &version_dir,
+            &persist_dir,
+            pkg.version(),
+            pkg.name(),
+            arch_str,
+            &fnames,
+            roots,
+        )?;
     }
 
     // The metadata is the commit record: written last, under both spellings so
@@ -438,14 +462,30 @@ pub(crate) fn version_component(pkg: &Package) -> String {
     }
 }
 
-/// Run a `pre_install` / `post_install` / `*_uninstall` hook standalone.
+/// Run a manifest hook with scoop's PowerShell library and context variables.
+#[allow(clippy::too_many_arguments)]
 fn run_hook(
     lines: &rake_domain::one_or_many::OneOrMany<String>,
-    version_dir: &Path,
+    ctx_dir: &Path,
+    original_dir: &Path,
     persist_dir: &Path,
     version: &str,
+    app: &str,
+    arch: &str,
+    fnames: &[String],
+    roots: &InstallRoots,
 ) -> Result<()> {
-    let ctx = script::HookContext::new(version_dir, persist_dir, version_dir, version);
+    let ctx = script::HookContext::with_scoop_lib(
+        ctx_dir,
+        persist_dir,
+        original_dir,
+        version,
+        &roots.root,
+        &roots.global,
+    )
+    .with_app(app)
+    .with_arch(arch)
+    .with_fnames(fnames);
     let body: Vec<String> = lines.iter().cloned().collect();
     script::run_powershell_script(&body, &ctx)
 }
@@ -456,12 +496,15 @@ fn run_hook(
 /// Order matters: the executable runs first and the hook script second. A
 /// `.ps1` executable is invoked inside PowerShell and is never deleted, because
 /// Scoop's `Remove-Item` sits in the `else` branch.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_installer(
     manifest: &Manifest,
     arch: Arch,
     dir: &Path,
     persist_dir: &Path,
     version: &str,
+    app: &str,
+    fnames: &[String],
     roots: &InstallRoots,
     uninstall: bool,
 ) -> Result<()> {
@@ -518,7 +561,17 @@ pub(crate) fn run_installer(
             if name.to_lowercase().ends_with(".ps1") {
                 // `& $progName @fnArgs` runs in-process, where scoop's library is
                 // already loaded — so the installer can call its functions.
-                run_ps1_installer(&prog, &fn_args, dir, persist_dir, version, roots)?;
+                run_ps1_installer(
+                    &prog,
+                    &fn_args,
+                    dir,
+                    persist_dir,
+                    version,
+                    app,
+                    arch.as_str(),
+                    fnames,
+                    roots,
+                )?;
             } else {
                 let status = Command::new(&prog).args(&fn_args).status()?;
                 if !status.success() {
@@ -547,7 +600,10 @@ pub(crate) fn run_installer(
             version,
             &roots.root,
             &roots.global,
-        );
+        )
+        .with_app(app)
+        .with_arch(arch.as_str())
+        .with_fnames(fnames);
         let body: Vec<String> = lines.iter().cloned().collect();
         script::run_powershell_script(&body, &ctx)?;
     }
@@ -555,12 +611,16 @@ pub(crate) fn run_installer(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_ps1_installer(
     prog: &Path,
     args: &[String],
     dir: &Path,
     persist_dir: &Path,
     version: &str,
+    app: &str,
+    arch: &str,
+    fnames: &[String],
     roots: &InstallRoots,
 ) -> Result<()> {
     let mut line = format!(
@@ -579,7 +639,10 @@ fn run_ps1_installer(
         version,
         &roots.root,
         &roots.global,
-    );
+    )
+    .with_app(app)
+    .with_arch(arch)
+    .with_fnames(fnames);
     script::run_powershell_script(&[line], &ctx)
 }
 
@@ -883,15 +946,25 @@ pub(crate) fn resolve_env_add_paths(manifest: &Manifest, arch: Arch, dir: &Path)
     };
     env_add_path
         .iter()
-        .filter(|entry| !entry.trim().is_empty())
-        // The name comes from the manifest and is joined onto `dir`, so it has to clear
-        // the same guard as `bin` and `persist`: `..` or an absolute path in it would
-        // otherwise place a PATH entry anywhere on the disk. `is_in_dir` below cannot
-        // catch this — a joined path with unresolved `..` still starts with `dir` as a
-        // string, so `..\..\..\..\Startup` passes the prefix test while resolving to
-        // `C:\Startup`.
-        .filter(|entry| crate::infra::fs::validate_relative_path("env_add_path", entry).is_ok())
-        .map(|entry| dir.join(entry))
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            // Scoop manifests such as `nodejs` use `"."` to put `<app>/current` itself
+            // on PATH (`Join-Path $dir "." | Get-AbsolutePath` == `$dir`).
+            let stripped = entry
+                .strip_prefix("./")
+                .or_else(|| entry.strip_prefix(".\\"))
+                .unwrap_or(entry);
+            if stripped == "." || stripped.is_empty() {
+                return Some(dir.to_path_buf());
+            }
+            // The name comes from the manifest and is joined onto `dir`, so it has to clear
+            // the same guard as `bin` and `persist`: `..` or an absolute path in it would
+            // otherwise place a PATH entry anywhere on the disk.
+            crate::infra::fs::validate_relative_path("env_add_path", stripped)
+                .ok()
+                .map(|()| dir.join(stripped))
+        })
         .filter(|joined| is_in_dir(dir, joined))
         .collect()
 }

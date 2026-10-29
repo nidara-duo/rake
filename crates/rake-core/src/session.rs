@@ -30,7 +30,11 @@ impl Session {
         let event_bus = EventBus::new();
         let http_client = Box::new(ReqwestClient::new(
             config.proxy.as_deref(),
-            Some("Rake/0.1.0 (+https://github.com/username/rake)"),
+            Some(concat!(
+                "Rake/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/nidara-duo/rake)"
+            )),
         )?);
         let env_service = Box::new(WindowsEnvService::new());
         let git_service = Box::new(Git::new());

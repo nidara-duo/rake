@@ -82,7 +82,7 @@ Commit locally only — the user decides when to push.
 
 ### Scope
 
-Lowercase, matches the crate or module name, e.g. `list`, `status`, `cli`, `libscoop`, `archive`, `bucket`.
+Lowercase, matches the crate or module name, e.g. `list`, `status`, `cli`, `core`, `archive`, `bucket`.
 
 ### Body
 

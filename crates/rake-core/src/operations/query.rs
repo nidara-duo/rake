@@ -481,6 +481,60 @@ pub fn latest_versions_for_installed(
         .collect())
 }
 
+/// Resolve the target bucket manifest for each installed package, preferring the
+/// bucket recorded in `install.json` (`PackageStatus::Installed(state.bucket)`)
+/// and falling back to scanning local buckets in order when unrecorded or missing.
+///
+/// Keyed by lowercase package name so callers can look up case-insensitively.
+pub fn find_update_candidates(
+    session: &Session,
+    installed: &[Package],
+) -> Result<HashMap<String, Package>> {
+    let _guard = session.read_lock()?;
+    let buckets = crate::operations::bucket::bucket_list(session)?;
+    let bucket_by_name: HashMap<&str, &crate::bucket::Bucket> =
+        buckets.iter().map(|b| (b.name(), b)).collect();
+
+    let mut out = HashMap::new();
+    for pkg in installed {
+        let recorded_bucket = match &pkg.status {
+            PackageStatus::Installed(state) => state.bucket.as_deref(),
+            _ => None,
+        };
+
+        let found = recorded_bucket
+            .and_then(|b_name| {
+                bucket_by_name.get(b_name).copied().or_else(|| {
+                    buckets
+                        .iter()
+                        .find(|b| b.name().eq_ignore_ascii_case(b_name))
+                })
+            })
+            .and_then(|b| {
+                b.load_manifest(pkg.name())
+                    .map(|m| (b.name().to_owned(), m))
+            })
+            .or_else(|| {
+                buckets.iter().find_map(|b| {
+                    b.load_manifest(pkg.name())
+                        .map(|m| (b.name().to_owned(), m))
+                })
+            });
+
+        if let Some((bucket_name, manifest)) = found {
+            let candidate = Package::new(
+                PackageIdent::new(bucket_name, pkg.name()),
+                manifest,
+                None,
+                PackageStatus::NotInstalled,
+            );
+            out.insert(pkg.name().to_ascii_lowercase(), candidate);
+        }
+    }
+
+    Ok(out)
+}
+
 pub fn find_synced_by_names(session: &Session, names: &[&str]) -> Result<Vec<Package>> {
     let _guard = session.read_lock()?;
     let buckets = crate::operations::bucket::bucket_list(session)?;
@@ -1026,5 +1080,46 @@ mod tests {
             query_synced_matching(&session, &["packageb".to_string()], false, false).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name(), "packageb");
+    }
+
+    #[test]
+    fn find_update_candidates_prefers_recorded_bucket_over_alphabetical_first() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let buckets_dir = root.join("buckets");
+        // extras comes first alphabetically before main, but main is recorded in install.json
+        std::fs::create_dir_all(buckets_dir.join("extras").join("bucket")).unwrap();
+        std::fs::create_dir_all(buckets_dir.join("main").join("bucket")).unwrap();
+
+        std::fs::write(
+            buckets_dir.join("extras").join("bucket").join("demo.json"),
+            r#"{"version":"9.9.9"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            buckets_dir.join("main").join("bucket").join("demo.json"),
+            r#"{"version":"1.2.0"}"#,
+        )
+        .unwrap();
+
+        let session = make_session(root);
+        let manifest_v1 = serde_json::from_str(r#"{"version":"1.0.0"}"#).unwrap();
+        let installed = vec![Package::new(
+            PackageIdent::new("main", "demo"),
+            manifest_v1,
+            None,
+            PackageStatus::Installed(InstallState {
+                version: "1.0.0".to_string(),
+                bucket: Some("main".to_string()),
+                arch: "64bit".to_string(),
+                held: false,
+                url: None,
+            }),
+        )];
+
+        let candidates = find_update_candidates(&session, &installed).unwrap();
+        let candidate = candidates.get("demo").expect("candidate must be found");
+        assert_eq!(candidate.bucket(), "main");
+        assert_eq!(candidate.version(), "1.2.0");
     }
 }

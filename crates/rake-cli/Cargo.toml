@@ -1,7 +1,9 @@
 [package]
 name = "rake-cli"
-version = "0.1.4-alpha.2"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Rake CLI binary"
 
 [dependencies]
@@ -11,11 +13,11 @@ rake-domain = { path = "../rake-domain" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
-crossterm = "0.29"
-indicatif = "0.17"
-serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["rt", "macros", "time"] }
-tracing = "0.1"
+crossterm.workspace = true
+indicatif.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]

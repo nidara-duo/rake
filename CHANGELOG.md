@@ -7,6 +7,29 @@ Each release section lists the user-visible effect, not the commits that
 produced it. Anything that changes behaviour, output, or the on-disk layout of a
 Scoop root belongs here.
 
+## [0.1.4-alpha.3]
+
+A development build addressing regressions in `rake update` and aligning the install/update pipeline with Scoop's runtime behavior.
+
+### Fixed
+
+- `rake update` no longer fails on packages with custom installer scripts (such as `zed`). PowerShell hooks (`pre_install`, `installer.script`, `post_install`, `pre_uninstall`, `post_uninstall`) now define `$fname` (scalar string for single-file downloads, `@(...)` array for multi-file downloads), `$app`, `$architecture`, and `$global = $false`. All hook scripts now dot-source Scoop's PowerShell library.
+- Manifest `env_add_path` entries pointing to `.` (or `./`, `.\`) are now resolved directly to `<app>\current`, allowing applications like Node.js and Python to place their root directory on `PATH` without being dropped by relative path guards.
+- Compound archives (`.tar.gz`, `.tar.bz2`, `.tar.xz`) falling back to 7-Zip decompression now use a two-pass extraction process (decompressing the outer container followed by inner `.tar` extraction), ensuring nested payload files and `extract_dir` targets unpack completely.
+- Scoop cache filenames now use modern Scoop format `<app>#<version>#<sha256(url)[..7]><ext>`, preventing Windows `MAX_PATH` overflow on long release URLs while preserving backward compatibility for reading legacy cache files.
+- `rake update` now resolves the update candidate manifest from the bucket recorded in `scoop-install.json` first, matching `rake status` and preventing cross-bucket version conflicts.
+- `rake update -v <pkg>` (`--verbose`) no longer mistakenly treats the package name as a boolean argument for verbose mode. Added short flag `-a` for `--all`.
+- `rake update` now reliably flushes all progress events before exiting and returns a non-zero exit status if any package update fails.
+- Windows NTFS junction targets during `rake update` have verbatim `\\?\` path prefixes normalized when comparing active versus new version directories.
+
+### Changed
+
+- Root `Cargo.toml` now defines `[workspace.package]` and centralized `[workspace.dependencies]`, unifying versioning, edition 2024, licensing, and shared dependency versions across crates (`rake-shim-bin` preserves edition 2021 and vendored license).
+- Hash parsing and verification (`MD5`, `SHA1`, `SHA256`, `SHA512`) extracted into a dedicated `rake-hash` crate with `unsafe_code = "forbid"`.
+- `User-Agent` string now dynamically includes the crate version and repository URL.
+- Structured diagnostics logging via `RAKE_LOG` is routed to `stderr` to avoid interfering with stdout redirection and pipes.
+- Release workflow in GitHub Actions now validates the tag against `[workspace.package]` in root `Cargo.toml`.
+
 ## [0.1.4-alpha.2]
 
 A development build. As with 0.1.4-alpha.1, `install <app>` and `update <app>`

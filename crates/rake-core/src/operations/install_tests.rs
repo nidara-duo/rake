@@ -40,6 +40,19 @@ mod tests {
     }
 
     #[test]
+    fn env_add_path_resolves_dot_to_the_app_directory_itself() {
+        let m = manifest_with_env_add_path(r#"{"version":"1","env_add_path":["bin","."]}"#);
+        let resolved = resolve_env_add_paths(&m, Arch::Amd64, &app_dir());
+        assert_eq!(
+            resolved,
+            vec![
+                PathBuf::from(r"C:\rake\apps\demo\current\bin"),
+                PathBuf::from(r"C:\rake\apps\demo\current"),
+            ]
+        );
+    }
+
+    #[test]
     fn env_add_path_accepts_several_entries() {
         let m =
             manifest_with_env_add_path(r#"{"version":"1","env_add_path":["bin","lib","share"]}"#);
@@ -752,7 +765,7 @@ mod lifecycle_tests {
         record.held = true;
         install_meta::write_install_record(&old_version_dir, &record).unwrap();
 
-        let updated = update_packages(
+        let report = update_packages(
             &session,
             &[UpdateSpec {
                 installed: installed_package(&ident, manifest_v1.clone()),
@@ -769,6 +782,12 @@ mod lifecycle_tests {
         .await
         .expect("update should succeed");
 
+        assert!(
+            report.failed.is_empty(),
+            "unexpected failures: {:?}",
+            report.failed
+        );
+        let updated = report.updated;
         assert_eq!(updated.len(), 1, "the package must be reported as updated");
         assert!(
             updated[0].status.is_held(),
@@ -832,6 +851,81 @@ mod lifecycle_tests {
         assert!(
             new_record.held,
             "hold must be written to the new install.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_update_restores_old_version_and_records_failure_in_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("scoop");
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+
+        let v1_file = cache.join("demo#1.0.0#demo.zip");
+        write_zip(&v1_file, &[("app.txt", b"v1")]);
+        let v2_file = cache.join("demo#2.0.0#demo.zip");
+        write_zip(&v2_file, &[("app.txt", b"v2")]);
+
+        let ident = PackageIdent::new("main", "demo");
+        let manifest_v1: Manifest = serde_json::from_value(serde_json::json!({
+            "version": "1.0.0",
+            "url": "https://example.com/demo.zip"
+        }))
+        .unwrap();
+        let manifest_v2: Manifest = serde_json::from_value(serde_json::json!({
+            "version": "2.0.0",
+            "url": "https://example.com/demo.zip",
+            "post_install": "exit 1"
+        }))
+        .unwrap();
+
+        let session = session(&root);
+        let v1_pkg = Package::new(
+            ident.clone(),
+            manifest_v1.clone(),
+            None,
+            PackageStatus::NotInstalled,
+        );
+        install_packages(
+            &session,
+            &[v1_pkg],
+            &[downloaded(&ident, &v1_file, "demo.zip")],
+            Arch::Amd64,
+        )
+        .await
+        .expect("v1 install should succeed");
+
+        let app_dir = root.join("apps").join("demo");
+        assert_eq!(
+            std::fs::read(app_dir.join("current").join("app.txt")).unwrap(),
+            b"v1"
+        );
+
+        let report = update_packages(
+            &session,
+            &[UpdateSpec {
+                installed: installed_package(&ident, manifest_v1),
+                candidate: Package::new(
+                    ident.clone(),
+                    manifest_v2,
+                    None,
+                    PackageStatus::NotInstalled,
+                ),
+                arch: Arch::Amd64,
+                downloaded: vec![downloaded(&ident, &v2_file, "demo.zip")],
+            }],
+        )
+        .await
+        .expect("update_packages returns Ok(report) on per-package failure");
+
+        assert_eq!(report.updated.len(), 0);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0.name, "demo");
+
+        // The old version is restored
+        assert_eq!(
+            std::fs::read(app_dir.join("current").join("app.txt")).unwrap(),
+            b"v1"
         );
     }
 
@@ -1149,6 +1243,61 @@ mod uninstall_lifecycle_tests {
             std::fs::read(persist_dir.join("config").join("user.cfg")).unwrap(),
             b"mine",
             "a plain uninstall must never delete persisted data"
+        );
+    }
+
+    #[tokio::test]
+    async fn hooks_see_fname_and_post_install_sees_current_as_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("scoop");
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+
+        let archive = cache.join("demo#1.0.0#demo.zip");
+        write_zip(&archive, &[("app.txt", b"content")]);
+
+        let ident = PackageIdent::new("main", "demo");
+        let pkg_manifest: Manifest = serde_json::from_value(serde_json::json!({
+            "version": "1.0.0",
+            "url": "https://example.com/demo.zip",
+            "installer": {
+                "script": r#"Set-Content -LiteralPath "$dir\fname.txt" -Value $fname"#
+            },
+            "post_install": r#"Set-Content -LiteralPath "$original_dir\dirs.txt" -Value "$dir|$original_dir""#
+        }))
+        .unwrap();
+        let pkg = Package::new(
+            ident.clone(),
+            pkg_manifest,
+            None,
+            PackageStatus::NotInstalled,
+        );
+
+        let session = session(&root);
+        install_packages(
+            &session,
+            &[pkg],
+            &[downloaded(&ident, &archive, "demo.zip")],
+            Arch::Amd64,
+        )
+        .await
+        .expect("install should succeed");
+
+        let app_dir = root.join("apps").join("demo");
+        let version_dir = app_dir.join("1.0.0");
+        let current_dir = app_dir.join("current");
+
+        let fname_content = std::fs::read_to_string(version_dir.join("fname.txt")).unwrap();
+        assert_eq!(fname_content.trim(), "demo.zip");
+
+        let dirs_content = std::fs::read_to_string(version_dir.join("dirs.txt")).unwrap();
+        assert_eq!(
+            dirs_content.trim(),
+            format!(
+                "{}|{}",
+                current_dir.to_string_lossy(),
+                version_dir.to_string_lossy()
+            )
         );
     }
 }

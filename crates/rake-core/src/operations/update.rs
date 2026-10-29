@@ -272,10 +272,22 @@ pub async fn bucket_update(session: &Session) -> Result<BucketSyncReport> {
     Ok(report)
 }
 
-pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<Vec<Package>> {
+/// Outcome of updating a batch of packages.
+///
+/// One failing package rolls back to its previous version without aborting the
+/// remaining packages in the batch, while still letting the CLI report failures
+/// and exit with a non-zero status code.
+#[derive(Debug)]
+pub struct UpdateBatchReport {
+    pub updated: Vec<Package>,
+    pub failed: Vec<(rake_domain::package::PackageIdent, String)>,
+}
+
+pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<UpdateBatchReport> {
     let roots = install::InstallRoots::from_session(session);
     let tx = session.event_bus().core_sender();
     let mut updated = Vec::new();
+    let mut failed = Vec::new();
 
     for spec in specs {
         let _ = tx.try_send(Event::UpdateStart(
@@ -284,26 +296,23 @@ pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<
             spec.candidate.version().to_owned(),
         ));
 
-        // Everything is already downloaded (the caller drops specs whose
-        // download failed), so nothing here can leave the old version touched
-        // because of a network problem.
         match update_one(session, spec, &roots, &tx).await {
             Ok(pkg) => {
                 let _ = tx.try_send(Event::UpdateDone(pkg.ident.clone()));
                 updated.push(pkg);
             }
             Err(e) => {
-                // The old version has been put back by `update_one`; one package
-                // failing must not abandon the rest of the batch.
+                let reason = e.to_string();
                 let _ = tx.try_send(Event::UpdateProgress(format!(
-                    "Failed to update '{}', keeping the old version: {e}",
+                    "Failed to update '{}', keeping the old version: {reason}",
                     spec.candidate.name()
                 )));
+                failed.push((spec.candidate.ident.clone(), reason));
             }
         }
     }
 
-    Ok(updated)
+    Ok(UpdateBatchReport { updated, failed })
 }
 
 /// Update one package: deactivate the old version, install the new one, then
@@ -324,7 +333,17 @@ async fn update_one(
     let persist_dir = roots.persist.join(spec.installed.name());
     let old_version = install::version_component(&spec.installed);
     let new_version = install::version_component(&spec.candidate);
-    let old_dir = app_dir.join(&old_version);
+    let old_dir = {
+        let by_version = app_dir.join(&old_version);
+        if by_version.exists() {
+            by_version
+        } else {
+            std::fs::read_link(app_dir.join("current"))
+                .ok()
+                .and_then(|target| target.file_name().map(|name| app_dir.join(name)))
+                .unwrap_or(by_version)
+        }
+    };
     let new_dir = app_dir.join(&new_version);
 
     // `hold` and the manifest come from what is actually on disk. The bucket
@@ -468,12 +487,16 @@ fn deactivate_old(
     // 1. pre_uninstall, best effort: Scoop does not fail an uninstall because a
     //    notification hook could not run.
     if let Some(lines) = manifest.resolve_pre_uninstall(arch) {
-        let ctx = script::HookContext::new(
+        let ctx = script::HookContext::with_scoop_lib(
             version_dir,
             persist_dir,
             version_dir,
             spec.installed.version(),
-        );
+            &roots.root,
+            &roots.global,
+        )
+        .with_app(spec.installed.name())
+        .with_arch(arch.as_str());
         let body: Vec<String> = lines.iter().cloned().collect();
         let _ = script::run_powershell_script(&body, &ctx);
     }
@@ -487,6 +510,8 @@ fn deactivate_old(
         version_dir,
         persist_dir,
         spec.installed.version(),
+        spec.installed.name(),
+        &[],
         roots,
         true,
     )?;
@@ -529,12 +554,16 @@ fn deactivate_old(
 
     // 7. post_uninstall, best effort. It still sees the version directory.
     if let Some(lines) = manifest.resolve_post_uninstall(arch) {
-        let ctx = script::HookContext::new(
+        let ctx = script::HookContext::with_scoop_lib(
             version_dir,
             persist_dir,
             version_dir,
             spec.installed.version(),
-        );
+            &roots.root,
+            &roots.global,
+        )
+        .with_app(spec.installed.name())
+        .with_arch(arch.as_str());
         let body: Vec<String> = lines.iter().cloned().collect();
         let _ = script::run_powershell_script(&body, &ctx);
     }

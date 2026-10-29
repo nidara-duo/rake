@@ -169,7 +169,13 @@ impl NativeArchive {
                                 src.display()
                             );
                             staged.reset()?;
-                            run_7z(&helper, src, &staged.staging, None)?;
+                            run_7z_stream_fallback(
+                                &helper,
+                                src,
+                                &staged.staging,
+                                format,
+                                staged.extract_dir.as_deref(),
+                            )?;
                             staged.finish()
                         }
                         None => Err(native_error),
@@ -430,6 +436,46 @@ fn extract_7z(
     sevenz_rust2::decompress_file(src, &staged.staging)
         .map_err(|e| crate::Error::Archive(format!("7z: {e}")))?;
     staged.finish()
+}
+
+fn run_7z_stream_fallback(
+    helper: &Path,
+    src: &Path,
+    staging: &Path,
+    format: ArchiveFormat,
+    extract_dir: Option<&str>,
+) -> Result<()> {
+    if matches!(
+        format,
+        ArchiveFormat::TarGz | ArchiveFormat::TarBz2 | ArchiveFormat::TarXz
+    ) {
+        // 7-Zip unpacks only the outer compression layer of `.tar.{gz,bz2,xz}` on the
+        // first pass, producing a single `.tar` file (Scoop `Expand-7zipArchive`,
+        // lib/decompress.ps1:83-102). Unpack that outer stream into a sibling temp dir,
+        // then extract the inner `.tar` into `staging`.
+        let tar_tmp = tempfile::Builder::new()
+            .prefix("rake-tar-")
+            .tempdir_in(staging.parent().unwrap_or(staging))
+            .map_err(crate::Error::Io)?;
+
+        run_7z(helper, src, tar_tmp.path(), None)?;
+
+        let inner_tar = std::fs::read_dir(tar_tmp.path())
+            .map_err(crate::Error::Io)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.is_file())
+            .ok_or_else(|| {
+                crate::Error::Archive(format!(
+                    "7-Zip outer pass produced no inner tar for {}",
+                    src.display()
+                ))
+            })?;
+
+        run_7z(helper, &inner_tar, staging, extract_dir)
+    } else {
+        run_7z(helper, src, staging, extract_dir)
+    }
 }
 
 /// Run 7-Zip's `x` command into `dest`.
@@ -1400,6 +1446,55 @@ mod innosetup_extraction_tests {
         assert!(
             cache_file.exists(),
             "cache file must survive InnoSetup extraction"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn compound_tar_gz_7z_fallback_unpacks_both_layers_and_honours_extract_dir() {
+        let Some(helper) = find_7z(None) else {
+            return;
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src_tar_gz = tmp.path().join("archive.tar.gz");
+
+        // Create a real .tar.gz with package/bin/app.js
+        {
+            let tar_gz_file = tokio::fs::File::create(&src_tar_gz).await.unwrap();
+            let enc = async_compression::tokio::write::GzipEncoder::new(tar_gz_file);
+            let mut tar_builder = tokio_tar::Builder::new(enc);
+
+            let data = b"console.log('hello from app');";
+            let mut header = tokio_tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, "package/bin/app.js", &data[..])
+                .await
+                .unwrap();
+            let mut enc = tar_builder.into_inner().await.unwrap();
+            tokio::io::AsyncWriteExt::shutdown(&mut enc).await.unwrap();
+        }
+
+        let dest = tmp.path().join("dest");
+        let staged = StagedExtraction::new(&dest, Some("package")).unwrap();
+
+        run_7z_stream_fallback(
+            &helper,
+            &src_tar_gz,
+            &staged.staging,
+            ArchiveFormat::TarGz,
+            staged.extract_dir.as_deref(),
+        )
+        .unwrap();
+
+        staged.finish().unwrap();
+
+        assert_eq!(
+            std::fs::read(dest.join("bin").join("app.js")).unwrap(),
+            b"console.log('hello from app');"
         );
     }
 }

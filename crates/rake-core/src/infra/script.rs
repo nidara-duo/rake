@@ -34,6 +34,9 @@ pub struct HookContext<'a> {
     /// `Invoke-ExternalCommand`, `Expand-InnoArchive`, ...), which resolve only when
     /// scoop's `lib/` is dot-sourced. Callers pass the roots to enable that.
     pub scoop_roots: Option<(&'a Path, &'a Path)>,
+    pub app: Option<&'a str>,
+    pub arch: Option<&'a str>,
+    pub fnames: &'a [String],
 }
 
 impl<'a> HookContext<'a> {
@@ -54,6 +57,9 @@ impl<'a> HookContext<'a> {
             original_dir,
             version,
             scoop_roots: None,
+            app: None,
+            arch: None,
+            fnames: &[],
         }
     }
 
@@ -76,8 +82,54 @@ impl<'a> HookContext<'a> {
             original_dir,
             version,
             scoop_roots: Some((root, global_root)),
+            app: None,
+            arch: None,
+            fnames: &[],
         }
     }
+
+    pub fn with_app(mut self, app: &'a str) -> Self {
+        self.app = Some(app);
+        self
+    }
+
+    pub fn with_arch(mut self, arch: &'a str) -> Self {
+        self.arch = Some(arch);
+        self
+    }
+
+    pub fn with_fnames(mut self, fnames: &'a [String]) -> Self {
+        self.fnames = fnames;
+        self
+    }
+}
+
+fn format_extra_hook_vars(ctx: &HookContext<'_>) -> String {
+    let mut out = String::new();
+    if let Some(app) = ctx.app {
+        out.push_str(&format!("$app = {}\r\n", quote_powershell_string(app)));
+    }
+    if let Some(arch) = ctx.arch {
+        out.push_str(&format!(
+            "$architecture = {}\r\n",
+            quote_powershell_string(arch)
+        ));
+    }
+    match ctx.fnames {
+        [] => {}
+        [single] => {
+            out.push_str(&format!("$fname = {}\r\n", quote_powershell_string(single)));
+        }
+        many => {
+            let joined = many
+                .iter()
+                .map(|s| quote_powershell_string(s))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("$fname = @({joined})\r\n"));
+        }
+    }
+    out
 }
 
 /// Execute a list of PowerShell script lines (e.g. `pre_install`, `post_install`).
@@ -104,7 +156,7 @@ pub fn run_powershell_script(lines: &[String], ctx: &HookContext) -> Result<()> 
     // When scoop's library is requested, its prelude replaces these four assignments:
     // it defines the same variables and additionally loads the functions a manifest
     // hook is likely to call.
-    let header = match ctx.scoop_roots {
+    let mut header = match ctx.scoop_roots {
         Some((root, global_root)) => {
             let lib = crate::infra::scoop_lib::ensure_library(root)?;
             crate::infra::scoop_lib::build_prelude(
@@ -118,13 +170,19 @@ pub fn run_powershell_script(lines: &[String], ctx: &HookContext) -> Result<()> 
             )
         }
         None => format!(
-            "$dir = {dir}\r\n$persist_dir = {persist_dir}\r\n$original_dir = {original_dir}\r\n$version = {version}\r\n\r\n",
+            "$global = $false\r\n$dir = {dir}\r\n$persist_dir = {persist_dir}\r\n$original_dir = {original_dir}\r\n$version = {version}\r\n",
             dir = dir,
             persist_dir = persist_dir,
             original_dir = original_dir,
             version = version,
         ),
     };
+
+    let extra = format_extra_hook_vars(ctx);
+    if !extra.is_empty() {
+        header.push_str(&extra);
+    }
+    header.push_str("\r\n");
 
     run_body(&format!("{header}{script_body}")).map(|_| ())
 }
@@ -370,5 +428,60 @@ mod tests {
             tmp.path().to_string_lossy(),
             "the header must survive a body full of quotes"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hook_exposes_scalar_fname_app_and_arch_for_single_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let version_dir = tmp.path().join("apps").join("zed").join("1.26.2");
+        let persist_dir = tmp.path().join("persist").join("zed");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::create_dir_all(&persist_dir).unwrap();
+
+        let marker = tmp.path().join("marker.txt");
+        let fnames = vec!["zed.exe".to_owned()];
+        let ctx = HookContext::new(&version_dir, &persist_dir, &version_dir, "1.26.2")
+            .with_app("zed")
+            .with_arch("64bit")
+            .with_fnames(&fnames);
+
+        let lines = vec![format!(
+            "Set-Content -LiteralPath '{}' -Value \"$dir\\$fname|$app|$architecture\"",
+            marker.to_string_lossy()
+        )];
+
+        run_powershell_script(&lines, &ctx).unwrap();
+
+        let written = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(
+            written.trim_end(),
+            format!("{}\\zed.exe|zed|64bit", version_dir.to_string_lossy())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hook_exposes_array_fname_for_multiple_downloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let version_dir = tmp.path().join("apps").join("multi").join("1.0.0");
+        let persist_dir = tmp.path().join("persist").join("multi");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::create_dir_all(&persist_dir).unwrap();
+
+        let marker = tmp.path().join("marker.txt");
+        let fnames = vec!["one.7z".to_owned(), "two.7z".to_owned()];
+        let ctx = HookContext::new(&version_dir, &persist_dir, &version_dir, "1.0.0")
+            .with_fnames(&fnames);
+
+        let lines = vec![format!(
+            "Set-Content -LiteralPath '{}' -Value \"$($fname[0])|$($fname[1])\"",
+            marker.to_string_lossy()
+        )];
+
+        run_powershell_script(&lines, &ctx).unwrap();
+
+        let written = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(written.trim_end(), "one.7z|two.7z");
     }
 }

@@ -62,18 +62,17 @@ jobs:
           # A tag that disagrees with the crate version would ship a binary whose
           # --version does not match the release it is filed under.
           #
-          # Read from the crate that actually produces the binary, not from the workspace
-          # root: `[workspace]` has no version of its own — Cargo rejects that key, so a
-          # copy of it there was dead weight that only this check happened to read.
-          $cliManifest = "crates/rake-cli/Cargo.toml"
-          if (-not (Test-Path $cliManifest)) {
-            Write-Error "cannot find $cliManifest"
+          # Read from [workspace.package] in the root Cargo.toml, which is the
+          # canonical version inherited across workspace crates.
+          $workspaceManifest = "Cargo.toml"
+          if (-not (Test-Path $workspaceManifest)) {
+            Write-Error "cannot find $workspaceManifest"
             exit 1
           }
-          $declared = (Select-String -Path $cliManifest -Pattern '^version = "(.+)"$' |
+          $declared = (Select-String -Path $workspaceManifest -Pattern '^version = "(.+)"$' |
                        Select-Object -First 1).Matches[0].Groups[1].Value
           if ($declared -ne $version) {
-            Write-Error "tag is $tag but $cliManifest says $declared"
+            Write-Error "tag is $tag but $workspaceManifest says $declared"
             exit 1
           }
 

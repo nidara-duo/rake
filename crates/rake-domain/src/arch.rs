@@ -19,6 +19,14 @@ impl Arch {
             _ => Arch::Amd64,
         }
     }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Arch::Ia32 => "32bit",
+            Arch::Amd64 => "64bit",
+            Arch::Aarch64 => "arm64",
+        }
+    }
 }
 
 /// Parse the spellings that reach us from `install.json` and the CLI.
@@ -42,11 +50,7 @@ impl std::str::FromStr for Arch {
 
 impl std::fmt::Display for Arch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Arch::Ia32 => write!(f, "32bit"),
-            Arch::Amd64 => write!(f, "64bit"),
-            Arch::Aarch64 => write!(f, "arm64"),
-        }
+        write!(f, "{}", self.as_str())
     }
 }
 

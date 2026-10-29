@@ -20,7 +20,7 @@ pub struct Args {
     pub names: Vec<String>,
     /// Architecture override (32bit, 64bit, arm64)
     #[arg(short, long)]
-    pub arch: Option<String>,
+    pub arch: Option<Arch>,
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
@@ -37,20 +37,11 @@ fn parse_app_name(raw: &str) -> &str {
     raw.split('@').next().unwrap_or(raw)
 }
 
-fn get_arch(arch_str: Option<&str>) -> Arch {
-    match arch_str {
-        Some("32bit") => Arch::Ia32,
-        Some("64bit") => Arch::Amd64,
-        Some("arm64") => Arch::Aarch64,
-        _ => Arch::current(),
-    }
-}
-
 use crate::util::human_size;
 
 pub async fn execute(args: Args, session: &Session) -> Result<()> {
     let mut stdout = std::io::stdout();
-    let arch = get_arch(args.arch.as_deref());
+    let arch = args.arch.unwrap_or_else(Arch::current);
 
     // 1. Resolve packages
     write!(stdout, "\rResolving packages...\r")?;
@@ -428,4 +419,28 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use rake_domain::arch::Arch;
+
+    #[test]
+    fn parses_arch_flags() {
+        let args = Args::try_parse_from(["install", "--arch", "64bit", "git"]).unwrap();
+        assert_eq!(args.arch, Some(Arch::Amd64));
+
+        let args = Args::try_parse_from(["install", "--arch", "arm64", "git"]).unwrap();
+        assert_eq!(args.arch, Some(Arch::Aarch64));
+
+        let args = Args::try_parse_from(["install", "-a", "32bit", "git"]).unwrap();
+        assert_eq!(args.arch, Some(Arch::Ia32));
+
+        let args = Args::try_parse_from(["install", "git"]).unwrap();
+        assert_eq!(args.arch, None);
+
+        assert!(Args::try_parse_from(["install", "--arch", "invalid", "git"]).is_err());
+    }
 }

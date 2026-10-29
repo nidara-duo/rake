@@ -75,8 +75,16 @@ pub fn uninstall_packages(
         if let Some(ref m) = manifest
             && let Some(script_lines) = m.resolve_pre_uninstall(arch)
         {
-            let ctx =
-                script::HookContext::new(&version_dir, &pkg_persist_dir, &version_dir, version_str);
+            let ctx = script::HookContext::with_scoop_lib(
+                &version_dir,
+                &pkg_persist_dir,
+                &version_dir,
+                version_str,
+                &roots.root,
+                &roots.global,
+            )
+            .with_app(&name)
+            .with_arch(arch.as_str());
             let _ = script::run_powershell_script(
                 &script_lines.iter().cloned().collect::<Vec<_>>(),
                 &ctx,
@@ -93,6 +101,8 @@ pub fn uninstall_packages(
                 &version_dir,
                 &pkg_persist_dir,
                 version_str,
+                &name,
+                &[],
                 &roots,
                 true,
             )?;
@@ -194,8 +204,16 @@ pub fn uninstall_packages(
             && let Some(script_lines) = m.resolve_post_uninstall(arch)
             && pkg_persist_dir.exists()
         {
-            let ctx =
-                script::HookContext::new(&version_dir, &pkg_persist_dir, &version_dir, version_str);
+            let ctx = script::HookContext::with_scoop_lib(
+                &version_dir,
+                &pkg_persist_dir,
+                &version_dir,
+                version_str,
+                &roots.root,
+                &roots.global,
+            )
+            .with_app(&name)
+            .with_arch(arch.as_str());
             let _ = script::run_powershell_script(
                 &script_lines.iter().cloned().collect::<Vec<_>>(),
                 &ctx,

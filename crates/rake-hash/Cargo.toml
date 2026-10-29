@@ -1,8 +1,19 @@
 [package]
 name = "rake-hash"
-version = "0.1.4-alpha.2"
-edition = "2024"
-description = "Hash verification for Rake — SHA256, MD5, SHA1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hash verification for Rake — MD5, SHA1, SHA256, SHA512"
+
+[dependencies]
+hex.workspace = true
+md5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

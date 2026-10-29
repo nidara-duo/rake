@@ -26,7 +26,7 @@ pub struct Args {
     /// Package(s) to update (use `*` for all installed)
     pub names: Vec<String>,
     /// Update every installed package (same as passing `*`)
-    #[arg(long)]
+    #[arg(short = 'a', long)]
     pub all: bool,
     /// Force reinstall even if up-to-date
     #[arg(short, long)]
@@ -50,6 +50,7 @@ pub struct Args {
         long,
         num_args = 0..=1,
         default_missing_value = "true",
+        require_equals = true,
         action = clap::ArgAction::Set
     )]
     pub verbose: Option<bool>,
@@ -66,15 +67,6 @@ pub struct Args {
 }
 
 use crate::util::human_size;
-
-fn get_arch(arch_str: Option<&str>) -> Arch {
-    match arch_str {
-        Some("32bit") => Arch::Ia32,
-        Some("64bit") => Arch::Amd64,
-        Some("arm64") => Arch::Aarch64,
-        _ => Arch::current(),
-    }
-}
 
 struct DoneFlag(Arc<AtomicBool>);
 
@@ -268,6 +260,10 @@ fn spawn_update_ui(
             }
         }
 
+        while let Ok(event) = rx.try_recv() {
+            handle_event(event);
+        }
+
         for (_, pb) in download_bars.drain() {
             pb.finish_and_clear();
         }
@@ -364,6 +360,13 @@ fn spawn_bucket_ui(session: &Session, done: Arc<AtomicBool>) -> thread::JoinHand
             }
         }
 
+        while !stop {
+            match rx.try_recv() {
+                Ok(event) => stop = handle(&event),
+                Err(_) => break,
+            }
+        }
+
         for (_, pb) in spinners.drain() {
             pb.finish_and_clear();
         }
@@ -445,21 +448,18 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
         return Ok(());
     }
 
-    let synced = rake_core::operations::query::find_synced_by_names(
-        session,
-        &effective_names
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-    )?;
+    let candidates = rake_core::operations::query::find_update_candidates(session, &installed)?;
 
-    let installed_by_name: HashMap<&str, &Package> =
-        installed.iter().map(|p| (p.name(), p)).collect();
+    let installed_by_name: HashMap<String, &Package> = installed
+        .iter()
+        .map(|p| (p.name().to_ascii_lowercase(), p))
+        .collect();
 
     let mut specs: Vec<UpdateSpec> = Vec::new();
 
     for target_name in &effective_names {
-        let installed_pkg = match installed_by_name.get(target_name.as_str()) {
+        let key = target_name.to_ascii_lowercase();
+        let installed_pkg = match installed_by_name.get(&key) {
             Some(p) => *p,
             None => {
                 eprintln!(" '{}' is not installed", style(target_name).red());
@@ -468,14 +468,14 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
         };
 
         let arch = match &installed_pkg.status {
-            PackageStatus::Installed(state) => get_arch(Some(&state.arch)),
+            PackageStatus::Installed(state) => state
+                .arch
+                .parse::<Arch>()
+                .unwrap_or_else(|_| Arch::current()),
             _ => Arch::current(),
         };
 
-        let candidate = match synced
-            .iter()
-            .find(|p| p.name().eq_ignore_ascii_case(target_name))
-        {
+        let candidate = match candidates.get(&key) {
             Some(p) => p,
             None => {
                 eprintln!(" '{}' not found in any bucket", style(target_name).red());
@@ -595,8 +595,7 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
     if specs.is_empty() {
         drop(_guard);
         let _ = ui_handle.join();
-        println!("No packages were updated.");
-        return Ok(());
+        anyhow::bail!("failed to download requested package updates");
     }
 
     // Dry run: the artifacts above are downloaded and verified, but nothing is
@@ -612,28 +611,33 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
         return Ok(());
     }
 
-    let result = update_packages(session, &specs).await;
+    let report = update_packages(session, &specs).await?;
 
     drop(_guard);
     let _ = ui_handle.join();
 
-    match result {
-        Ok(updated) => {
-            for pkg in &updated {
-                println!(
-                    " {} '{}' ({}) updated!",
-                    style("✓").green(),
-                    style(pkg.name()).green(),
-                    pkg.version(),
-                );
-            }
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Update failed: {e}");
-            Err(e.into())
-        }
+    for pkg in &report.updated {
+        println!(
+            " {} '{}' ({}) updated!",
+            style("✓").green(),
+            style(pkg.name()).green(),
+            pkg.version(),
+        );
     }
+
+    if !report.failed.is_empty() {
+        for (ident, reason) in &report.failed {
+            eprintln!(
+                " {} '{}' failed to update: {}",
+                style("✗").red(),
+                style(&ident.name).red(),
+                reason,
+            );
+        }
+        anyhow::bail!("{} package(s) failed to update", report.failed.len());
+    }
+
+    Ok(())
 }
 
 /// Bucket-sync only mode: update all buckets.
@@ -757,21 +761,52 @@ mod tests {
     /// flag, or hand back `Some(false)` and quietly override the setting the wrong way.
     #[test]
     fn the_flag_can_be_written_both_ways() {
-        let args = Args::try_parse_from(["rake", "update", "-v"]).unwrap();
+        let args = Args::try_parse_from(["update", "-v"]).unwrap();
         assert_eq!(args.verbose, Some(true), "-v alone must mean true");
 
-        let args = Args::try_parse_from(["rake", "update", "--verbose"]).unwrap();
+        let args = Args::try_parse_from(["update", "--verbose"]).unwrap();
         assert_eq!(args.verbose, Some(true), "--verbose alone must mean true");
 
-        let args = Args::try_parse_from(["rake", "update", "-v", "false"]).unwrap();
+        let args = Args::try_parse_from(["update", "-v=false"]).unwrap();
         assert_eq!(
             args.verbose,
             Some(false),
             "an explicit value must be honoured"
         );
 
-        let args = Args::try_parse_from(["rake", "update"]).unwrap();
+        let args = Args::try_parse_from(["update", "--verbose=false"]).unwrap();
+        assert_eq!(
+            args.verbose,
+            Some(false),
+            "an explicit value must be honoured"
+        );
+
+        let args = Args::try_parse_from(["update"]).unwrap();
         assert_eq!(args.verbose, None, "absent must stay absent");
+    }
+
+    #[test]
+    fn verbose_short_flag_does_not_swallow_package_name() {
+        let args = Args::try_parse_from(["update", "-v", "git"]).unwrap();
+        assert_eq!(args.verbose, Some(true));
+        assert_eq!(args.names, vec!["git"]);
+
+        let cli = crate::cmd::Cli::try_parse_from(["rake", "update", "-v", "git"]).unwrap();
+        match cli.command {
+            crate::cmd::Command::Update(cli_args) => {
+                assert_eq!(cli_args.verbose, Some(true));
+                assert_eq!(cli_args.names, vec!["git"]);
+            }
+            _ => panic!("expected Update command"),
+        }
+    }
+
+    #[test]
+    fn all_flag_accepts_short_a_and_long_all() {
+        let short = Args::try_parse_from(["update", "-a"]).unwrap();
+        assert!(short.all);
+        let long = Args::try_parse_from(["update", "--all"]).unwrap();
+        assert!(long.all);
     }
 
     /// Turning the setting off gives the short form; the flag still reaches it.

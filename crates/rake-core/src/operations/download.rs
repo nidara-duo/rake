@@ -1,12 +1,9 @@
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use futures_util::future::join_all;
-use md5::Md5;
 use rake_domain::arch::Arch;
 use rake_domain::package::{Package, PackageIdent};
-use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256};
 
 use crate::Result;
 use crate::event::Event;
@@ -362,25 +359,12 @@ pub fn target_filename(url: &str) -> String {
     }
 }
 
-/// Generate the cache filename exactly as Scoop's `cache_path` does:
-/// `<app>#<version>#<url>`, where every run of characters outside
-/// `[\w.-]` in the *whole* URL (fragment included) becomes a single `_`.
+/// Generate the cache filename matching current Scoop's `cache_path`
+/// (`lib/core.ps1:397-401`): `<app>#<version>#<sha256(url)[..7]><ext>`.
 ///
-/// The full URL is what makes two artifacts of one package distinct:
-/// `https://example.com/file.exe#/dl.7z` and
-/// `https://example.com/file.exe#/other.7z` must not share a cache file.
+/// Hashing the full URL (including `#/dl.7z` fragments) keeps multiple artifacts
+/// of the same package distinct while staying well below Windows `MAX_PATH`.
 pub fn cache_filename(pkg: &Package, url: &str) -> String {
-    format!(
-        "{}#{}#{}",
-        pkg.name(),
-        pkg.version(),
-        sanitize_url_for_cache(url)
-    )
-}
-
-/// The pre-migration Scoop name: `sha256(url)[..7]` plus the URL extension.
-/// Kept so cache files written by older Rake/Scoop builds are still found.
-fn legacy_cache_filename(pkg: &Package, url: &str) -> String {
     let hash = hex::encode(Sha256::digest(url.as_bytes()));
     format!(
         "{}#{}#{}{}",
@@ -388,6 +372,18 @@ fn legacy_cache_filename(pkg: &Package, url: &str) -> String {
         pkg.version(),
         &hash[..7],
         url_extension(url)
+    )
+}
+
+/// Pre-migration Scoop cache filename (`lib/core.ps1:388-395`):
+/// `<app>#<version>#<sanitized_url>`. Kept so existing un-migrated cache files
+/// written by older Scoop or Rake 0.1.4-alpha.2+ builds are still reused.
+fn legacy_cache_filename(pkg: &Package, url: &str) -> String {
+    format!(
+        "{}#{}#{}",
+        pkg.name(),
+        pkg.version(),
+        sanitize_url_for_cache(url)
     )
 }
 
@@ -409,8 +405,14 @@ fn sanitize_url_for_cache(url: &str) -> String {
 }
 
 fn url_extension(url: &str) -> &str {
-    let leaf = url.rsplit(['/', '\\']).next().unwrap_or(url);
-    let leaf = leaf.split('?').next().unwrap_or(leaf);
+    // Strip query string only when there is no `#/` rename fragment after it;
+    // if a `#/name.ext` fragment is present at the end, Scoop takes the extension
+    // from that fragment (`[System.IO.Path]::GetExtension($url)`).
+    let effective = match url.find("#/") {
+        Some(pos) => &url[pos + 2..],
+        None => url.split(['?', '#']).next().unwrap_or(url),
+    };
+    let leaf = effective.rsplit(['/', '\\']).next().unwrap_or(effective);
     match leaf.rfind('.') {
         Some(pos) => &leaf[pos..],
         None => "",
@@ -451,81 +453,13 @@ fn download_error(msg: String) -> crate::Error {
     crate::Error::Io(std::io::Error::other(msg))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HashAlgo {
-    Md5,
-    Sha1,
-    Sha256,
-    Sha512,
-}
-
-/// Split a manifest hash spec into (algorithm, hex_digest).
-///
-/// Scoop manifests express hashes either as bare hex (algorithm inferred
-/// from length: 32=md5, 40=sha1, 64=sha256, 128=sha512) or as
-/// `"algo:hexdigest"` (e.g. `"sha512:abcd..."`). Rake previously ALWAYS
-/// hashed downloads with SHA256 regardless of what the manifest asked
-/// for, which made every package pinned to sha512 (or md5/sha1) fail
-/// verification 100% of the time — this was the root cause of
-/// "hash mismatch" errors during install/update.
-fn parse_hash_spec(spec: &str) -> (HashAlgo, &str) {
-    if let Some((prefix, rest)) = spec.split_once(':') {
-        let algo = match prefix.to_ascii_lowercase().as_str() {
-            "md5" => HashAlgo::Md5,
-            "sha1" => HashAlgo::Sha1,
-            "sha256" => HashAlgo::Sha256,
-            "sha512" => HashAlgo::Sha512,
-            _ => HashAlgo::Sha256,
-        };
-        (algo, rest)
-    } else {
-        let algo = match spec.len() {
-            32 => HashAlgo::Md5,
-            40 => HashAlgo::Sha1,
-            128 => HashAlgo::Sha512,
-            _ => HashAlgo::Sha256,
-        };
-        (algo, spec)
-    }
-}
-
-fn hash_file<D: Digest>(file: &mut std::fs::File) -> Result<String> {
-    let mut hasher = D::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
 /// Verify that a file's hash matches the expected manifest hash spec.
 ///
 /// Supports md5 / sha1 / sha256 / sha512, with or without an `"algo:"`
-/// prefix (see [`parse_hash_spec`]). Returns `Ok(())` on match, or an
-/// error on mismatch / I/O failure. Hash comparison is case-insensitive.
+/// prefix. Returns `Ok(())` on match, or an error on mismatch / I/O failure.
+/// Hash comparison is case-insensitive.
 pub fn verify_file_hash(path: &Path, expected: &str) -> Result<()> {
-    let (algo, expected_hex) = parse_hash_spec(expected);
-
-    let mut file = std::fs::File::open(path)?;
-
-    let actual = match algo {
-        HashAlgo::Md5 => hash_file::<Md5>(&mut file)?,
-        HashAlgo::Sha1 => hash_file::<Sha1>(&mut file)?,
-        HashAlgo::Sha256 => hash_file::<Sha256>(&mut file)?,
-        HashAlgo::Sha512 => hash_file::<Sha512>(&mut file)?,
-    };
-
-    if actual.eq_ignore_ascii_case(expected_hex) {
-        Ok(())
-    } else {
-        Err(crate::Error::Io(std::io::Error::other(format!(
-            "hash mismatch: expected {expected}, got {actual}"
-        ))))
-    }
+    rake_hash::verify_file_hash(path, expected).map_err(crate::Error::Io)
 }
 
 #[cfg(test)]
@@ -608,25 +542,27 @@ mod url_tests {
         assert_eq!(target_filename("https://example.com/"), "download");
     }
 
-    /// The exact name Scoop's `cache_path` produces: every run of characters
-    /// outside `[\w.-]` collapses to one underscore, and the whole URL —
-    /// fragment included — is part of the name.
     #[test]
-    fn cache_filename_matches_scoop_for_a_fragment_url() {
+    fn cache_filename_matches_current_scoop_format() {
         let git = pkg("git", "2.50.0");
-
+        let name = cache_filename(&git, "https://example.com/file.exe#/dl.7z");
+        assert!(name.starts_with("git#2.50.0#"));
+        assert!(name.ends_with(".7z"));
+        let parts: Vec<&str> = name.split('#').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[2].len(), 7 + ".7z".len());
         assert_eq!(
-            cache_filename(&git, "https://example.com/file.exe#/dl.7z"),
+            legacy_cache_filename(&git, "https://example.com/file.exe#/dl.7z"),
             "git#2.50.0#https_example.com_file.exe_dl.7z"
         );
     }
 
     #[test]
-    fn cache_filename_collapses_runs_of_unsafe_characters() {
+    fn cache_filename_collapses_runs_of_unsafe_characters_in_legacy_name() {
         let app = pkg("app", "1.0");
 
         assert_eq!(
-            cache_filename(&app, "https://a.example//b"),
+            legacy_cache_filename(&app, "https://a.example//b"),
             "app#1.0#https_a.example_b"
         );
     }
@@ -667,7 +603,7 @@ mod url_tests {
     }
 
     #[test]
-    fn find_cached_file_still_sees_the_legacy_hash_name() {
+    fn find_cached_file_still_sees_the_legacy_sanitized_name() {
         let dir = tempfile::tempdir().unwrap();
         let app = pkg("app", "1.0");
         let url = "https://example.com/file.exe#/dl.7z";
@@ -696,52 +632,11 @@ mod hash_tests {
     use super::*;
 
     #[test]
-    fn infers_sha256_from_bare_64_char_hex() {
-        let spec = "a".repeat(64);
-        assert_eq!(parse_hash_spec(&spec).0, HashAlgo::Sha256);
-    }
-
-    #[test]
-    fn infers_sha512_from_bare_128_char_hex() {
-        let spec = "a".repeat(128);
-        assert_eq!(parse_hash_spec(&spec).0, HashAlgo::Sha512);
-    }
-
-    #[test]
-    fn infers_md5_from_bare_32_char_hex() {
-        let spec = "a".repeat(32);
-        assert_eq!(parse_hash_spec(&spec).0, HashAlgo::Md5);
-    }
-
-    #[test]
-    fn infers_sha1_from_bare_40_char_hex() {
-        let spec = "a".repeat(40);
-        assert_eq!(parse_hash_spec(&spec).0, HashAlgo::Sha1);
-    }
-
-    #[test]
-    fn respects_explicit_sha512_prefix() {
-        let spec = format!("sha512:{}", "a".repeat(128));
-        let (algo, hex) = parse_hash_spec(&spec);
-        assert_eq!(algo, HashAlgo::Sha512);
-        assert_eq!(hex, "a".repeat(128));
-    }
-
-    #[test]
     fn verifies_known_sha256_vector() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.bin");
         std::fs::write(&path, b"hello world").unwrap();
         let expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
-        verify_file_hash(&path, expected).unwrap();
-    }
-
-    #[test]
-    fn verifies_known_sha512_prefixed_vector() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("f.bin");
-        std::fs::write(&path, b"hello world").unwrap();
-        let expected = "sha512:309ecc489c12d6eb4cc40f50c902f2b4d0ed77ee511a7c7a9bcd3ca86d4cd86f989dd35bc5ff499670da34255b45b0cfd830e81f605dcf7dc5542e93ae9cd76f";
         verify_file_hash(&path, expected).unwrap();
     }
 

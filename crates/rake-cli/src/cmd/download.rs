@@ -23,7 +23,7 @@ pub struct Args {
     pub force: bool,
     /// Architecture override (32bit, 64bit, arm64)
     #[arg(short, long)]
-    pub arch: Option<String>,
+    pub arch: Option<Arch>,
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub yes: bool,
@@ -31,15 +31,6 @@ pub struct Args {
 
 fn parse_app_name(raw: &str) -> &str {
     raw.split('@').next().unwrap_or(raw)
-}
-
-fn get_arch(arch_str: Option<&str>) -> Arch {
-    match arch_str {
-        Some("32bit") => Arch::Ia32,
-        Some("64bit") => Arch::Amd64,
-        Some("arm64") => Arch::Aarch64,
-        _ => Arch::current(),
-    }
 }
 
 struct PkgState {
@@ -53,7 +44,7 @@ struct PkgState {
 
 pub fn execute(args: Args, session: &Session) -> Result<()> {
     let mut stdout = std::io::stdout();
-    let arch = get_arch(args.arch.as_deref());
+    let arch = args.arch.unwrap_or_else(Arch::current);
 
     // 1. Resolve packages
     write!(stdout, "\rResolving packages...\r")?;
@@ -426,3 +417,27 @@ fn draw_progress(
 }
 
 use crate::util::human_size;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use rake_domain::arch::Arch;
+
+    #[test]
+    fn parses_arch_flags() {
+        let args = Args::try_parse_from(["download", "--arch", "64bit", "git"]).unwrap();
+        assert_eq!(args.arch, Some(Arch::Amd64));
+
+        let args = Args::try_parse_from(["download", "--arch", "arm64", "git"]).unwrap();
+        assert_eq!(args.arch, Some(Arch::Aarch64));
+
+        let args = Args::try_parse_from(["download", "-a", "32bit", "git"]).unwrap();
+        assert_eq!(args.arch, Some(Arch::Ia32));
+
+        let args = Args::try_parse_from(["download", "git"]).unwrap();
+        assert_eq!(args.arch, None);
+
+        assert!(Args::try_parse_from(["download", "--arch", "invalid", "git"]).is_err());
+    }
+}

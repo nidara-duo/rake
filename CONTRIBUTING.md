@@ -56,7 +56,7 @@ Only commit when all pass clean. No warnings, no formatting diffs, no failing te
 
 ### Scope
 
-Lowercase, matches the crate or module name, e.g. `list`, `status`, `cli`, `libscoop`, `archive`, `bucket`.
+Lowercase, matches the crate or module name, e.g. `list`, `status`, `cli`, `core`, `archive`, `bucket`.
 
 ### Body
 
@@ -66,6 +66,7 @@ Lowercase, matches the crate or module name, e.g. `list`, `status`, `cli`, `libs
 
 ## Code Style & Rust Conventions
 
+- **Rust edition**: The workspace uses Rust 2024 edition (MSRV 1.85+). The vendored `rake-shim-bin` crate remains on 2021 edition.
 - Use `crate::` imports for internal crate references.
 - Errors use `crate::error::Fallible` and `crate::error::Error`.
 - Public API gets doc comments (`///`); internal items are `pub(crate)`.

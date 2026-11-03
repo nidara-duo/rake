@@ -13,7 +13,7 @@ reqwest = { version = "0.12", features = ["stream"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
-zip = "2"
+zip = "9"
 sevenz-rust2 = "0.21"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "bzip2", "xz"] }
 tokio-tar = "0.3"

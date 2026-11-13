@@ -1681,7 +1681,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rake-cli"
-version = "0.1.4-alpha.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "rake-core"
-version = "0.1.4-alpha.3"
+version = "0.1.4"
 dependencies = [
  "async-compression",
  "async-trait",
@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "rake-domain"
-version = "0.1.4-alpha.3"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1739,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "rake-hash"
-version = "0.1.4-alpha.3"
+version = "0.1.4"
 dependencies = [
  "hex",
  "md-5",
@@ -1750,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "rake-shim-bin"
-version = "0.1.4-alpha.3"
+version = "0.1.4"
 dependencies = [
  "windows-sys 0.61.2",
 ]

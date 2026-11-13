@@ -10,7 +10,7 @@ members = [
 default-members = ["crates/rake-cli"]
 
 [workspace.package]
-version = "0.1.4-alpha.3"
+version = "0.1.4"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/nidara-duo/rake"

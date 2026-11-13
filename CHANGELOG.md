@@ -7,9 +7,9 @@ Each release section lists the user-visible effect, not the commits that
 produced it. Anything that changes behaviour, output, or the on-disk layout of a
 Scoop root belongs here.
 
-## [0.1.4-alpha.3]
+## [0.1.4]
 
-A development build addressing regressions in `rake update` and aligning the install/update pipeline with Scoop's runtime behavior.
+Release 0.1.4: restores Scoop-compatible `rake update` and install/teardown pipeline, and modernizes the workspace structure.
 
 ### Fixed
 

@@ -7,6 +7,21 @@ Each release section lists the user-visible effect, not the commits that
 produced it. Anything that changes behaviour, output, or the on-disk layout of a
 Scoop root belongs here.
 
+## [0.1.5]
+
+Release 0.1.5: restores backward compatibility for `rake update -v false`, consolidates core lifecycle/layout internals, and normalizes repository line endings.
+
+### Fixed
+
+- `rake update -v false` and `rake update --verbose false` (space-separated) now work again alongside `-v=false` and `rake update -v <pkg>`, instead of treating `"false"` as a package name.
+
+### Changed
+
+- Unified application directory layout and version resolution into `InstallRoots` / `AppLayout` (including normalized Windows NTFS junction targets across `install`, `update`, `uninstall`, and `reset`).
+- Consolidated hook phase context (`HookPhase` / `HookContext::for_phase`), link activation/deactivation (`deactivate_links` / `reactivate_links`), and bucket candidate lookup (`resolve_installed_candidate`).
+- `UpdateBatchReport::failed` now preserves typed `crate::Error` values instead of stringified messages.
+- Added `.gitattributes` to enforce consistent CRLF line endings across source, config, script, and documentation files.
+
 ## [0.1.4]
 
 Release 0.1.4: restores Scoop-compatible `rake update` and install/teardown pipeline, and modernizes the workspace structure.

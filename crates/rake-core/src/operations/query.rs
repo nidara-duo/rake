@@ -440,6 +440,32 @@ pub fn collect_snapshot(session: &Session) -> Result<Snapshot> {
     })
 }
 
+fn resolve_installed_candidate<'a>(
+    pkg: &Package,
+    buckets: &'a [crate::bucket::Bucket],
+    bucket_by_name: &HashMap<&'a str, &'a crate::bucket::Bucket>,
+) -> Option<(&'a str, Manifest)> {
+    let recorded_bucket = match &pkg.status {
+        PackageStatus::Installed(state) => state.bucket.as_deref(),
+        _ => None,
+    };
+
+    recorded_bucket
+        .and_then(|b_name| {
+            bucket_by_name.get(b_name).copied().or_else(|| {
+                buckets
+                    .iter()
+                    .find(|b| b.name().eq_ignore_ascii_case(b_name))
+            })
+        })
+        .and_then(|b| b.load_manifest(pkg.name()).map(|m| (b.name(), m)))
+        .or_else(|| {
+            buckets
+                .iter()
+                .find_map(|b| b.load_manifest(pkg.name()).map(|m| (b.name(), m)))
+        })
+}
+
 pub fn latest_versions_for_installed(
     session: &Session,
     installed: &[Package],
@@ -454,22 +480,8 @@ pub fn latest_versions_for_installed(
         .par_iter()
         .map(|pkg| {
             let name_lower = pkg.name().to_ascii_lowercase();
-
-            let recorded_bucket = match &pkg.status {
-                PackageStatus::Installed(state) => state.bucket.as_deref(),
-                _ => None,
-            };
-
-            let version = recorded_bucket
-                .and_then(|b| bucket_by_name.get(b))
-                .and_then(|b| b.load_manifest(pkg.name()))
-                .map(|m| m.version().to_owned())
-                .or_else(|| {
-                    buckets
-                        .iter()
-                        .find_map(|b| b.load_manifest(pkg.name()))
-                        .map(|m| m.version().to_owned())
-                });
+            let version = resolve_installed_candidate(pkg, &buckets, &bucket_by_name)
+                .map(|(_, m)| m.version().to_owned());
 
             (name_lower, version)
         })
@@ -497,31 +509,9 @@ pub fn find_update_candidates(
 
     let mut out = HashMap::new();
     for pkg in installed {
-        let recorded_bucket = match &pkg.status {
-            PackageStatus::Installed(state) => state.bucket.as_deref(),
-            _ => None,
-        };
-
-        let found = recorded_bucket
-            .and_then(|b_name| {
-                bucket_by_name.get(b_name).copied().or_else(|| {
-                    buckets
-                        .iter()
-                        .find(|b| b.name().eq_ignore_ascii_case(b_name))
-                })
-            })
-            .and_then(|b| {
-                b.load_manifest(pkg.name())
-                    .map(|m| (b.name().to_owned(), m))
-            })
-            .or_else(|| {
-                buckets.iter().find_map(|b| {
-                    b.load_manifest(pkg.name())
-                        .map(|m| (b.name().to_owned(), m))
-                })
-            });
-
-        if let Some((bucket_name, manifest)) = found {
+        if let Some((bucket_name, manifest)) =
+            resolve_installed_candidate(pkg, &buckets, &bucket_by_name)
+        {
             let candidate = Package::new(
                 PackageIdent::new(bucket_name, pkg.name()),
                 manifest,

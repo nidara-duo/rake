@@ -19,6 +19,26 @@ pub fn quote_powershell_string(s: &str) -> String {
     format!("'{escaped}'")
 }
 
+/// Lifecycle phase of a manifest hook.
+///
+/// Determines whether `$dir` is bound to the concrete version directory or the
+/// `current` junction (`lib/install.ps1:54-69`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookPhase {
+    /// Runs before `current` and links exist (`$dir == $original_dir`).
+    PreInstall,
+    /// Runs package `installer` script (`$dir == $original_dir`).
+    Installer,
+    /// Runs after `current`, shims, shortcuts, env, and persist exist (`$dir == current`).
+    PostInstall,
+    /// Runs before removing links/files (`$dir == $original_dir`).
+    PreUninstall,
+    /// Runs package `uninstaller` script (`$dir == $original_dir`).
+    Uninstaller,
+    /// Runs after removing app files while persist remains (`$dir == $original_dir`).
+    PostUninstall,
+}
+
 /// Script hook context — variable substitution for `$dir`, `$persist_dir`,
 /// `$original_dir`, `$version`.
 pub struct HookContext<'a> {
@@ -86,6 +106,34 @@ impl<'a> HookContext<'a> {
             arch: None,
             fnames: &[],
         }
+    }
+
+    /// Build a hook context for a specific lifecycle phase.
+    ///
+    /// Binds `$dir` to `active_dir` (`apps/<app>/current`) for `PostInstall` and to
+    /// `version_dir` for all other phases, while `$original_dir` always refers to
+    /// `version_dir`. Always loads Scoop's PowerShell library and sets `$app`,
+    /// `$architecture`, and `$fname`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_phase(
+        phase: HookPhase,
+        version_dir: &'a Path,
+        active_dir: &'a Path,
+        persist_dir: &'a Path,
+        version: &'a str,
+        app: &'a str,
+        arch: &'a str,
+        fnames: &'a [String],
+        roots: (&'a Path, &'a Path),
+    ) -> Self {
+        let ctx_dir = match phase {
+            HookPhase::PostInstall => active_dir,
+            _ => version_dir,
+        };
+        Self::with_scoop_lib(ctx_dir, persist_dir, version_dir, version, roots.0, roots.1)
+            .with_app(app)
+            .with_arch(arch)
+            .with_fnames(fnames)
     }
 
     pub fn with_app(mut self, app: &'a str) -> Self {
@@ -483,5 +531,58 @@ mod tests {
 
         let written = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(written.trim_end(), "one.7z|two.7z");
+    }
+
+    #[test]
+    fn for_phase_binds_dir_to_active_for_post_install_and_version_otherwise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let version_dir = tmp.path().join("apps").join("demo").join("1.0.0");
+        let active_dir = tmp.path().join("apps").join("demo").join("current");
+        let persist_dir = tmp.path().join("persist").join("demo");
+        let root = tmp.path();
+        let global = tmp.path().join("global");
+        let fnames = vec!["demo.zip".to_owned()];
+
+        let post = HookContext::for_phase(
+            HookPhase::PostInstall,
+            &version_dir,
+            &active_dir,
+            &persist_dir,
+            "1.0.0",
+            "demo",
+            "64bit",
+            &fnames,
+            (root, &global),
+        );
+        assert_eq!(post.version_dir, active_dir);
+        assert_eq!(post.original_dir, version_dir);
+        assert_eq!(post.app, Some("demo"));
+        assert_eq!(post.arch, Some("64bit"));
+        assert_eq!(post.fnames, fnames.as_slice());
+
+        for phase in [
+            HookPhase::PreInstall,
+            HookPhase::Installer,
+            HookPhase::PreUninstall,
+            HookPhase::Uninstaller,
+            HookPhase::PostUninstall,
+        ] {
+            let ctx = HookContext::for_phase(
+                phase,
+                &version_dir,
+                &active_dir,
+                &persist_dir,
+                "1.0.0",
+                "demo",
+                "64bit",
+                &fnames,
+                (root, &global),
+            );
+            assert_eq!(
+                ctx.version_dir, version_dir,
+                "{phase:?} must bind $dir to version_dir"
+            );
+            assert_eq!(ctx.original_dir, version_dir);
+        }
     }
 }

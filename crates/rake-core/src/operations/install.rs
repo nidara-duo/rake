@@ -21,44 +21,7 @@ use crate::session::Session;
 /// rather than redefining a private `InstallInfo`.
 pub type InstallInfo = InstallRecord;
 
-/// The directories one install batch writes to, resolved once.
-///
-/// Passed around as one value because every step below needs a different subset
-/// of them, and a seven-argument parameter list on each is where a mix-up lives.
-pub(crate) struct InstallRoots {
-    /// `$SCOOP` — also the base the PowerShell library is loaded from.
-    pub root: PathBuf,
-    pub apps: PathBuf,
-    pub shims: PathBuf,
-    pub persist: PathBuf,
-    pub modules: PathBuf,
-    pub global: PathBuf,
-}
-
-impl InstallRoots {
-    pub(crate) fn from_session(session: &Session) -> Self {
-        let root = session
-            .config()
-            .root_path
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| PathBuf::from("apps"));
-        let global = session
-            .config()
-            .global_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\rake"));
-
-        Self {
-            apps: root.join("apps"),
-            shims: root.join("shims"),
-            persist: root.join("persist"),
-            modules: root.join("modules"),
-            root,
-            global,
-        }
-    }
-}
+pub use crate::infra::layout::{AppLayout, InstallRoots};
 
 /// Commit downloaded files — extract, link, shim, persist.
 /// Does NOT download — caller is responsible for providing DownloadedFile list.
@@ -105,9 +68,8 @@ async fn install_one(
     roots: &InstallRoots,
     tx: &flume::Sender<Event>,
 ) -> Result<Package> {
-    let app_dir = roots.apps.join(pkg.name());
-    let version_dir = app_dir.join(version_component(pkg));
-    let persist_dir = roots.persist.join(pkg.name());
+    let layout = roots.app_layout(pkg.name());
+    let version_dir = layout.pkg_version_dir(pkg);
 
     if version_dir.exists() {
         if install_meta::is_installed(&version_dir) {
@@ -137,7 +99,12 @@ async fn install_one(
         _ => None,
     };
 
-    let mut txn = InstallTransaction::new(&version_dir, &app_dir, &roots.shims, &persist_dir);
+    let mut txn = InstallTransaction::new(
+        &version_dir,
+        &layout.app_dir,
+        &roots.shims,
+        &layout.persist_dir,
+    );
 
     match install_steps(
         session,
@@ -274,6 +241,7 @@ async fn install_steps(
     // `current`, shims and persist exist (install.ps1:54).
     if let Some(lines) = manifest.resolve_pre_install(arch) {
         run_hook(
+            script::HookPhase::PreInstall,
             lines,
             &version_dir,
             &version_dir,
@@ -317,9 +285,10 @@ async fn install_steps(
 
     if let Some(lines) = manifest.resolve_post_install(arch) {
         run_hook(
+            script::HookPhase::PostInstall,
             lines,
-            &dir,
             &version_dir,
+            &dir,
             &persist_dir,
             pkg.version(),
             pkg.name(),
@@ -452,22 +421,13 @@ fn extraction_plan(filename: &str, innosetup: bool) -> Option<Extraction> {
     None
 }
 
-/// The version directory name for a package — `nightly` for nightlies, which
-/// reuse one directory instead of accumulating versions.
-pub(crate) fn version_component(pkg: &Package) -> String {
-    if pkg.is_nightly() {
-        "nightly".to_owned()
-    } else {
-        pkg.version().to_owned()
-    }
-}
-
 /// Run a manifest hook with scoop's PowerShell library and context variables.
 #[allow(clippy::too_many_arguments)]
 fn run_hook(
+    phase: script::HookPhase,
     lines: &rake_domain::one_or_many::OneOrMany<String>,
-    ctx_dir: &Path,
-    original_dir: &Path,
+    version_dir: &Path,
+    active_dir: &Path,
     persist_dir: &Path,
     version: &str,
     app: &str,
@@ -475,17 +435,17 @@ fn run_hook(
     fnames: &[String],
     roots: &InstallRoots,
 ) -> Result<()> {
-    let ctx = script::HookContext::with_scoop_lib(
-        ctx_dir,
+    let ctx = script::HookContext::for_phase(
+        phase,
+        version_dir,
+        active_dir,
         persist_dir,
-        original_dir,
         version,
-        &roots.root,
-        &roots.global,
-    )
-    .with_app(app)
-    .with_arch(arch)
-    .with_fnames(fnames);
+        app,
+        arch,
+        fnames,
+        (&roots.root, &roots.global),
+    );
     let body: Vec<String> = lines.iter().cloned().collect();
     script::run_powershell_script(&body, &ctx)
 }
@@ -508,6 +468,11 @@ pub(crate) fn run_installer(
     roots: &InstallRoots,
     uninstall: bool,
 ) -> Result<()> {
+    let phase = if uninstall {
+        script::HookPhase::Uninstaller
+    } else {
+        script::HookPhase::Installer
+    };
     let (title, file, args, script_lines, keep) = if uninstall {
         let Some(spec) = manifest.resolve_uninstaller(arch) else {
             return Ok(());
@@ -562,6 +527,7 @@ pub(crate) fn run_installer(
                 // `& $progName @fnArgs` runs in-process, where scoop's library is
                 // already loaded — so the installer can call its functions.
                 run_ps1_installer(
+                    phase,
                     &prog,
                     &fn_args,
                     dir,
@@ -593,17 +559,17 @@ pub(crate) fn run_installer(
     }
 
     if let Some(lines) = script_lines {
-        let ctx = script::HookContext::with_scoop_lib(
+        let ctx = script::HookContext::for_phase(
+            phase,
+            dir,
             dir,
             persist_dir,
-            dir,
             version,
-            &roots.root,
-            &roots.global,
-        )
-        .with_app(app)
-        .with_arch(arch.as_str())
-        .with_fnames(fnames);
+            app,
+            arch.as_str(),
+            fnames,
+            (&roots.root, &roots.global),
+        );
         let body: Vec<String> = lines.iter().cloned().collect();
         script::run_powershell_script(&body, &ctx)?;
     }
@@ -613,6 +579,7 @@ pub(crate) fn run_installer(
 
 #[allow(clippy::too_many_arguments)]
 fn run_ps1_installer(
+    phase: script::HookPhase,
     prog: &Path,
     args: &[String],
     dir: &Path,
@@ -632,17 +599,17 @@ fn run_ps1_installer(
         line.push_str(&script::quote_powershell_string(arg));
     }
 
-    let ctx = script::HookContext::with_scoop_lib(
+    let ctx = script::HookContext::for_phase(
+        phase,
+        dir,
         dir,
         persist_dir,
-        dir,
         version,
-        &roots.root,
-        &roots.global,
-    )
-    .with_app(app)
-    .with_arch(arch)
-    .with_fnames(fnames);
+        app,
+        arch,
+        fnames,
+        (&roots.root, &roots.global),
+    );
     script::run_powershell_script(&[line], &ctx)
 }
 
@@ -1014,6 +981,116 @@ pub(crate) fn finalize_installation(
     // what Rake installed (see infra::install_meta).
     install_meta::write_install_record(version_dir, install_info)?;
     install_meta::write_installed_manifest(version_dir, &pkg.manifest)?;
+
+    Ok(())
+}
+
+/// Tear down the active links of an installed version (`persist`, shims,
+/// shortcuts, PowerShell module, environment entries, and the `current` junction),
+/// while keeping `version_dir` itself intact on disk.
+pub(crate) fn deactivate_links(
+    session: &Session,
+    manifest: &Manifest,
+    arch: Arch,
+    app_dir: &Path,
+    version_dir: &Path,
+    roots: &InstallRoots,
+    tx: &flume::Sender<Event>,
+) -> Result<()> {
+    // 1. Unlink persist before anything touches the directory.
+    if let Some(ref persist_val) = manifest.persist {
+        let entries = persist::parse_persist(persist_val);
+        let _ = persist::unlink(&entries, version_dir);
+    }
+
+    // 2. Shims, shortcuts and the module link owned by this version.
+    if let Some(bin_val) = manifest.resolve_bin(arch) {
+        let entries = shim::parse_bin(bin_val);
+        let _ = shim::remove_shims(&entries, &roots.shims);
+    }
+    if let Some(list) = manifest.resolve_shortcuts(arch) {
+        let entries = parse_shortcuts(list);
+        if !entries.is_empty() {
+            let _ = shortcut::remove_shortcuts(&entries, false);
+        }
+    }
+    let _ = uninstall_psmodule(session, manifest, roots);
+
+    // 3. Environment entries added by the manifest.
+    if let Some(env_set) = manifest.resolve_env_set(arch) {
+        for key in env_set.keys() {
+            let _ = session.env_service().remove_env(key);
+        }
+    }
+    remove_env_add_paths(manifest, arch, &app_dir.join("current"));
+
+    // 4. `current` itself.
+    if !session.config().no_junction.unwrap_or(false) {
+        let _ = tx.try_send(Event::UpdateProgress("Unlinking current...".to_owned()));
+        fs::remove_symlink(&app_dir.join("current"))?;
+    }
+
+    Ok(())
+}
+
+/// Re-activate links for an existing version directory (`current` junction,
+/// shims, shortcuts, PowerShell module, environment entries, and `persist`).
+///
+/// When `strict` is true (used by `reset`), any failure aborts immediately.
+/// When `strict` is false (used when rolling back a failed update), step failures
+/// after linking `current` are best-effort so as much of the old version as
+/// possible is restored.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reactivate_links(
+    session: &Session,
+    manifest: &Manifest,
+    app_name: &str,
+    arch: Arch,
+    app_dir: &Path,
+    version_dir: &Path,
+    roots: &InstallRoots,
+    tx: &flume::Sender<Event>,
+    strict: bool,
+) -> Result<()> {
+    let no_junction = session.config().no_junction.unwrap_or(false);
+    if !no_junction {
+        link_current(version_dir, app_dir)?;
+    }
+    let dir = if no_junction {
+        version_dir.to_path_buf()
+    } else {
+        app_dir.join("current")
+    };
+
+    if strict {
+        let _ = apply_shims(manifest, &dir, &roots.shims, tx, arch)?;
+        let _ = apply_shortcuts(manifest, &dir, arch, tx)?;
+        let _ = install_psmodule(session, manifest, &dir, roots)?;
+        apply_env(manifest, session, arch, &dir)?;
+    } else {
+        let _ = apply_shims(manifest, &dir, &roots.shims, tx, arch);
+        let _ = apply_shortcuts(manifest, &dir, arch, tx);
+        let _ = install_psmodule(session, manifest, &dir, roots);
+        let _ = apply_env(manifest, session, arch, &dir);
+    }
+
+    // Persist: unlink first, then re-apply. `persist::apply` moves a shipped
+    // copy aside to `<name>.original` when the target already exists, so
+    // applying without unlinking would rename the *junction* and leave a
+    // `.original` link behind on every reset.
+    if let Some(ref persist_val) = manifest.persist {
+        let entries = persist::parse_persist(persist_val);
+        if !entries.is_empty() {
+            let persist_dir = roots.persist.join(app_name);
+            if strict {
+                persist::unlink(&entries, version_dir)?;
+                persist::apply(&entries, version_dir, &persist_dir)?;
+            } else {
+                let _ = persist::unlink(&entries, version_dir);
+                let _ = persist::apply(&entries, version_dir, &persist_dir);
+            }
+        }
+    }
 
     Ok(())
 }

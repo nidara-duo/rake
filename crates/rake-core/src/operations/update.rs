@@ -7,7 +7,8 @@ use rake_domain::package::{Package, PackageStatus};
 use crate::Result;
 use crate::event::{BucketState, Event};
 use crate::infra::git::GitService;
-use crate::infra::{fs, install_meta, persist, script, shim, shortcut};
+use crate::infra::layout::AppLayout;
+use crate::infra::{fs, install_meta, script};
 use crate::operations::bucket;
 use crate::operations::download::DownloadedFile;
 use crate::operations::install;
@@ -279,8 +280,10 @@ pub async fn bucket_update(session: &Session) -> Result<BucketSyncReport> {
 /// and exit with a non-zero status code.
 #[derive(Debug)]
 pub struct UpdateBatchReport {
+    /// Packages that were successfully updated.
     pub updated: Vec<Package>,
-    pub failed: Vec<(rake_domain::package::PackageIdent, String)>,
+    /// Packages that failed to update, paired with the error that caused the failure.
+    pub failed: Vec<(rake_domain::package::PackageIdent, crate::Error)>,
 }
 
 pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<UpdateBatchReport> {
@@ -302,12 +305,11 @@ pub async fn update_packages(session: &Session, specs: &[UpdateSpec]) -> Result<
                 updated.push(pkg);
             }
             Err(e) => {
-                let reason = e.to_string();
                 let _ = tx.try_send(Event::UpdateProgress(format!(
-                    "Failed to update '{}', keeping the old version: {reason}",
+                    "Failed to update '{}', keeping the old version: {e}",
                     spec.candidate.name()
                 )));
-                failed.push((spec.candidate.ident.clone(), reason));
+                failed.push((spec.candidate.ident.clone(), e));
             }
         }
     }
@@ -329,22 +331,13 @@ async fn update_one(
     roots: &install::InstallRoots,
     tx: &flume::Sender<Event>,
 ) -> Result<Package> {
-    let app_dir = roots.apps.join(spec.installed.name());
-    let persist_dir = roots.persist.join(spec.installed.name());
-    let old_version = install::version_component(&spec.installed);
-    let new_version = install::version_component(&spec.candidate);
-    let old_dir = {
-        let by_version = app_dir.join(&old_version);
-        if by_version.exists() {
-            by_version
-        } else {
-            std::fs::read_link(app_dir.join("current"))
-                .ok()
-                .and_then(|target| target.file_name().map(|name| app_dir.join(name)))
-                .unwrap_or(by_version)
-        }
-    };
-    let new_dir = app_dir.join(&new_version);
+    let layout = roots.app_layout(spec.installed.name());
+    let old_version = AppLayout::version_component(&spec.installed);
+    let new_version = AppLayout::version_component(&spec.candidate);
+    let old_dir = layout
+        .resolve_installed_version_dir(Some(&old_version))
+        .unwrap_or_else(|| layout.version_dir(&old_version));
+    let new_dir = layout.version_dir(&new_version);
 
     // `hold` and the manifest come from what is actually on disk. The bucket
     // copy (`spec.installed.manifest`) may already describe the new version by
@@ -360,7 +353,7 @@ async fn update_one(
     // directory the old version occupies, so that directory is moved aside and
     // put back if the install fails.
     let backup = if old_dir == new_dir && old_dir.exists() {
-        let backup = app_dir.join(format!("{old_version}.updating"));
+        let backup = layout.app_dir.join(format!("{old_version}.updating"));
         fs::remove_dir(&backup)?;
         std::fs::rename(&old_dir, &backup)?;
         Some(backup)
@@ -377,8 +370,8 @@ async fn update_one(
         &old_manifest,
         spec,
         &active_old_dir,
-        &app_dir,
-        &persist_dir,
+        &layout.app_dir,
+        &layout.persist_dir,
         roots,
         tx,
     ) {
@@ -391,7 +384,7 @@ async fn update_one(
             spec,
             backup.as_deref(),
             &old_dir,
-            &app_dir,
+            &layout.app_dir,
             roots,
             tx,
         );
@@ -420,7 +413,7 @@ async fn update_one(
                 spec,
                 backup.as_deref(),
                 &old_dir,
-                &app_dir,
+                &layout.app_dir,
                 roots,
                 tx,
             );
@@ -435,7 +428,7 @@ async fn update_one(
             spec,
             backup.as_deref(),
             &old_dir,
-            &app_dir,
+            &layout.app_dir,
             roots,
             tx,
         );
@@ -487,16 +480,17 @@ fn deactivate_old(
     // 1. pre_uninstall, best effort: Scoop does not fail an uninstall because a
     //    notification hook could not run.
     if let Some(lines) = manifest.resolve_pre_uninstall(arch) {
-        let ctx = script::HookContext::with_scoop_lib(
+        let ctx = script::HookContext::for_phase(
+            script::HookPhase::PreUninstall,
+            version_dir,
             version_dir,
             persist_dir,
-            version_dir,
             spec.installed.version(),
-            &roots.root,
-            &roots.global,
-        )
-        .with_app(spec.installed.name())
-        .with_arch(arch.as_str());
+            spec.installed.name(),
+            arch.as_str(),
+            &[],
+            (&roots.root, &roots.global),
+        );
         let body: Vec<String> = lines.iter().cloned().collect();
         let _ = script::run_powershell_script(&body, &ctx);
     }
@@ -516,54 +510,22 @@ fn deactivate_old(
         true,
     )?;
 
-    // 3. Unlink persist before anything else touches the directory. The links
-    //    live inside it, and following one would delete the user's data.
-    if let Some(ref persist_val) = manifest.persist {
-        let entries = persist::parse_persist(persist_val);
-        let _ = persist::unlink(&entries, version_dir);
-    }
-
-    // 4. Shims, shortcuts and the module link the old version owns.
-    if let Some(bin_val) = manifest.resolve_bin(arch) {
-        let entries = shim::parse_bin(bin_val);
-        let _ = shim::remove_shims(&entries, &roots.shims);
-    }
-    if let Some(list) = manifest.resolve_shortcuts(arch) {
-        let entries = install::parse_shortcuts(list);
-        if !entries.is_empty() {
-            let _ = shortcut::remove_shortcuts(&entries, false);
-        }
-    }
-    let _ = install::uninstall_psmodule(session, manifest, roots);
-
-    // 5. Environment entries the old version added. The new install re-adds its
-    //    own; leaving the old ones behind is how a PATH entry for a version that
-    //    no longer exists survives forever.
-    if let Some(env_set) = manifest.resolve_env_set(arch) {
-        for key in env_set.keys() {
-            let _ = session.env_service().remove_env(key);
-        }
-    }
-    install::remove_env_add_paths(manifest, arch, &app_dir.join("current"));
-
-    // 6. `current` itself. The new install creates it again.
-    if !session.config().no_junction.unwrap_or(false) {
-        let _ = tx.try_send(Event::UpdateProgress("Unlinking current...".to_owned()));
-        fs::remove_symlink(&app_dir.join("current"))?;
-    }
+    // 3–6. Unlink persist, shims, shortcuts, module link, env, and `current`.
+    install::deactivate_links(session, manifest, arch, app_dir, version_dir, roots, tx)?;
 
     // 7. post_uninstall, best effort. It still sees the version directory.
     if let Some(lines) = manifest.resolve_post_uninstall(arch) {
-        let ctx = script::HookContext::with_scoop_lib(
+        let ctx = script::HookContext::for_phase(
+            script::HookPhase::PostUninstall,
+            version_dir,
             version_dir,
             persist_dir,
-            version_dir,
             spec.installed.version(),
-            &roots.root,
-            &roots.global,
-        )
-        .with_app(spec.installed.name())
-        .with_arch(arch.as_str());
+            spec.installed.name(),
+            arch.as_str(),
+            &[],
+            (&roots.root, &roots.global),
+        );
         let body: Vec<String> = lines.iter().cloned().collect();
         let _ = script::run_powershell_script(&body, &ctx);
     }
@@ -586,26 +548,17 @@ fn reactivate_old(
     roots: &install::InstallRoots,
     tx: &flume::Sender<Event>,
 ) -> Result<()> {
-    let arch = spec.arch;
-    let no_junction = session.config().no_junction.unwrap_or(false);
-
-    if !no_junction {
-        install::link_current(version_dir, app_dir)?;
-    }
-    let dir = if no_junction {
-        version_dir.to_path_buf()
-    } else {
-        app_dir.join("current")
-    };
-
-    let _ = install::apply_shims(manifest, &dir, &roots.shims, tx, arch);
-    let _ = install::apply_shortcuts(manifest, &dir, arch, tx);
-    let _ = install::install_psmodule(session, manifest, &dir, roots);
-    let _ = install::apply_env(manifest, session, arch, &dir);
-    let _ =
-        install::apply_persistence(manifest, spec.installed.name(), version_dir, &roots.persist);
-
-    Ok(())
+    install::reactivate_links(
+        session,
+        manifest,
+        spec.installed.name(),
+        spec.arch,
+        app_dir,
+        version_dir,
+        roots,
+        tx,
+        false,
+    )
 }
 
 /// Move a same-version backup back into place, if there was one.

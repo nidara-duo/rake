@@ -14,18 +14,7 @@ fn sanitize_manifest_name(name: &str) -> String {
     name.chars().filter(|c| !"/\\?:*<>|".contains(*c)).collect()
 }
 
-pub static BUILTIN_BUCKETS: &[(&str, &str)] = &[
-    ("main", "https://github.com/ScoopInstaller/Main"),
-    ("extras", "https://github.com/ScoopInstaller/Extras"),
-    ("games", "https://github.com/calinou/scoop-games"),
-    ("java", "https://github.com/ScoopInstaller/Java"),
-    ("php", "https://github.com/ScoopInstaller/PHP"),
-    ("versions", "https://github.com/ScoopInstaller/Versions"),
-    (
-        "nonportable",
-        "https://github.com/ScoopInstaller/Nonportable",
-    ),
-];
+pub use rake_domain::bucket::BUILTIN_BUCKETS;
 
 #[derive(Debug, Clone)]
 pub struct Bucket {

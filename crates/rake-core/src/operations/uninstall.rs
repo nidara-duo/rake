@@ -32,7 +32,6 @@ pub fn uninstall_packages(
     let is_wildcard = names.iter().any(|p| p == "*" || p == "-a" || p == "--all");
     let mut result = Vec::new();
     let shims_dir = roots.shims.clone();
-    let persist_root = roots.persist.clone();
 
     let entries: Vec<_> = std::fs::read_dir(&apps_root)
         .map_err(crate::Error::Io)?
@@ -52,18 +51,26 @@ pub fn uninstall_packages(
             continue;
         }
 
-        let app_dir = apps_root.join(&name);
-        let version = resolve_version(&app_dir);
-        let version_dir = match &version {
-            Some(v) => app_dir.join(v),
-            None => continue,
+        let layout = roots.app_layout(&name);
+        let Some(version_dir) = layout.resolve_installed_version_dir(None) else {
+            continue;
         };
         let manifest = load_manifest(&version_dir);
+        let version = manifest
+            .as_ref()
+            .map(|m| m.version().to_owned())
+            .or_else(|| {
+                version_dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
         // The architecture the app was installed for, not the machine's — the
         // manifest's architecture blocks were resolved with it.
         let arch = install_meta::installed_arch(&version_dir);
-        let pkg_persist_dir = persist_root.join(&name);
-        let version_str = version.as_deref().unwrap_or("");
+        let pkg_persist_dir = &layout.persist_dir;
+        let version_str = version.as_str();
 
         // The order below is Scoop's `uninstall_app`
         // (libexec/scoop-uninstall.ps1): the hooks and the package's own
@@ -75,16 +82,17 @@ pub fn uninstall_packages(
         if let Some(ref m) = manifest
             && let Some(script_lines) = m.resolve_pre_uninstall(arch)
         {
-            let ctx = script::HookContext::with_scoop_lib(
+            let ctx = script::HookContext::for_phase(
+                script::HookPhase::PreUninstall,
                 &version_dir,
-                &pkg_persist_dir,
                 &version_dir,
+                pkg_persist_dir,
                 version_str,
-                &roots.root,
-                &roots.global,
-            )
-            .with_app(&name)
-            .with_arch(arch.as_str());
+                &name,
+                arch.as_str(),
+                &[],
+                (&roots.root, &roots.global),
+            );
             let _ = script::run_powershell_script(
                 &script_lines.iter().cloned().collect::<Vec<_>>(),
                 &ctx,
@@ -99,7 +107,7 @@ pub fn uninstall_packages(
                 m,
                 arch,
                 &version_dir,
-                &pkg_persist_dir,
+                pkg_persist_dir,
                 version_str,
                 &name,
                 &[],
@@ -119,8 +127,8 @@ pub fn uninstall_packages(
             && let Some(ref persist_val) = m.persist
         {
             let entries = persist::parse_persist(persist_val);
-            persist::unlink(&entries, &app_dir.join("current"))?;
-            if let Ok(version_entries) = std::fs::read_dir(&app_dir) {
+            persist::unlink(&entries, &layout.current_dir)?;
+            if let Ok(version_entries) = std::fs::read_dir(&layout.app_dir) {
                 for ve in version_entries.flatten() {
                     let vpath = ve.path();
                     if vpath.is_dir()
@@ -141,7 +149,7 @@ pub fn uninstall_packages(
                     session.env_service().remove_env(k)?;
                 }
             }
-            install::remove_env_add_paths(m, arch, &app_dir.join("current"));
+            install::remove_env_add_paths(m, arch, &layout.current_dir);
         }
 
         // 5. The PowerShell module link, before the version directory it points
@@ -171,13 +179,13 @@ pub fn uninstall_packages(
         }
 
         // 8. Remove the `current` junction itself, then every version directory.
-        let current_link = app_dir.join("current");
+        let current_link = &layout.current_dir;
         if current_link.exists() || current_link.is_symlink() {
-            fs::remove_symlink(&current_link)?;
+            fs::remove_symlink(current_link)?;
         }
 
         let mut failed = Vec::new();
-        if let Ok(version_entries) = std::fs::read_dir(&app_dir) {
+        if let Ok(version_entries) = std::fs::read_dir(&layout.app_dir) {
             for ve in version_entries.flatten() {
                 let path = ve.path();
                 if path.is_dir()
@@ -192,10 +200,10 @@ pub fn uninstall_packages(
         //    something is left inside, so only a genuine failure is worth
         //    reporting — and by this point a failure has already been recorded
         //    above.
-        if let Err(e) = fs::remove_dir(&app_dir)
+        if let Err(e) = fs::remove_dir(&layout.app_dir)
             && failed.is_empty()
         {
-            failed.push(format!("{}: {e}", app_dir.display()));
+            failed.push(format!("{}: {e}", layout.app_dir.display()));
         }
 
         // 10. post_uninstall, best effort, after the app is gone but while the
@@ -204,16 +212,17 @@ pub fn uninstall_packages(
             && let Some(script_lines) = m.resolve_post_uninstall(arch)
             && pkg_persist_dir.exists()
         {
-            let ctx = script::HookContext::with_scoop_lib(
+            let ctx = script::HookContext::for_phase(
+                script::HookPhase::PostUninstall,
                 &version_dir,
-                &pkg_persist_dir,
                 &version_dir,
+                pkg_persist_dir,
                 version_str,
-                &roots.root,
-                &roots.global,
-            )
-            .with_app(&name)
-            .with_arch(arch.as_str());
+                &name,
+                arch.as_str(),
+                &[],
+                (&roots.root, &roots.global),
+            );
             let _ = script::run_powershell_script(
                 &script_lines.iter().cloned().collect::<Vec<_>>(),
                 &ctx,
@@ -222,44 +231,17 @@ pub fn uninstall_packages(
 
         // 11. `--purge` is the explicit request to destroy the persisted data.
         if purge && pkg_persist_dir.exists() {
-            fs::remove_dir(&pkg_persist_dir)?;
+            fs::remove_dir(pkg_persist_dir)?;
         }
 
         result.push(Uninstalled {
             name,
-            version: version.unwrap_or_default(),
+            version,
             failed,
         });
     }
 
     Ok(result)
-}
-
-fn resolve_version(app_dir: &std::path::Path) -> Option<String> {
-    let current_dir = app_dir.join("current");
-    let manifest_path = crate::infra::install_meta::INSTALLED_MANIFEST;
-    let manifest_path = if current_dir.join(manifest_path).is_file() {
-        current_dir.join(manifest_path)
-    } else {
-        current_dir.join(crate::infra::install_meta::INSTALLED_MANIFEST_LEGACY)
-    };
-    if let Ok(content) = crate::infra::json::read_to_string(&manifest_path)
-        && let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content)
-        && let Some(ver) = manifest.get("version").and_then(|v| v.as_str())
-    {
-        return Some(ver.to_owned());
-    }
-    let entries = std::fs::read_dir(app_dir).ok()?;
-    let mut dirs: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name == "current" { None } else { Some(name) }
-        })
-        .collect();
-    dirs.sort();
-    dirs.last().cloned()
 }
 
 fn load_manifest(version_dir: &std::path::Path) -> Option<rake_domain::manifest::Manifest> {

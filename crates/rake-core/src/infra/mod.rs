@@ -6,6 +6,8 @@ pub mod git_libgit2;
 pub mod http;
 pub mod install_meta;
 pub mod json;
+/// Application directory layout and installation root paths.
+pub mod layout;
 pub mod persist;
 pub mod scoop_lib;
 pub mod script;

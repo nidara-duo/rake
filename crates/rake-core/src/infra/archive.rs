@@ -1450,39 +1450,106 @@ mod innosetup_extraction_tests {
     }
 
     #[cfg(windows)]
-    #[tokio::test]
-    async fn compound_tar_gz_7z_fallback_unpacks_both_layers_and_honours_extract_dir() {
-        let Some(helper) = find_7z(None) else {
-            return;
-        };
+    async fn write_sample_tar_gz(path: &Path) {
+        let tar_gz_file = tokio::fs::File::create(path).await.unwrap();
+        let enc = async_compression::tokio::write::GzipEncoder::new(tar_gz_file);
+        let mut tar_builder = tokio_tar::Builder::new(enc);
 
-        let tmp = tempfile::tempdir().unwrap();
-        let src_tar_gz = tmp.path().join("archive.tar.gz");
-
-        // Create a real .tar.gz with package/bin/app.js
-        {
-            let tar_gz_file = tokio::fs::File::create(&src_tar_gz).await.unwrap();
-            let enc = async_compression::tokio::write::GzipEncoder::new(tar_gz_file);
-            let mut tar_builder = tokio_tar::Builder::new(enc);
-
-            let data = b"console.log('hello from app');";
+        for (entry_path, data) in [
+            ("package/bin/app.js", &b"console.log('hello from app');"[..]),
+            ("ignored/skip.txt", &b"should not be extracted"[..]),
+        ] {
             let mut header = tokio_tar::Header::new_gnu();
             header.set_size(data.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
             tar_builder
-                .append_data(&mut header, "package/bin/app.js", &data[..])
+                .append_data(&mut header, entry_path, data)
                 .await
                 .unwrap();
-            let mut enc = tar_builder.into_inner().await.unwrap();
-            tokio::io::AsyncWriteExt::shutdown(&mut enc).await.unwrap();
         }
+        let mut enc = tar_builder.into_inner().await.unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut enc).await.unwrap();
+    }
 
-        let dest = tmp.path().join("dest");
+    #[cfg(windows)]
+    fn create_fake_7z_helper(dir: &Path) -> (PathBuf, PathBuf) {
+        let log_path = dir.join("fake-7z-calls.log");
+        let ps1_path = dir.join("fake-7z.ps1");
+        let cmd_path = dir.join("fake-7z.cmd");
+
+        let ps1 = r#"$ErrorActionPreference = 'Stop'
+$rawArgs = @(
+    $env:RAKE_FAKE7Z_ARG1,
+    $env:RAKE_FAKE7Z_ARG2,
+    $env:RAKE_FAKE7Z_ARG3,
+    $env:RAKE_FAKE7Z_ARG4,
+    $env:RAKE_FAKE7Z_ARG5,
+    $env:RAKE_FAKE7Z_ARG6
+) | Where-Object { $_ }
+Add-Content -LiteralPath (Join-Path $PSScriptRoot 'fake-7z-calls.log') -Value ($rawArgs -join '|')
+$src = $rawArgs[1]
+$dest = ($rawArgs | Where-Object { $_ -like '-o*' } | Select-Object -First 1).Substring(2)
+$include = $rawArgs | Where-Object { $_ -like '-ir!*' } | Select-Object -First 1
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+if ($src.ToLowerInvariant().EndsWith('.tar.gz')) {
+    $outTar = Join-Path $dest 'archive.tar'
+    $inStream = [System.IO.File]::OpenRead($src)
+    try {
+        $gz = New-Object System.IO.Compression.GzipStream(
+            $inStream,
+            [System.IO.Compression.CompressionMode]::Decompress
+        )
+        try {
+            $outStream = [System.IO.File]::Create($outTar)
+            try {
+                $gz.CopyTo($outStream)
+            } finally {
+                $outStream.Dispose()
+            }
+        } finally {
+            $gz.Dispose()
+        }
+    } finally {
+        $inStream.Dispose()
+    }
+} else {
+    $tarArgs = @('-xf', $src, '-C', $dest)
+    if ($include) {
+        $sub = $include.Substring(4) -replace '\\\*$', '' -replace '\\', '/'
+        $tarArgs += $sub
+    }
+    & tar @tarArgs
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+"#;
+        std::fs::write(&ps1_path, ps1).unwrap();
+        let cmd = concat!(
+            "@echo off\r\n",
+            "set \"RAKE_FAKE7Z_ARG1=%~1\"\r\n",
+            "set \"RAKE_FAKE7Z_ARG2=%~2\"\r\n",
+            "set \"RAKE_FAKE7Z_ARG3=%~3\"\r\n",
+            "set \"RAKE_FAKE7Z_ARG4=%~4\"\r\n",
+            "set \"RAKE_FAKE7Z_ARG5=%~5\"\r\n",
+            "set \"RAKE_FAKE7Z_ARG6=%~6\"\r\n",
+            "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0fake-7z.ps1\"\r\n",
+        );
+        std::fs::write(&cmd_path, cmd).unwrap();
+
+        (cmd_path, log_path)
+    }
+
+    #[cfg(windows)]
+    async fn run_compound_tar_gz_fallback_test(helper: &Path, work_dir: &Path) {
+        let src_tar_gz = work_dir.join("archive.tar.gz");
+        write_sample_tar_gz(&src_tar_gz).await;
+
+        let dest = work_dir.join("dest");
         let staged = StagedExtraction::new(&dest, Some("package")).unwrap();
 
         run_7z_stream_fallback(
-            &helper,
+            helper,
             &src_tar_gz,
             &staged.staging,
             ArchiveFormat::TarGz,
@@ -1495,6 +1562,48 @@ mod innosetup_extraction_tests {
         assert_eq!(
             std::fs::read(dest.join("bin").join("app.js")).unwrap(),
             b"console.log('hello from app');"
+        );
+        assert!(
+            !dest.join("ignored").exists() && !dest.join("skip.txt").exists(),
+            "entries outside extract_dir must not end up in dest"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn compound_tar_gz_7z_fallback_unpacks_both_layers_and_honours_extract_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = find_7z(None).unwrap_or_else(|| create_fake_7z_helper(tmp.path()).0);
+
+        run_compound_tar_gz_fallback_test(&helper, tmp.path()).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn compound_tar_gz_fallback_runs_two_passes_with_mock_helper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (helper, calls_log) = create_fake_7z_helper(tmp.path());
+
+        run_compound_tar_gz_fallback_test(&helper, tmp.path()).await;
+
+        let log = std::fs::read_to_string(&calls_log).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected outer and inner passes, got: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("archive.tar.gz") && !lines[0].contains("-ir!"),
+            "first pass must decompress outer .tar.gz without -ir! filter: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("rake-tar-")
+                && lines[1].contains(".tar")
+                && lines[1].contains(r"-ir!package\*"),
+            "second pass must unpack inner .tar with -ir!package\\*: {}",
+            lines[1]
         );
     }
 }

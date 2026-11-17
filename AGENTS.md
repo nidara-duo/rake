@@ -106,3 +106,4 @@ The work is done when:
 - `cargo clippy` produces no warnings
 - relevant tests pass
 - the behaviour is demonstrable (a CLI invocation or a test assertion)
+- when `install` or `update` pipelines change, a live smoke run (`rake status`, `rake update -v false --dry-run` or updating a real test package in the local Scoop root) succeeds

@@ -66,6 +66,28 @@ pub struct Args {
     pub unstable_install: bool,
 }
 
+impl Args {
+    /// Normalize space-separated boolean literals after `-v` / `--verbose`.
+    ///
+    /// `require_equals = true` prevents `-v` from greedily consuming a package
+    /// name in `rake update -v git`. When a user writes `rake update -v false` or
+    /// `rake update --verbose false` (with a space), clap sets `verbose = Some(true)`
+    /// via `default_missing_value` and places `"false"` into `names[0]`. Consuming a
+    /// leading `"true"`/`"false"` literal here makes both `-v=false` and `-v false`
+    /// work alongside `-v git`.
+    pub fn normalized(mut self) -> Self {
+        if self.verbose == Some(true)
+            && let Some(first) = self.names.first()
+            && (first.eq_ignore_ascii_case("false") || first.eq_ignore_ascii_case("true"))
+        {
+            let val = first.eq_ignore_ascii_case("true");
+            self.names.remove(0);
+            self.verbose = Some(val);
+        }
+        self
+    }
+}
+
 use crate::util::human_size;
 
 struct DoneFlag(Arc<AtomicBool>);
@@ -423,6 +445,7 @@ fn needs_report(outcome: &update::BucketSyncOutcome, display_drew: bool) -> bool
 
 /// Update installed packages to latest versions
 pub async fn execute(args: Args, session: &Session) -> Result<()> {
+    let args = args.normalized();
     let installed = query::query_installed(session)?;
     let has_wildcard = args.all || args.names.iter().any(|n| n == "*");
     let effective_names: Vec<String> = if has_wildcard {
@@ -756,44 +779,92 @@ mod tests {
         assert!(!resolve_verbose(Some(false), true));
     }
 
-    /// `-v` with no value means "yes", and `--verbose false` means "no". Without the
-    /// `num_args`/`default_missing_value` pair clap would demand an argument for the
-    /// flag, or hand back `Some(false)` and quietly override the setting the wrong way.
+    /// `-v` with no value means "yes", and both `-v=false`/`--verbose=false` and
+    /// space-separated `-v false`/`--verbose false` mean "no".
+    ///
+    /// `require_equals = true` stops clap from swallowing a package name in `-v git`,
+    /// while `Args::normalized()` consumes a leading `"true"`/`"false"` literal that
+    /// `require_equals` leaves in `names[0]` so space-separated boolean literals work too.
     #[test]
     fn the_flag_can_be_written_both_ways() {
-        let args = Args::try_parse_from(["update", "-v"]).unwrap();
+        let args = Args::try_parse_from(["update", "-v"]).unwrap().normalized();
         assert_eq!(args.verbose, Some(true), "-v alone must mean true");
+        assert!(args.names.is_empty());
 
-        let args = Args::try_parse_from(["update", "--verbose"]).unwrap();
+        let args = Args::try_parse_from(["update", "--verbose"])
+            .unwrap()
+            .normalized();
         assert_eq!(args.verbose, Some(true), "--verbose alone must mean true");
+        assert!(args.names.is_empty());
 
-        let args = Args::try_parse_from(["update", "-v=false"]).unwrap();
+        let args = Args::try_parse_from(["update", "-v=false"])
+            .unwrap()
+            .normalized();
         assert_eq!(
             args.verbose,
             Some(false),
             "an explicit value must be honoured"
         );
+        assert!(args.names.is_empty());
 
-        let args = Args::try_parse_from(["update", "--verbose=false"]).unwrap();
+        let args = Args::try_parse_from(["update", "--verbose=false"])
+            .unwrap()
+            .normalized();
         assert_eq!(
             args.verbose,
             Some(false),
             "an explicit value must be honoured"
         );
+        assert!(args.names.is_empty());
 
-        let args = Args::try_parse_from(["update"]).unwrap();
+        let args = Args::try_parse_from(["update", "-v", "false"])
+            .unwrap()
+            .normalized();
+        assert_eq!(
+            args.verbose,
+            Some(false),
+            "space-separated -v false must mean false"
+        );
+        assert!(args.names.is_empty());
+
+        let args = Args::try_parse_from(["update", "--verbose", "false"])
+            .unwrap()
+            .normalized();
+        assert_eq!(
+            args.verbose,
+            Some(false),
+            "space-separated --verbose false must mean false"
+        );
+        assert!(args.names.is_empty());
+
+        let args = Args::try_parse_from(["update", "-v", "false", "git"])
+            .unwrap()
+            .normalized();
+        assert_eq!(args.verbose, Some(false));
+        assert_eq!(args.names, vec!["git"]);
+
+        let args = Args::try_parse_from(["update", "-v", "true"])
+            .unwrap()
+            .normalized();
+        assert_eq!(args.verbose, Some(true));
+        assert!(args.names.is_empty());
+
+        let args = Args::try_parse_from(["update"]).unwrap().normalized();
         assert_eq!(args.verbose, None, "absent must stay absent");
     }
 
     #[test]
     fn verbose_short_flag_does_not_swallow_package_name() {
-        let args = Args::try_parse_from(["update", "-v", "git"]).unwrap();
+        let args = Args::try_parse_from(["update", "-v", "git"])
+            .unwrap()
+            .normalized();
         assert_eq!(args.verbose, Some(true));
         assert_eq!(args.names, vec!["git"]);
 
         let cli = crate::cmd::Cli::try_parse_from(["rake", "update", "-v", "git"]).unwrap();
         match cli.command {
             crate::cmd::Command::Update(cli_args) => {
+                let cli_args = cli_args.normalized();
                 assert_eq!(cli_args.verbose, Some(true));
                 assert_eq!(cli_args.names, vec!["git"]);
             }

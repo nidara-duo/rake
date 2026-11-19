@@ -1,3 +1,4 @@
+pub(crate) mod activation;
 pub mod bucket;
 pub mod cache;
 pub mod checkup;
@@ -9,6 +10,7 @@ pub mod hold;
 pub mod install;
 #[cfg(test)]
 mod install_tests;
+pub(crate) mod installer;
 pub mod query;
 pub mod reset;
 pub mod self_update;

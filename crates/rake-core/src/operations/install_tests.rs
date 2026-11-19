@@ -2,7 +2,7 @@
 mod tests {
     use rake_domain::package::InstallRecord;
 
-    use super::super::install::{is_in_dir, resolve_env_add_paths};
+    use super::super::activation::{is_in_dir, resolve_env_add_paths};
     use rake_domain::arch::Arch;
     use std::path::{Path, PathBuf};
 

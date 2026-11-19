@@ -522,84 +522,73 @@ fn find_7z(root_path: Option<&Path>) -> Option<PathBuf> {
 }
 
 async fn extract_tar(src: &Path, dest: &Path) -> Result<()> {
-    let file = tokio::fs::File::open(src).await?;
-    let reader = tokio::io::BufReader::new(file);
+    let src = src.to_path_buf();
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let file = std::fs::File::open(&src)?;
+        let reader = std::io::BufReader::new(file);
 
-    let decompressed: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
-        match src.extension().and_then(|s| s.to_str()) {
-            Some("gz") | Some("tgz") => Box::new(tokio::io::BufReader::new(
-                async_compression::tokio::bufread::GzipDecoder::new(reader),
-            )),
-            Some("bz2") | Some("tbz") | Some("tbz2") => Box::new(tokio::io::BufReader::new(
-                async_compression::tokio::bufread::BzDecoder::new(reader),
-            )),
-            Some("xz") | Some("txz") => Box::new(tokio::io::BufReader::new(
-                async_compression::tokio::bufread::XzDecoder::new(reader),
-            )),
+        let decompressed: Box<dyn std::io::Read> = match src
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("gz") | Some("tgz") => Box::new(flate2::read::GzDecoder::new(reader)),
+            Some("bz2") | Some("tbz") | Some("tbz2") => {
+                Box::new(bzip2::read::BzDecoder::new(reader))
+            }
+            Some("xz") | Some("txz") => Box::new(xz2::read::XzDecoder::new(reader)),
             _ => Box::new(reader),
         };
 
-    let mut archive = tokio_tar::Archive::new(decompressed);
-    archive
-        .unpack(dest)
-        .await
-        .map_err(|e| crate::Error::Archive(format!("tar: {}", e)))?;
+        let mut archive = tar::Archive::new(decompressed);
+        archive
+            .unpack(&dest)
+            .map_err(|e| crate::Error::Archive(format!("tar: {e}")))?;
 
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|e| crate::Error::Archive(format!("tar task join: {e}")))?
+}
+
+async fn extract_single_compressed_stream<R: std::io::Read + Send + 'static>(
+    src: &Path,
+    dest: &Path,
+    kind: &'static str,
+    make_decoder: impl FnOnce(std::io::BufReader<std::fs::File>) -> R + Send + 'static,
+) -> Result<()> {
+    let src = src.to_path_buf();
+    let out_name = src
+        .file_stem()
+        .unwrap_or_else(|| src.file_name().unwrap_or_default())
+        .to_os_string();
+    let out_path = dest.join(out_name);
+
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let file = std::fs::File::open(&src)?;
+        let reader = std::io::BufReader::new(file);
+        let mut decoder = make_decoder(reader);
+        let mut out = std::fs::File::create(&out_path)?;
+        std::io::copy(&mut decoder, &mut out)
+            .map_err(|e| crate::Error::Archive(format!("{kind}: {e}")))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| crate::Error::Archive(format!("{kind} task join: {e}")))?
 }
 
 async fn extract_gz(src: &Path, dest: &Path) -> Result<()> {
-    let file = tokio::fs::File::open(src).await?;
-    let reader = tokio::io::BufReader::new(file);
-    let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(reader);
-
-    let out_name = src
-        .file_stem()
-        .unwrap_or(src.file_name().unwrap_or_default());
-    let out_path = dest.join(out_name);
-
-    let mut out = tokio::fs::File::create(&out_path).await?;
-    tokio::io::copy(&mut decoder, &mut out)
-        .await
-        .map_err(|e| crate::Error::Archive(format!("gz: {}", e)))?;
-
-    Ok(())
+    extract_single_compressed_stream(src, dest, "gz", flate2::read::GzDecoder::new).await
 }
 
 async fn extract_xz(src: &Path, dest: &Path) -> Result<()> {
-    let file = tokio::fs::File::open(src).await?;
-    let reader = tokio::io::BufReader::new(file);
-    let mut decoder = async_compression::tokio::bufread::XzDecoder::new(reader);
-
-    let out_name = src
-        .file_stem()
-        .unwrap_or(src.file_name().unwrap_or_default());
-    let out_path = dest.join(out_name);
-
-    let mut out = tokio::fs::File::create(&out_path).await?;
-    tokio::io::copy(&mut decoder, &mut out)
-        .await
-        .map_err(|e| crate::Error::Archive(format!("xz: {}", e)))?;
-
-    Ok(())
+    extract_single_compressed_stream(src, dest, "xz", xz2::read::XzDecoder::new).await
 }
 
 async fn extract_bz2(src: &Path, dest: &Path) -> Result<()> {
-    let file = tokio::fs::File::open(src).await?;
-    let reader = tokio::io::BufReader::new(file);
-    let mut decoder = async_compression::tokio::bufread::BzDecoder::new(reader);
-
-    let out_name = src
-        .file_stem()
-        .unwrap_or(src.file_name().unwrap_or_default());
-    let out_path = dest.join(out_name);
-
-    let mut out = tokio::fs::File::create(&out_path).await?;
-    tokio::io::copy(&mut decoder, &mut out)
-        .await
-        .map_err(|e| crate::Error::Archive(format!("bz2: {}", e)))?;
-
-    Ok(())
+    extract_single_compressed_stream(src, dest, "bz2", bzip2::read::BzDecoder::new).await
 }
 
 #[cfg(windows)]
@@ -1082,7 +1071,7 @@ mod extraction_tests {
     }
 
     /// A hand-built ustar header, so the entry name can be anything at all — including
-    /// a path that escapes. `tokio_tar::Builder` would not necessarily let us write one.
+    /// a path that escapes. `tar::Builder` would not necessarily let us write one.
     fn tar_with_entry(name: &str, data: &[u8]) -> Vec<u8> {
         let mut header = [0u8; 512];
         let name_bytes = name.as_bytes();
@@ -1128,7 +1117,7 @@ mod extraction_tests {
         );
     }
 
-    /// The tar equivalent of zip-slip. Unlike zip, this one relies on `tokio_tar`
+    /// The tar equivalent of zip-slip. Unlike zip, this one relies on `tar`
     /// refusing the path rather than on any check in this crate, so it is worth
     /// proving rather than assuming — a regression in the dependency would otherwise
     /// turn into a silent write outside the version directory.
@@ -1450,26 +1439,25 @@ mod innosetup_extraction_tests {
     }
 
     #[cfg(windows)]
-    async fn write_sample_tar_gz(path: &Path) {
-        let tar_gz_file = tokio::fs::File::create(path).await.unwrap();
-        let enc = async_compression::tokio::write::GzipEncoder::new(tar_gz_file);
-        let mut tar_builder = tokio_tar::Builder::new(enc);
+    fn write_sample_tar_gz(path: &Path) {
+        let tar_gz_file = std::fs::File::create(path).unwrap();
+        let enc = flate2::write::GzEncoder::new(tar_gz_file, flate2::Compression::default());
+        let mut tar_builder = tar::Builder::new(enc);
 
         for (entry_path, data) in [
             ("package/bin/app.js", &b"console.log('hello from app');"[..]),
             ("ignored/skip.txt", &b"should not be extracted"[..]),
         ] {
-            let mut header = tokio_tar::Header::new_gnu();
+            let mut header = tar::Header::new_gnu();
             header.set_size(data.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
             tar_builder
                 .append_data(&mut header, entry_path, data)
-                .await
                 .unwrap();
         }
-        let mut enc = tar_builder.into_inner().await.unwrap();
-        tokio::io::AsyncWriteExt::shutdown(&mut enc).await.unwrap();
+        let enc = tar_builder.into_inner().unwrap();
+        enc.finish().unwrap();
     }
 
     #[cfg(windows)]
@@ -1543,7 +1531,7 @@ if ($src.ToLowerInvariant().EndsWith('.tar.gz')) {
     #[cfg(windows)]
     async fn run_compound_tar_gz_fallback_test(helper: &Path, work_dir: &Path) {
         let src_tar_gz = work_dir.join("archive.tar.gz");
-        write_sample_tar_gz(&src_tar_gz).await;
+        write_sample_tar_gz(&src_tar_gz);
 
         let dest = work_dir.join("dest");
         let staged = StagedExtraction::new(&dest, Some("package")).unwrap();

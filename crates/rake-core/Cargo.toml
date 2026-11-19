@@ -11,15 +11,17 @@ rake-domain = { path = "../rake-domain" }
 rake-hash = { path = "../rake-hash" }
 
 serde = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "io-util", "macros", "sync", "time"] }
 reqwest = { version = "0.12", features = ["stream"] }
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-zip = "2"
+zip = "9"
 sevenz-rust2 = "0.21"
-async-compression = { version = "0.4", features = ["tokio", "gzip", "bzip2", "xz"] }
-tokio-tar = "0.3"
+tar = "0.4"
+flate2 = "1"
+bzip2 = "0.6"
+xz2 = "0.1"
 futures-util = "0.3"
 remove_dir_all = "0.8"
 walkdir = "2"
@@ -29,14 +31,15 @@ flume = "0.12"
 async-trait = "0.1"
 sha2.workspace = true
 hex.workspace = true
-git2 = "0.19"
+git2 = "0.20"
 tempfile.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["net"] }
 
 [target.'cfg(windows)'.dependencies]
 junction = "1.2"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging", "Win32_System_SystemServices", "Win32_System_Environment", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging", "Win32_System_SystemServices", "Win32_System_Environment", "Win32_Storage_FileSystem", "Win32_System_Services"] }
 
 [lints.rust]
 unsafe_code = "warn"

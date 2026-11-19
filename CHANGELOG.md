@@ -7,6 +7,23 @@ Each release section lists the user-visible effect, not the commits that
 produced it. Anything that changes behaviour, output, or the on-disk layout of a
 Scoop root belongs here.
 
+## [0.1.6]
+
+Release 0.1.6: resolves all security advisories in archive, git, and TLS dependencies, speeds up bucket updates and `rake checkup`, fixes CI batch quoting on `RUNNER~1`, and modularizes core archive and install pipelines.
+
+### Fixed
+
+- Fixed batch shim/uninstall test quoting when `TEMP` uses Windows 8.3 short paths (`RUNNER~1`) by stripping outer quotes with `%~1`/`%~2` in test batch scripts.
+- Replaced `tokio-tar` + `async-compression` with synchronous `tar`, `flate2`, `bzip2`, and `xz2` inside `tokio::task::spawn_blocking`, and upgraded `zip` (`9.0.3`), `git2` (`0.20.4`), `rustls` (`0.23.46`), and `rustls-webpki` (`0.103.17`) to resolve all open security advisories.
+- Replaced 50ms `recv_timeout` polling in `rake update` progress consumers with event-driven `Event::OperationDone` / `EventBus::stop()`.
+
+### Changed
+
+- `rake update` now syncs up to 4 buckets concurrently via `futures_util::stream::iter(...).buffered(4)` while preserving deterministic report ordering.
+- `rake checkup` now queries `WinDefend` service state via native Win32 SCM and checks Defender exclusion registry keys before falling back to PowerShell `Get-MpPreference`.
+- Split monolithic `archive.rs` and `install.rs` into focused modules (`infra/archive/*`, `operations/activation.rs`, `operations/installer.rs`) and narrowed `tokio` feature flags in `rake-core`.
+- Hardened GitHub Actions CI and release workflows with Node 24 actions, `Swatinem/rust-cache@v2`, `rustsec/audit-check@v2`, and a `quality -> build -> publish` release gate.
+
 ## [0.1.5]
 
 Release 0.1.5: restores backward compatibility for `rake update -v false`, consolidates core lifecycle/layout internals, and normalizes repository line endings.

@@ -1,6 +1,6 @@
 # <img src="assets/rake_logo.ico" width="42" height="42" valign="middle" alt="Rake Logo"> Rake (Scoop in Rust)
 
-[![Version](https://img.shields.io/badge/version-0.1.5-blue?style=for-the-badge)](https://github.com/nidara-duo/rake/releases)
+[![Version](https://img.shields.io/badge/version-0.1.6-blue?style=for-the-badge)](https://github.com/nidara-duo/rake/releases)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green?style=for-the-badge)](LICENSE)
 [![Platform Windows](https://img.shields.io/badge/platform-windows-0078d7?style=for-the-badge&logo=windows)](https://www.microsoft.com/windows)
 [![Language Rust](https://img.shields.io/badge/language-Rust-ea4aaa?style=for-the-badge&logo=rust)](https://www.rust-lang.org)
@@ -76,7 +76,7 @@ GitHub's "latest release" endpoint never returns pre-releases, so if you want to
 or a specific tag:
 
 ```powershell
-& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/nidara-duo/rake/main/scripts/bootstrap.ps1))) -Version v0.1.5
+& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/nidara-duo/rake/main/scripts/bootstrap.ps1))) -Version v0.1.6
 ```
 
 > Run these from PowerShell. From `cmd.exe`, keep the wrapper so a throw still yields a non-zero exit code:

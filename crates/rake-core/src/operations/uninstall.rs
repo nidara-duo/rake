@@ -567,7 +567,8 @@ mod tests {
     #[test]
     fn the_packages_own_uninstaller_runs_before_the_directory_is_removed() {
         let tmp = tempdir().unwrap();
-        let root = tmp.path();
+        let root_buf = tmp.path().join("scoop~1");
+        let root = root_buf.as_path();
         let (s, _env) = session(root);
         install(
             root,
@@ -583,7 +584,7 @@ mod tests {
 
         std::fs::write(
             version_dir.join("uninstall.bat"),
-            format!("@echo off\r\necho %1 > \"{}\"\r\n", marker.display()),
+            format!("@echo off\r\necho %~1 > \"{}\"\r\n", marker.display()),
         )
         .unwrap();
 

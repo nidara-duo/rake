@@ -8,9 +8,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  quality:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Both this and ci.yml track stable, so a release is built by the same
+      # toolchain that checked it — as long as stable has not moved between the
+      # two runs. Keep the local toolchain current; see AGENTS.md.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
   build:
-    permissions:
-      contents: write
+    needs: quality
     strategy:
       fail-fast: false
       matrix:
@@ -20,14 +42,15 @@ jobs:
           - aarch64-pc-windows-msvc
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      # Both this and ci.yml track stable, so a release is built by the same
-      # toolchain that checked it — as long as stable has not moved between the
-      # two runs. Keep the local toolchain current; see AGENTS.md.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -49,6 +72,30 @@ jobs:
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           Set-Content -Path "$zip.sha256" -Value "$hash  $zip"
           Write-Output "Packaged: $zip"
+
+      - name: Upload target artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rake-${{ matrix.target }}
+          path: |
+            rake-*.zip
+            rake-*.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: rake-*
+          merge-multiple: true
+          path: dist
 
       - name: Extract release notes for this tag
         shell: pwsh
@@ -104,12 +151,13 @@ jobs:
           Write-Output "Release notes: $($body.Length) chars from '$header'"
 
       - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: ${{ runner.temp }}/notes.md
           # So a v0.1.4-alpha.1 is listed as a pre-release instead of sitting in
           # the releases list as if it were the finished 0.1.4.
           prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
           files: |
-            rake-*.zip
-            rake-*.zip.sha256
+            dist/rake-*.zip
+            dist/rake-*.zip.sha256

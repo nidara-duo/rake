@@ -1012,15 +1012,16 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn installer_file_runs_with_substituted_args_and_is_removed() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("scoop");
+        let root = tmp.path().join("scoop~1");
         let cache = tmp.path().join("cache");
         std::fs::create_dir_all(&cache).unwrap();
 
         // A batch installer that records its arguments and succeeds.
+        // `%~1`/`%~2` strips quotes added by Rust's BatBadBut escaping on paths with `~`.
         let installer = cache.join("demo#1.0.0#setup.bat");
         std::fs::write(
             &installer,
-            b"@echo off\r\necho %1^|%2 > \"%~dp0args.txt\"\r\nexit /b 0\r\n",
+            b"@echo off\r\necho %~1^|%~2 > \"%~dp0args.txt\"\r\nexit /b 0\r\n",
         )
         .unwrap();
 

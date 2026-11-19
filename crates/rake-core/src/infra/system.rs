@@ -198,17 +198,124 @@ pub fn is_developer_mode_enabled() -> Result<bool> {
     }
 }
 
+#[cfg(windows)]
+fn normalize_exclusion_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let no_verbatim = trimmed.strip_prefix(r"\\?\").unwrap_or(trimmed);
+    no_verbatim
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+/// Pure check whether `target` matches or resides inside any exclusion path.
+#[cfg(windows)]
+pub(crate) fn path_is_excluded(target: &Path, exclusions: &[String]) -> bool {
+    let target_norm = normalize_exclusion_path(&target.to_string_lossy());
+    if target_norm.is_empty() {
+        return false;
+    }
+
+    exclusions.iter().any(|entry| {
+        let excl = normalize_exclusion_path(entry);
+        if excl.is_empty() {
+            return false;
+        }
+        target_norm == excl
+            || target_norm
+                .strip_prefix(&excl)
+                .is_some_and(|rest| rest.starts_with('\\'))
+    })
+}
+
+/// Read string value names (exclusion paths) from an HKLM registry key, returning
+/// `None` if the key does not exist or cannot be opened (e.g. `ERROR_ACCESS_DENIED`).
+#[cfg(windows)]
+fn read_hklm_value_names(subkey: &str) -> Option<Vec<String>> {
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_ITEMS;
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegEnumValueW, RegOpenKeyExW,
+    };
+
+    const ERROR_MORE_DATA: u32 = 234;
+
+    let wide_subkey: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut hkey: HKEY = std::ptr::null_mut();
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            wide_subkey.as_ptr(),
+            0,
+            KEY_READ,
+            &mut hkey,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+
+    let mut names = Vec::new();
+    let mut index: u32 = 0;
+    let mut buf_len: usize = 512;
+
+    let ok = loop {
+        let mut buf = vec![0u16; buf_len];
+        let mut len = buf.len() as u32;
+        let rc = unsafe {
+            RegEnumValueW(
+                hkey,
+                index,
+                buf.as_mut_ptr(),
+                &mut len,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc == 0 {
+            names.push(String::from_utf16_lossy(&buf[..len as usize]));
+            index += 1;
+        } else if rc == ERROR_MORE_DATA && buf_len < 32768 {
+            buf_len *= 2;
+        } else {
+            break rc == ERROR_NO_MORE_ITEMS;
+        }
+    };
+
+    unsafe {
+        RegCloseKey(hkey);
+    }
+
+    ok.then_some(names)
+}
+
 /// Is `path` covered by a Windows Defender exclusion?
 ///
-/// Returns `None` when the question could not be answered — PowerShell unavailable, the
-/// cmdlet refusing to run, Defender disabled mid-check. The previous version returned
-/// `true` in every one of those cases, including from a `catch` inside the script, so
-/// `checkup` printed "OK" for a check that had not happened. A check that cannot be
-/// performed is not a passing check.
+/// Queries the Defender registry exclusion keys first for sub-millisecond answers and
+/// falls back to PowerShell `Get-MpPreference` when Tamper Protection restricts direct
+/// registry read access to standard users. Returns `None` when the question could not be
+/// answered.
 pub fn check_defender_exclusion(path: &Path) -> Result<Option<bool>> {
     #[cfg(windows)]
     {
-        let path_str = path.to_str().unwrap_or(".");
+        let abs_path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+
+        let policy_exclusions =
+            read_hklm_value_names(r"SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions\Paths")
+                .unwrap_or_default();
+        if path_is_excluded(&abs_path, &policy_exclusions) {
+            return Ok(Some(true));
+        }
+
+        if let Some(mut main_exclusions) =
+            read_hklm_value_names(r"SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths")
+        {
+            main_exclusions.extend(policy_exclusions);
+            return Ok(Some(path_is_excluded(&abs_path, &main_exclusions)));
+        }
+
+        let path_str = abs_path.to_str().unwrap_or(".");
         // Single quotes make the value literal, so the doubling below is the whole
         // escaping rule — see infra::script for why this differs from the double-quoted
         // form used elsewhere.
@@ -264,6 +371,49 @@ pub(crate) fn exclusion_verdict(stdout: &str) -> Option<bool> {
     }
 }
 
+/// Query `WinDefend` directly via Win32 SCM, returning `None` only when SCM could
+/// not tell so the caller can fall back to PowerShell.
+#[cfg(windows)]
+fn query_windefend_scm() -> Option<bool> {
+    use windows_sys::Win32::Foundation::{ERROR_SERVICE_DOES_NOT_EXIST, GetLastError};
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
+        SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS,
+    };
+
+    let scm = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if scm.is_null() {
+        return None;
+    }
+
+    let svc_name: Vec<u16> = "WinDefend\0".encode_utf16().collect();
+    let svc = unsafe { OpenServiceW(scm, svc_name.as_ptr(), SERVICE_QUERY_STATUS) };
+    if svc.is_null() {
+        let err = unsafe { GetLastError() };
+        unsafe {
+            CloseServiceHandle(scm);
+        }
+        return if err == ERROR_SERVICE_DOES_NOT_EXIST {
+            Some(false)
+        } else {
+            None
+        };
+    }
+
+    let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+    let ok = unsafe { QueryServiceStatus(svc, &mut status) };
+    unsafe {
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+    }
+
+    if ok == 0 {
+        None
+    } else {
+        Some(status.dwCurrentState == SERVICE_RUNNING)
+    }
+}
+
 /// Is the Defender service running?
 ///
 /// `None` means the question could not be answered. It used to return `false` on any
@@ -273,6 +423,10 @@ pub(crate) fn exclusion_verdict(stdout: &str) -> Option<bool> {
 pub fn is_windows_defender_running() -> Result<Option<bool>> {
     #[cfg(windows)]
     {
+        if let Some(running) = query_windefend_scm() {
+            return Ok(Some(running));
+        }
+
         let script =
             vec!["(Get-Service -Name WinDefend -ErrorAction SilentlyContinue).Status".to_owned()];
 
@@ -374,5 +528,24 @@ mod defender_tests {
             ),
             (Some(false), Some(true))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_is_excluded_matches_exact_subtree_and_ignores_sibling_prefix() {
+        let exclusions = vec![r"C:\Users\Demo\scoop\".to_owned()];
+        assert!(path_is_excluded(
+            Path::new(r"C:\Users\Demo\scoop"),
+            &exclusions
+        ));
+        assert!(path_is_excluded(
+            Path::new(r"c:/users/demo/scoop/apps"),
+            &exclusions
+        ));
+        assert!(
+            !path_is_excluded(Path::new(r"C:\Users\Demo\scoop2"), &exclusions),
+            "sibling directory sharing prefix must not match"
+        );
+        assert!(!path_is_excluded(Path::new(r"D:\scoop"), &exclusions));
     }
 }

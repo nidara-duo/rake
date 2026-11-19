@@ -1,9 +1,5 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 use std::thread;
 use std::time::Duration;
 
@@ -11,7 +7,7 @@ use anyhow::Result;
 use clap::Parser;
 use crossterm::style::{Stylize, style};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use rake_core::event::{BucketState, Event};
+use rake_core::event::{BucketState, Event, EventBus};
 use rake_core::operations::query;
 use rake_core::operations::update::{UpdateSpec, update_packages};
 use rake_core::operations::{download, update};
@@ -90,17 +86,17 @@ impl Args {
 
 use crate::util::human_size;
 
-struct DoneFlag(Arc<AtomicBool>);
+struct UiStopGuard(EventBus);
 
-impl DoneFlag {
-    fn new(flag: Arc<AtomicBool>) -> Self {
-        Self(flag)
+impl UiStopGuard {
+    fn from_session(session: &Session) -> Self {
+        Self(session.event_bus().clone())
     }
 }
 
-impl Drop for DoneFlag {
+impl Drop for UiStopGuard {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.0.stop();
     }
 }
 
@@ -127,11 +123,7 @@ fn short_name(name: &str) -> String {
     format!("...{tail}")
 }
 
-fn spawn_update_ui(
-    session: &Session,
-    quiet: bool,
-    done: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
+fn spawn_update_ui(session: &Session, quiet: bool) -> thread::JoinHandle<()> {
     let rx = session.event_bus().core_receiver();
 
     thread::spawn(move || {
@@ -272,17 +264,17 @@ fn spawn_update_ui(
             _ => {}
         };
 
-        while !done.load(Ordering::Acquire) {
-            if let Ok(event) = rx.recv_timeout(Duration::from_millis(50)) {
-                handle_event(event);
-
-                while let Ok(event) = rx.try_recv() {
-                    handle_event(event);
-                }
+        while let Ok(event) = rx.recv() {
+            if matches!(event, Event::OperationDone) {
+                break;
             }
+            handle_event(event);
         }
 
         while let Ok(event) = rx.try_recv() {
+            if matches!(event, Event::OperationDone) {
+                break;
+            }
             handle_event(event);
         }
 
@@ -324,7 +316,7 @@ fn should_draw(mode: BucketReport, stderr_is_terminal: bool) -> bool {
 /// whatever else is already queued. Both go through one handler. The two copies this
 /// replaced had already drifted — one wrote `✗ name` and the other `✗  name` — which is
 /// the usual way duplicated code announces that it should not have been duplicated.
-fn spawn_bucket_ui(session: &Session, done: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+fn spawn_bucket_ui(session: &Session) -> thread::JoinHandle<()> {
     let rx = session.event_bus().core_receiver();
 
     thread::spawn(move || {
@@ -336,11 +328,10 @@ fn spawn_bucket_ui(session: &Session, done: Arc<AtomicBool>) -> thread::JoinHand
 
         let mut spinners: HashMap<String, ProgressBar> = HashMap::new();
 
-        // Returns true when the stream is over, so the caller can stop early instead of
-        // waiting for the done flag.
+        // Returns true when the stream is over, so the thread can exit cleanly without polling.
         let mut handle = |event: &Event| -> bool {
             match event {
-                Event::BucketSyncDone => true,
+                Event::BucketSyncDone | Event::OperationDone => true,
                 Event::BucketSyncProgress { name, state } => {
                     match state {
                         BucketState::Started => {
@@ -369,23 +360,9 @@ fn spawn_bucket_ui(session: &Session, done: Arc<AtomicBool>) -> thread::JoinHand
             }
         };
 
-        let mut stop = false;
-        while !stop && !done.load(Ordering::Acquire) {
-            if let Ok(event) = rx.recv_timeout(Duration::from_millis(50)) {
-                stop = handle(&event);
-                while !stop {
-                    match rx.try_recv() {
-                        Ok(event) => stop = handle(&event),
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-
-        while !stop {
-            match rx.try_recv() {
-                Ok(event) => stop = handle(&event),
-                Err(_) => break,
+        while let Ok(event) = rx.recv() {
+            if handle(&event) {
+                break;
             }
         }
 
@@ -575,9 +552,8 @@ pub async fn execute(args: Args, session: &Session) -> Result<()> {
         }
     }
 
-    let done = Arc::new(AtomicBool::new(false));
-    let _guard = DoneFlag::new(done.clone());
-    let ui_handle = spawn_update_ui(session, args.quiet, done);
+    let _guard = UiStopGuard::from_session(session);
+    let ui_handle = spawn_update_ui(session, args.quiet);
 
     if !args.quiet {
         println!("Resolving packages...");
@@ -678,9 +654,8 @@ async fn bucket_only(session: &Session, mode: BucketReport) -> Result<()> {
     // finish, and a display with no terminal is a thread waiting on a channel for nothing.
     let show_display = should_draw(mode, display_can_draw());
     let ui = show_display.then(|| {
-        let done = Arc::new(AtomicBool::new(false));
-        let guard = DoneFlag::new(done.clone());
-        (spawn_bucket_ui(session, done), guard)
+        let guard = UiStopGuard::from_session(session);
+        (spawn_bucket_ui(session), guard)
     });
 
     if !quiet {

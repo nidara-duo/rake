@@ -12,7 +12,10 @@ pub enum BucketState {
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    BucketSyncProgress { name: String, state: BucketState },
+    BucketSyncProgress {
+        name: String,
+        state: BucketState,
+    },
     BucketSyncDone,
 
     DownloadCached(PackageIdent),
@@ -31,6 +34,9 @@ pub enum Event {
     UpdateStart(PackageIdent, String, String),
     UpdateProgress(String),
     UpdateDone(PackageIdent),
+
+    /// Signals UI listeners that the foreground CLI operation has finished.
+    OperationDone,
 
     NeedConfirm(ConfirmRequest),
     NeedCandidateSelect(Vec<String>),
@@ -89,6 +95,13 @@ impl EventBus {
 
     pub fn cli_receiver(&self) -> Receiver<Event> {
         self.cli_rx.clone()
+    }
+
+    /// Notify UI consumers that the current operation has completed.
+    pub fn stop(&self) {
+        let _ = self
+            .core_tx
+            .send_timeout(Event::OperationDone, std::time::Duration::from_secs(2));
     }
 }
 

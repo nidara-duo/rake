@@ -232,40 +232,54 @@ fn skip_reason(bucket: &crate::bucket::Bucket) -> Option<BucketSyncOutcome> {
 }
 
 pub async fn bucket_update(session: &Session) -> Result<BucketSyncReport> {
+    use futures_util::stream::{self, StreamExt};
+
+    const MAX_CONCURRENT_PULLS: usize = 4;
+
     let buckets = bucket::bucket_list(session)?;
-    let git = crate::infra::git_libgit2::Git::new();
     let tx = session.event_bus().core_sender();
-    let mut report = BucketSyncReport::default();
 
-    for bucket in &buckets {
-        if let Some(reason) = skip_reason(bucket) {
-            report.push(bucket.name(), reason);
-            continue;
+    let outcomes = stream::iter(buckets.into_iter().map(|bucket| {
+        let tx = tx.clone();
+        async move {
+            let name = bucket.name().to_owned();
+            if let Some(reason) = skip_reason(&bucket) {
+                return (name, reason);
+            }
+
+            let _ = tx.try_send(Event::BucketSyncProgress {
+                name: name.clone(),
+                state: BucketState::Started,
+            });
+
+            let git = crate::infra::git_libgit2::Git::new();
+            let outcome = match git.pull(bucket.path()).await {
+                Ok(_) => {
+                    let _ = tx.try_send(Event::BucketSyncProgress {
+                        name: name.clone(),
+                        state: BucketState::Succeeded,
+                    });
+                    BucketSyncOutcome::Updated
+                }
+                Err(e) => {
+                    let _ = tx.try_send(Event::BucketSyncProgress {
+                        name: name.clone(),
+                        state: BucketState::Failed(e.to_string()),
+                    });
+                    BucketSyncOutcome::Failed(e.to_string())
+                }
+            };
+
+            (name, outcome)
         }
+    }))
+    .buffered(MAX_CONCURRENT_PULLS)
+    .collect::<Vec<_>>()
+    .await;
 
-        let _ = tx.try_send(Event::BucketSyncProgress {
-            name: bucket.name().to_owned(),
-            state: BucketState::Started,
-        });
-
-        let outcome = match git.pull(bucket.path()).await {
-            Ok(_) => {
-                let _ = tx.try_send(Event::BucketSyncProgress {
-                    name: bucket.name().to_owned(),
-                    state: BucketState::Succeeded,
-                });
-                BucketSyncOutcome::Updated
-            }
-            Err(e) => {
-                let _ = tx.try_send(Event::BucketSyncProgress {
-                    name: bucket.name().to_owned(),
-                    state: BucketState::Failed(e.to_string()),
-                });
-                BucketSyncOutcome::Failed(e.to_string())
-            }
-        };
-
-        report.push(bucket.name(), outcome);
+    let mut report = BucketSyncReport::default();
+    for (name, outcome) in outcomes {
+        report.push(name, outcome);
     }
 
     let _ = tx.try_send(Event::BucketSyncDone);
